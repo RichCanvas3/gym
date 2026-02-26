@@ -1,0 +1,20 @@
+{
+  "name": "@climb-gym/agent",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@climb-gym/knowledge": "workspace:*",
+    "@climb-gym/ops": "workspace:*",
+    "@langchain/core": "^1.1.29",
+    "@langchain/openai": "^1.2.11",
+    "langchain": "^1.2.28",
+    "zod": "^4.3.6"
+  }
+}
