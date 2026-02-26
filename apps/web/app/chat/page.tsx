@@ -3,6 +3,8 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
+import { useWaiver } from "@/components/waiver/WaiverProvider";
+import { useRouter } from "next/navigation";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -13,6 +15,8 @@ type ChatApiResponse = {
   answer?: unknown;
   error?: unknown;
   suggestedCartItems?: unknown;
+  cartActions?: unknown;
+  uiActions?: unknown;
 };
 
 type SuggestedCartItem = {
@@ -22,7 +26,9 @@ type SuggestedCartItem = {
 };
 
 export default function ChatPage() {
-  const { addLine } = useCart();
+  const router = useRouter();
+  const { lines, addLine, removeSku, clear } = useCart();
+  const { waiver } = useWaiver();
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -47,7 +53,14 @@ export default function ChatPage() {
       const url = useHosted ? "/api/agent/run" : "/api/chat";
       const body = {
         message: text,
-        session: { gymName: "Front Range Climbing (Boulder)", timezone: "America/Denver" },
+        session: {
+          gymName: "Front Range Climbing (Boulder)",
+          timezone: "America/Denver",
+          cartLines: lines,
+          waiver: waiver
+            ? { id: waiver.id, participantName: waiver.participantName, isMinor: waiver.isMinor }
+            : undefined,
+        },
       };
 
       const res = await fetch(url, {
@@ -69,6 +82,34 @@ export default function ChatPage() {
       }
       setMessages((m) => [...m, { role: "assistant", text: String(payload?.answer ?? "") }]);
       setLastSuggestions(parseSuggestions(payload?.suggestedCartItems));
+
+      // Auto-apply cart actions, then navigate to /cart if requested.
+      const cartOps = parseCartActions(payload?.cartActions);
+      let cartChanged = false;
+      for (const op of cartOps) {
+        if (op.op === "clear") {
+          clear();
+          cartChanged = true;
+        } else if (op.op === "remove" && op.sku) {
+          removeSku(op.sku);
+          cartChanged = true;
+        } else if (op.op === "add" && op.sku) {
+          addLine({ sku: op.sku, quantity: op.quantity ?? 1 });
+          cartChanged = true;
+        }
+      }
+      if (cartChanged) {
+        router.push("/cart");
+        return;
+      }
+
+      // Auto-navigate to waiver when agent signals it's required.
+      const ui = parseUiActions(payload?.uiActions);
+      const wantsWaiver = ui.some((a) => a.type === "navigate" && a.to === "/waiver");
+      if (wantsWaiver) {
+        router.push("/waiver");
+        return;
+      }
     } finally {
       setBusy(false);
     }
@@ -177,5 +218,34 @@ function extractErrorMessage(j: Record<string, unknown>) {
   if (typeof j.error === "string") return j.error;
   if (typeof j.detail === "string") return j.detail;
   return "Request failed.";
+}
+
+function parseCartActions(value: unknown): Array<{ op: "add" | "remove" | "clear"; sku?: string; quantity?: number }> {
+  if (!Array.isArray(value)) return [];
+  const out: Array<{ op: "add" | "remove" | "clear"; sku?: string; quantity?: number }> = [];
+  for (const x of value) {
+    if (!x || typeof x !== "object") continue;
+    const o = x as Record<string, unknown>;
+    const op = o.op === "add" || o.op === "remove" || o.op === "clear" ? o.op : null;
+    if (!op) continue;
+    const sku = typeof o.sku === "string" ? o.sku : undefined;
+    const quantity = typeof o.quantity === "number" ? o.quantity : undefined;
+    out.push({ op, sku, quantity });
+  }
+  return out;
+}
+
+function parseUiActions(value: unknown): Array<{ type: "navigate"; to: string }> {
+  if (!Array.isArray(value)) return [];
+  const out: Array<{ type: "navigate"; to: string }> = [];
+  for (const x of value) {
+    if (!x || typeof x !== "object") continue;
+    const o = x as Record<string, unknown>;
+    if (o.type !== "navigate") continue;
+    const to = typeof o.to === "string" ? o.to : "";
+    if (!to) continue;
+    out.push({ type: "navigate", to });
+  }
+  return out;
 }
 

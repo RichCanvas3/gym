@@ -32,6 +32,8 @@ class Session(BaseModel):
     timezone: Optional[str] = None
     userName: Optional[str] = None
     userGoals: Optional[str] = None
+    cartLines: Optional[list[dict[str, Any]]] = None
+    waiver: Optional[dict[str, Any]] = None
 
 
 class Input(BaseModel):
@@ -51,6 +53,8 @@ class Output(BaseModel):
     opsFreshness: Optional[dict[str, Any]] = None
     weatherFreshness: Optional[dict[str, Any]] = None
     suggestedCartItems: Optional[list[CartItemSuggestion]] = None
+    cartActions: Optional[list[dict[str, Any]]] = None
+    uiActions: Optional[list[dict[str, Any]]] = None
 
 
 class _Trace:
@@ -80,6 +84,11 @@ def build_system_prompt() -> str:
             "- If the user intent is to buy/book something, include a machine-readable cart suggestion at the end:",
             "  - Put `CartItemsJSON:` on its own line, followed by a JSON array of `{ sku, quantity, note? }`.",
             "  - Use real SKUs (use ops catalog tools if needed).",
+            "- For web UI automation, you MAY also include these machine-readable directives at the very end (each on its own line):",
+            "  - `CartActionsJSON:` followed by a JSON array of `{ op: \"add\"|\"remove\"|\"clear\", sku?, quantity?, note? }`.",
+            "  - `UIActionsJSON:` followed by a JSON array of `{ type: \"navigate\", to: \"/waiver\"|\"/cart\"|\"/shop\"|\"/chat\", reason? }`.",
+            "- If a waiver must be signed before proceeding, include a UI action to navigate to `/waiver`.",
+            "- If you add/remove items via CartActionsJSON, include a UI action to navigate to `/cart`.",
             "",
             "Keep responses concise and actionable.",
         ]
@@ -94,6 +103,24 @@ def build_session_prompt(session: Optional[Session]) -> str:
         lines.append(f"UserName: {session.userName}")
     if session and session.userGoals:
         lines.append(f"UserGoals: {session.userGoals}")
+    if session and session.waiver and isinstance(session.waiver, dict) and session.waiver.get("id"):
+        lines.append(
+            f"WaiverOnFile: yes (id={session.waiver.get('id')}, participant={session.waiver.get('participantName')}, minor={session.waiver.get('isMinor')})"
+        )
+    else:
+        lines.append("WaiverOnFile: unknown")
+    if session and session.cartLines and isinstance(session.cartLines, list) and len(session.cartLines) > 0:
+        parts: list[str] = []
+        for it in session.cartLines[:25]:
+            if not isinstance(it, dict):
+                continue
+            sku = it.get("sku")
+            qty = it.get("quantity")
+            if isinstance(sku, str):
+                parts.append(f"{sku} x{qty}")
+        lines.append("Cart: " + ", ".join(parts) if parts else "Cart: empty")
+    else:
+        lines.append("Cart: empty")
     return "\n".join(lines)
 
 
@@ -120,6 +147,19 @@ def _extract_cart(answer: str) -> tuple[str, Optional[list[CartItemSuggestion]]]
             q = int(qty) if isinstance(qty, (int, float)) else 1
             out.append(CartItemSuggestion(sku=sku, quantity=max(1, q), note=note if isinstance(note, str) else None))
         return clean, out or None
+    except Exception:
+        return clean, None
+
+
+def _extract_json_line(text: str, marker: str) -> tuple[str, Any | None]:
+    needle = "\n" + marker
+    idx = text.rfind(needle)
+    if idx == -1:
+        return text, None
+    json_part = text[idx + len(needle) :].strip()
+    clean = text[:idx].rstrip()
+    try:
+        return clean, json.loads(json_part)
     except Exception:
         return clean, None
 
@@ -317,7 +357,10 @@ async def run(input: Input) -> Output:
                 )
             )
 
-    answer, suggested = _extract_cart(raw)
+    # Extract optional UI/cart directives (order: UI, cart actions, legacy cart items)
+    txt, ui_actions = _extract_json_line(raw, "UIActionsJSON:")
+    txt, cart_actions = _extract_json_line(txt, "CartActionsJSON:")
+    answer, suggested = _extract_cart(txt)
 
     ops_freshness = None
     if trace.ops_as_of and trace.ops_endpoints:
@@ -333,5 +376,7 @@ async def run(input: Input) -> Output:
         opsFreshness=ops_freshness,
         weatherFreshness=weather_freshness,
         suggestedCartItems=suggested,
+        cartActions=cart_actions if isinstance(cart_actions, list) else None,
+        uiActions=ui_actions if isinstance(ui_actions, list) else None,
     )
 

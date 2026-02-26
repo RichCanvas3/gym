@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
+import { useWaiver } from "@/components/waiver/WaiverProvider";
 
 type ApiOk = { id: string; createdAtISO: string; message: string };
 type ApiErr = { error: string };
@@ -17,6 +18,7 @@ function computeIsMinor(dobISO: string) {
 }
 
 export default function WaiverPage() {
+  const { setWaiver, waiver, clearWaiver } = useWaiver();
   const [participantName, setParticipantName] = useState("");
   const [participantEmail, setParticipantEmail] = useState("");
   const [participantDobISO, setParticipantDobISO] = useState("");
@@ -58,7 +60,18 @@ export default function WaiverPage() {
         setError(typeof e.error === "string" ? e.error : "Submission failed.");
         return;
       }
-      setResult(json as ApiOk);
+      const ok = json as ApiOk;
+      setResult(ok);
+      setWaiver({
+        id: ok.id,
+        createdAtISO: ok.createdAtISO,
+        participantName: participantName.trim(),
+        participantEmail: participantEmail.trim(),
+        participantDobISO: participantDobISO.trim(),
+        isMinor,
+        guardianName: isMinor ? guardianName.trim() : undefined,
+        guardianEmail: isMinor ? guardianEmail.trim() : undefined,
+      });
     } finally {
       setBusy(false);
     }
@@ -84,6 +97,21 @@ export default function WaiverPage() {
 
         <main className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
           <div className="grid grid-cols-1 gap-4">
+            {waiver ? (
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-white/10 dark:bg-white/5">
+                <div className="font-semibold">Waiver on file (this browser)</div>
+                <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                  {waiver.participantName} • {waiver.participantEmail} • ID{" "}
+                  <span className="font-mono">{waiver.id}</span>
+                </div>
+                <button
+                  onClick={() => clearWaiver()}
+                  className="mt-3 h-9 rounded-xl border border-zinc-200 px-3 text-xs font-medium dark:border-white/10"
+                >
+                  Clear saved waiver
+                </button>
+              </div>
+            ) : null}
             <Field label="Participant full name">
               <input
                 value={participantName}

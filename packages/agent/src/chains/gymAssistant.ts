@@ -103,7 +103,7 @@ export async function runGymAssistant(input: {
     }
   }
 
-  const { answer, suggestedCartItems } = extractCartSuggestions(finalText);
+  const extracted = extractUiAndCart(finalText);
 
   const opsFreshness: OpsFreshness | undefined =
     trace.opsAsOfISO && trace.opsEndpoints.size
@@ -116,11 +116,13 @@ export async function runGymAssistant(input: {
       : undefined;
 
   return {
-    answer,
+    answer: extracted.answer,
     citations: dedupeCitations(trace.citations),
     opsFreshness,
     weatherFreshness,
-    suggestedCartItems,
+    suggestedCartItems: extracted.suggestedCartItems,
+    cartActions: extracted.cartActions,
+    uiActions: extracted.uiActions,
   };
 }
 
@@ -343,33 +345,102 @@ function normalizeToolCalls(ai: any): Array<{ id: string; name: string; args: an
     .filter((c) => c.id && c.name);
 }
 
-function extractCartSuggestions(text: string): {
+function extractUiAndCart(text: string): {
   answer: string;
   suggestedCartItems?: Array<{ sku: string; quantity: number; note?: string }>;
+  cartActions?: Array<{ op: "add" | "remove" | "clear"; sku?: string; quantity?: number; note?: string }>;
+  uiActions?: Array<{ type: "navigate"; to: "/waiver" | "/cart" | "/shop" | "/chat"; reason?: string }>;
 } {
-  const marker = "\nCartItemsJSON:";
-  const idx = text.lastIndexOf(marker);
-  if (idx === -1) return { answer: text };
+  let answer = text;
 
-  const jsonPart = text.slice(idx + marker.length).trim();
+  const ui = extractJsonLine(answer, "UIActionsJSON:");
+  if (ui) answer = ui.answer;
+
+  const cartActions = extractJsonLine(answer, "CartActionsJSON:");
+  if (cartActions) answer = cartActions.answer;
+
+  const cartItems = extractJsonLine(answer, "CartItemsJSON:");
+  if (cartItems) answer = cartItems.answer;
+
+  const suggestedCartItems = normalizeCartItems(cartItems?.value);
+  const normalizedCartActions = normalizeCartActions(cartActions?.value, suggestedCartItems);
+  const uiActions = normalizeUiActions(ui?.value);
+
+  return {
+    answer: answer.trimEnd(),
+    suggestedCartItems: suggestedCartItems?.length ? suggestedCartItems : undefined,
+    cartActions: normalizedCartActions?.length ? normalizedCartActions : undefined,
+    uiActions: uiActions?.length ? uiActions : undefined,
+  };
+}
+
+function extractJsonLine(text: string, marker: string) {
+  const needle = `\n${marker}`;
+  const idx = text.lastIndexOf(needle);
+  if (idx === -1) return null;
+  const jsonPart = text.slice(idx + needle.length).trim();
   const answer = text.slice(0, idx).trimEnd();
   try {
-    const parsed = JSON.parse(jsonPart) as unknown;
-    if (!Array.isArray(parsed)) return { answer };
-    const items = parsed
-      .map((it) => {
-        if (!it || typeof it !== "object") return null;
-        const o = it as Record<string, unknown>;
-        const sku = typeof o.sku === "string" ? o.sku : "";
-        const quantity = typeof o.quantity === "number" ? o.quantity : 1;
-        const note = typeof o.note === "string" ? o.note : undefined;
-        if (!sku) return null;
-        return { sku, quantity: Number.isFinite(quantity) ? quantity : 1, note };
-      })
-      .filter(Boolean) as Array<{ sku: string; quantity: number; note?: string }>;
-    return { answer, suggestedCartItems: items.length ? items : undefined };
+    return { answer, value: JSON.parse(jsonPart) as unknown };
   } catch {
     return { answer };
   }
+}
+
+function normalizeCartItems(value: unknown) {
+  if (!Array.isArray(value)) return undefined;
+  const out: Array<{ sku: string; quantity: number; note?: string }> = [];
+  for (const it of value) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const sku = typeof o.sku === "string" ? o.sku : "";
+    const quantity = typeof o.quantity === "number" ? o.quantity : 1;
+    const note = typeof o.note === "string" ? o.note : undefined;
+    if (!sku) continue;
+    out.push({ sku, quantity: Number.isFinite(quantity) ? quantity : 1, note });
+  }
+  return out;
+}
+
+function normalizeCartActions(
+  value: unknown,
+  fallbackAdds?: Array<{ sku: string; quantity: number; note?: string }>,
+) {
+  const out: Array<{ op: "add" | "remove" | "clear"; sku?: string; quantity?: number; note?: string }> = [];
+
+  if (Array.isArray(value)) {
+    for (const it of value) {
+      if (!it || typeof it !== "object") continue;
+      const o = it as Record<string, unknown>;
+      const op = o.op === "add" || o.op === "remove" || o.op === "clear" ? o.op : null;
+      if (!op) continue;
+      const sku = typeof o.sku === "string" ? o.sku : undefined;
+      const quantity = typeof o.quantity === "number" ? o.quantity : undefined;
+      const note = typeof o.note === "string" ? o.note : undefined;
+      out.push({ op, sku, quantity, note });
+    }
+  }
+
+  if (out.length === 0 && fallbackAdds?.length) {
+    for (const a of fallbackAdds) out.push({ op: "add", sku: a.sku, quantity: a.quantity, note: a.note });
+  }
+
+  return out;
+}
+
+function normalizeUiActions(value: unknown) {
+  if (!Array.isArray(value)) return undefined;
+  const out: Array<{ type: "navigate"; to: "/waiver" | "/cart" | "/shop" | "/chat"; reason?: string }> = [];
+  for (const it of value) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    if (o.type !== "navigate") continue;
+    const to =
+      o.to === "/waiver" || o.to === "/cart" || o.to === "/shop" || o.to === "/chat" ? o.to : "";
+    const reason = typeof o.reason === "string" ? o.reason : undefined;
+    if (!to) continue;
+    out.push({ type: "navigate", to, reason });
+  }
+  return out;
 }
 

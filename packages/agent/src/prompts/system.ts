@@ -15,6 +15,11 @@ export function buildSystemPrompt() {
     "- If the user intent is to buy/book something, include a machine-readable cart suggestion at the end:",
     "  - Put `CartItemsJSON:` on its own line, followed by a JSON array of `{ sku, quantity, note? }`.",
     "  - Use real SKUs (use ops catalog tools if needed).",
+    "- For web UI automation, you MAY also include these machine-readable directives at the very end (each on its own line):",
+    "  - `CartActionsJSON:` followed by a JSON array of `{ op: \"add\"|\"remove\"|\"clear\", sku?, quantity?, note? }`.",
+    "  - `UIActionsJSON:` followed by a JSON array of `{ type: \"navigate\", to: \"/waiver\"|\"/cart\"|\"/shop\"|\"/chat\", reason? }`.",
+    "- If a waiver must be signed before proceeding, include a UI action to navigate to `/waiver`.",
+    "- If you add/remove items via CartActionsJSON, include a UI action to navigate to `/cart`.",
     "",
     "Keep responses concise and actionable.",
   ].join("\n");

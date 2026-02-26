@@ -19,12 +19,27 @@ export type CartItemSuggestion = {
   note?: string;
 };
 
+export type CartAction = {
+  op: "add" | "remove" | "clear";
+  sku?: string;
+  quantity?: number;
+  note?: string;
+};
+
+export type UiAction = {
+  type: "navigate";
+  to: "/waiver" | "/cart" | "/shop" | "/chat";
+  reason?: string;
+};
+
 export type GymAssistantResult = {
   answer: string;
   citations: Citation[];
   opsFreshness?: OpsFreshness;
   weatherFreshness?: WeatherFreshness;
   suggestedCartItems?: CartItemSuggestion[];
+  cartActions?: CartAction[];
+  uiActions?: UiAction[];
 };
 
 export type GymAssistantSession = {
@@ -32,5 +47,7 @@ export type GymAssistantSession = {
   timezone?: string;
   userName?: string;
   userGoals?: string;
+  cartLines?: Array<{ sku: string; quantity: number }>;
+  waiver?: { id: string; participantName: string; isMinor: boolean };
 };
 
