@@ -10,7 +10,7 @@ from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from .knowledge_index import KnowledgeHit, build_vectorstore, search_kb
+from .knowledge_index import KnowledgeHit, ensure_index, search_kb
 from .ops_data import (
     CAMP_ENROLLMENTS,
     CAMPS,
@@ -127,7 +127,7 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("Missing OPENAI_API_KEY")
 
-    store = build_vectorstore()
+    index = ensure_index()
     trace = _Trace()
 
     class KnowledgeSearchArgs(BaseModel):
@@ -135,7 +135,7 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         k: Optional[int] = Field(default=4, ge=1, le=10)
 
     def knowledge_search(query: str, k: int = 4) -> str:
-        tool_text, hits = search_kb(store, query, k=k)
+        tool_text, hits = search_kb(index, query, k=k)
         for h in hits:
             trace.citations.append({"sourceId": h.sourceId, "snippet": h.snippet})
         return tool_text
