@@ -1,9 +1,9 @@
 {
   "$schema": "https://langgra.ph/schema.json",
   "python_version": "3.12",
-  "dependencies": ["./apps/api"],
+  "dependencies": ["./"],
   "graphs": {
-    "gym": "./apps/api/graph.py:graph"
+    "gym": "apps.api.graph:graph"
   }
 }
 

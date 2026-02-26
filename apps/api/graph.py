@@ -5,7 +5,7 @@ from typing import Any, TypedDict, Optional
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.graph import END, StateGraph
 
-from .agent import Input, Session, run
+from apps.api.agent import Input, Session, run
 
 
 class GraphState(TypedDict, total=False):
