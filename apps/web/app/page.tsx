@@ -22,6 +22,12 @@ export default function Home() {
           >
             Shop + cart
           </Link>
+          <Link
+            href="/waiver"
+            className="inline-flex h-11 items-center rounded-xl border border-zinc-200 px-4 text-sm font-medium dark:border-white/10"
+          >
+            Online waiver
+          </Link>
           <a
             href="/api/ops/classes/search"
             className="inline-flex h-11 items-center rounded-xl border border-zinc-200 px-4 text-sm font-medium dark:border-white/10"
