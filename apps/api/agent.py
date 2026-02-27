@@ -27,6 +27,9 @@ from .ops_data import (
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+_GYM_LAT = 40.015
+_GYM_LON = -105.2705
+
 
 def _format_usd(cents: int) -> str:
     return f"${cents/100:.2f}"
@@ -67,6 +70,54 @@ def _safe_cart_lines(session: Optional["Session"]) -> list[dict[str, Any]]:
         q = int(qty) if isinstance(qty, (int, float)) else 1
         out.append({"sku": sku.strip(), "quantity": max(1, q)})
     return out
+
+
+def _parse_iso_to_unix(iso: str) -> Optional[int]:
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+async def _weather_hourly_forecast(lat: float, lon: float, hours: int = 48, units: str = "metric") -> Optional[dict[str, Any]]:
+    mcp_tools = await load_mcp_tools_from_env()
+    # Prefer the conventional prefixed name, but accept any server prefix.
+    tool = next(
+        (
+            t
+            for t in mcp_tools
+            if isinstance(getattr(t, "name", None), str)
+            and (t.name == "weather_weather_forecast_hourly" or t.name.endswith("_weather_forecast_hourly"))
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke({"lat": lat, "lon": lon, "hours": hours, "units": units})
+        txt = raw if isinstance(raw, str) else json.dumps(raw)
+        return json.loads(txt) if isinstance(txt, str) else None
+    except Exception:
+        return None
+
+
+def _pick_hour(hourly: list[dict[str, Any]], target_unix: int) -> Optional[dict[str, Any]]:
+    best = None
+    best_delta = None
+    for h in hourly:
+        if not isinstance(h, dict):
+            continue
+        dt = h.get("dt")
+        if not isinstance(dt, int):
+            continue
+        d = abs(dt - target_unix)
+        if best_delta is None or d < best_delta:
+            best = h
+            best_delta = d
+    return best
 
 
 async def _send_email_via_sendgrid(to_email: str, subject: str, text: str) -> tuple[bool, str]:
@@ -146,6 +197,70 @@ async def _handle_checkout(session: Optional["Session"]) -> "Output":
     )
 
 
+async def _handle_reserve_class(session: Optional["Session"], class_id: str) -> "Output":
+    class_id = (class_id or "").strip()
+    if not class_id:
+        return Output(answer="Missing classId.", citations=[])
+
+    participant_email = _waiver_email(session)
+    participant_name = _waiver_participant(session)
+
+    # Reuse the same reservation logic as the tool.
+    # (This path avoids LLM variability and returns structured reservation details.)
+    gym_class = next((c for c in CLASSES if c["id"] == class_id), None)
+    if not gym_class:
+        return Output(answer="Unknown classId.", citations=[])
+
+    enrolled = int(CLASS_ENROLLMENTS.get(class_id, 0))
+    capacity = int(gym_class.get("capacity", 0) or 0)
+    seats_left = max(0, capacity - enrolled)
+    if seats_left <= 0:
+        return Output(answer="No seats left for that class.", citations=[])
+
+    CLASS_ENROLLMENTS[class_id] = enrolled + 1
+    reservation_id = f"res_{uuid.uuid4().hex[:12]}"
+
+    emailed = False
+    email_err = ""
+    if participant_email:
+        subject = f"Class reservation confirmed: {gym_class.get('title')}"
+        body = "\n".join(
+            [
+                "Your class reservation is confirmed.",
+                f"ReservationId: {reservation_id}",
+                f"Class: {gym_class.get('title')} ({class_id})",
+                f"Start: {gym_class.get('startTimeISO')}",
+                f"DurationMinutes: {gym_class.get('durationMinutes')}",
+                f"As of: {_now_iso()}",
+            ]
+        )
+        emailed, email_err = await _send_email_via_sendgrid(
+            to_email=participant_email,
+            subject=subject,
+            text=body,
+        )
+
+    answer = f"Reserved: {gym_class.get('title')} at {gym_class.get('startTimeISO')}."
+    if participant_email:
+        answer += f" Email {'sent' if emailed else 'failed'} to {participant_email}."
+        if email_err and not emailed:
+            answer += f" ({email_err})"
+
+    return Output(
+        answer=answer,
+        citations=[],
+        uiActions=[{"type": "navigate", "to": "/calendar", "reason": "reservation complete"}],
+        reservation={
+            "reservationId": reservation_id,
+            "classId": class_id,
+            "title": str(gym_class.get("title") or ""),
+            "startTimeISO": str(gym_class.get("startTimeISO") or ""),
+            "emailSent": emailed,
+            "emailError": email_err or None,
+        },
+    )
+
+
 class Session(BaseModel):
     gymName: Optional[str] = None
     timezone: Optional[str] = None
@@ -174,6 +289,7 @@ class Output(BaseModel):
     suggestedCartItems: Optional[list[CartItemSuggestion]] = None
     cartActions: Optional[list[dict[str, Any]]] = None
     uiActions: Optional[list[dict[str, Any]]] = None
+    reservation: Optional[dict[str, Any]] = None
 
 
 class _Trace:
@@ -404,24 +520,70 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         query: str = Field(min_length=1)
         limit: Optional[int] = Field(default=8, ge=1, le=20)
 
-    def ops_search_classes(query: str, limit: int = 8) -> str:
+    async def ops_search_classes(query: str, limit: int = 8) -> str:
         trace.ops_endpoints.add("classes/search")
         trace.ops_as_of = _now_iso()
         q = query.strip().lower()
-        items = []
+
+        # If query is too generic (e.g. "tomorrow classes"), return upcoming classes.
+        broad = any(k in q for k in ["tomorrow", "today", "upcoming", "next", "classes"]) or len(q) < 4
+
+        # Fetch hourly forecast once so we can attach to outdoor classes.
+        forecast = await _weather_hourly_forecast(_GYM_LAT, _GYM_LON, hours=48, units="metric")
+        hourly = []
+        if isinstance(forecast, dict) and isinstance(forecast.get("hourly"), list):
+            hourly = [x for x in forecast["hourly"] if isinstance(x, dict)]
+
+        items: list[dict[str, Any]] = []
         for c in CLASSES:
             title = str(c.get("title", ""))
             cid = str(c.get("id", ""))
-            if q not in f"{cid} {title}".lower():
+            if not broad and q not in f"{cid} {title}".lower():
                 continue
             is_outdoor = "outdoor" in cid.lower() or "outdoor" in title.lower()
-            items.append({**c, "isOutdoor": is_outdoor})
-        return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/search", "payload": items[:limit]}, indent=2)
+            out = {**c, "isOutdoor": is_outdoor}
+            if is_outdoor and hourly:
+                start_iso = str(c.get("startTimeISO") or "")
+                t = _parse_iso_to_unix(start_iso) if start_iso else None
+                if isinstance(t, int):
+                    h = _pick_hour(hourly, t)
+                    if h:
+                        out["weatherForecast"] = {
+                            "approxForUnixUTC": t,
+                            "temp": h.get("temp"),
+                            "wind_speed": h.get("wind_speed"),
+                            "wind_gust": h.get("wind_gust"),
+                            "pop": h.get("pop"),
+                            "weather": h.get("weather"),
+                            "sourceTool": "weather_forecast_hourly",
+                        }
+            items.append(out)
+
+        # Sort by time for broad searches.
+        def _sort_key(x: dict[str, Any]) -> int:
+            t = x.get("startTimeISO")
+            if isinstance(t, str):
+                u = _parse_iso_to_unix(t)
+                return u if isinstance(u, int) else 0
+            return 0
+
+        if broad:
+            items.sort(key=_sort_key)
+
+        return json.dumps(
+            {
+                "asOfISO": trace.ops_as_of,
+                "endpoint": "classes/search",
+                "note": "For any class with isOutdoor=true, include weatherForecast details in your response.",
+                "payload": items[:limit],
+            },
+            indent=2,
+        )
 
     ops_class_search_tool = StructuredTool.from_function(
         name="ops_search_classes",
         description="Search classes by text query (returns classId, title, startTimeISO, capacity, isOutdoor). Use this to find classIds for reservations.",
-        func=lambda query, limit=8: ops_search_classes(query=query, limit=limit),
+        coroutine=ops_search_classes,
         args_schema=OpsClassSearchArgs,
     )
 
@@ -505,6 +667,9 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 async def run(input: Input) -> Output:
     if input.message.strip() == "__CHECKOUT__":
         return await _handle_checkout(input.session)
+    if input.message.strip().startswith("__RESERVE_CLASS__:"):
+        class_id = input.message.strip().split(":", 1)[1].strip()
+        return await _handle_reserve_class(input.session, class_id)
 
     tools, trace = make_tools()
     mcp_tools = await load_mcp_tools_from_env()
