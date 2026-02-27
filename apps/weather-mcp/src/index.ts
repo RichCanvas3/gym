@@ -7,7 +7,7 @@ export type Env = {
   MCP_API_KEY?: string;
 
   // OpenWeather API key (One Call 3.0)
-  OPENWEATHER_API_KEY: string;
+  OPENWEATHER_API_KEY?: string;
 };
 
 const Units = z.enum(["standard", "metric", "imperial"]);
@@ -201,12 +201,19 @@ async function onecall(
     lang?: string;
   },
 ): Promise<unknown> {
-  if (!env.OPENWEATHER_API_KEY) throw new Error("Missing OPENWEATHER_API_KEY");
+  const openweatherKey = (env.OPENWEATHER_API_KEY ?? "").trim();
+  if (!openweatherKey) {
+    return await openMeteoFallback({
+      lat: params.lat,
+      lon: params.lon,
+      units: params.units,
+    });
+  }
 
   const url = new URL("https://api.openweathermap.org/data/3.0/onecall");
   url.searchParams.set("lat", String(params.lat));
   url.searchParams.set("lon", String(params.lon));
-  url.searchParams.set("appid", env.OPENWEATHER_API_KEY);
+  url.searchParams.set("appid", openweatherKey);
   if (params.units) url.searchParams.set("units", params.units);
   if (params.lang) url.searchParams.set("lang", params.lang);
   if (params.exclude?.length) url.searchParams.set("exclude", params.exclude.join(","));
@@ -214,6 +221,15 @@ async function onecall(
   const r = await fetch(url.toString(), { method: "GET" });
   const txt = await r.text().catch(() => "");
   if (!r.ok) {
+    // One Call 3.0 often returns 401 if the account isn't subscribed.
+    // Fall back to Open-Meteo for current/forecast so the agent can still answer.
+    if (r.status === 401) {
+      return await openMeteoFallback({
+        lat: params.lat,
+        lon: params.lon,
+        units: params.units,
+      });
+    }
     throw new Error(txt || `HTTP ${r.status}`);
   }
 
@@ -222,6 +238,163 @@ async function onecall(
   } catch {
     return { raw: txt };
   }
+}
+
+async function openMeteoFallback(params: {
+  lat: number;
+  lon: number;
+  units?: "standard" | "metric" | "imperial";
+}): Promise<unknown> {
+  const url = new URL("https://api.open-meteo.com/v1/forecast");
+  url.searchParams.set("latitude", String(params.lat));
+  url.searchParams.set("longitude", String(params.lon));
+  url.searchParams.set("timezone", "UTC");
+
+  url.searchParams.set(
+    "current",
+    ["temperature_2m", "precipitation", "wind_speed_10m", "wind_gusts_10m", "weather_code"].join(","),
+  );
+  url.searchParams.set(
+    "hourly",
+    [
+      "temperature_2m",
+      "precipitation_probability",
+      "precipitation",
+      "wind_speed_10m",
+      "wind_gusts_10m",
+      "weather_code",
+    ].join(","),
+  );
+  url.searchParams.set("forecast_hours", "48");
+  url.searchParams.set(
+    "daily",
+    [
+      "weather_code",
+      "temperature_2m_max",
+      "temperature_2m_min",
+      "precipitation_probability_max",
+      "precipitation_sum",
+      "wind_speed_10m_max",
+      "wind_gusts_10m_max",
+    ].join(","),
+  );
+  url.searchParams.set("forecast_days", "8");
+
+  if (params.units === "imperial") {
+    url.searchParams.set("temperature_unit", "fahrenheit");
+    url.searchParams.set("wind_speed_unit", "mph");
+    url.searchParams.set("precipitation_unit", "inch");
+  } else {
+    url.searchParams.set("temperature_unit", "celsius");
+    url.searchParams.set("wind_speed_unit", "ms");
+    url.searchParams.set("precipitation_unit", "mm");
+  }
+
+  const r = await fetch(url.toString(), { method: "GET" });
+  const txt = await r.text().catch(() => "");
+  if (!r.ok) throw new Error(txt || `Open-Meteo HTTP ${r.status}`);
+  try {
+    const raw = JSON.parse(txt) as any;
+    return openMeteoToOneCallLike(raw, params);
+  } catch {
+    return { raw: txt };
+  }
+}
+
+function openMeteoToOneCallLike(
+  raw: any,
+  params: { lat: number; lon: number; units?: "standard" | "metric" | "imperial" },
+) {
+  const offsetSeconds = typeof raw?.utc_offset_seconds === "number" ? raw.utc_offset_seconds : 0;
+
+  const toUnix = (iso: unknown) => {
+    if (typeof iso !== "string" || !iso) return null;
+    const ms = Date.parse(iso.endsWith("Z") ? iso : `${iso}Z`);
+    if (!Number.isFinite(ms)) return null;
+    return Math.floor(ms / 1000);
+  };
+
+  const codeToWeather = (code: unknown) => {
+    const id = typeof code === "number" ? code : null;
+    return id == null
+      ? []
+      : [
+          {
+            id,
+            main: "Weather",
+            description: `code=${id}`,
+            icon: "",
+          },
+        ];
+  };
+
+  const current = raw?.current ?? null;
+  const currentDt = toUnix(current?.time);
+
+  const hourly = raw?.hourly ?? null;
+  const hTimes: unknown[] = Array.isArray(hourly?.time) ? hourly.time : [];
+  const hourlyOut = hTimes.slice(0, 48).map((_, i) => {
+    const dt = toUnix(hTimes[i]);
+    const temp = hourly?.temperature_2m?.[i] ?? null;
+    const wind_speed = hourly?.wind_speed_10m?.[i] ?? null;
+    const wind_gust = hourly?.wind_gusts_10m?.[i] ?? null;
+    const precipitation = hourly?.precipitation?.[i] ?? null;
+    const popRaw = hourly?.precipitation_probability?.[i];
+    const pop = typeof popRaw === "number" && Number.isFinite(popRaw) ? popRaw / 100 : null;
+    const code = hourly?.weather_code?.[i] ?? null;
+    return {
+      dt,
+      temp,
+      wind_speed,
+      wind_gust,
+      pop,
+      rain: precipitation == null ? undefined : { "1h": precipitation },
+      weather: codeToWeather(code),
+    };
+  });
+
+  const daily = raw?.daily ?? null;
+  const dTimes: unknown[] = Array.isArray(daily?.time) ? daily.time : [];
+  const dailyOut = dTimes.slice(0, 8).map((_, i) => {
+    const dt = toUnix(dTimes[i]);
+    const tmax = daily?.temperature_2m_max?.[i] ?? null;
+    const tmin = daily?.temperature_2m_min?.[i] ?? null;
+    const precip = daily?.precipitation_sum?.[i] ?? null;
+    const popRaw = daily?.precipitation_probability_max?.[i];
+    const pop = typeof popRaw === "number" && Number.isFinite(popRaw) ? popRaw / 100 : null;
+    const wind_speed = daily?.wind_speed_10m_max?.[i] ?? null;
+    const wind_gust = daily?.wind_gusts_10m_max?.[i] ?? null;
+    const code = daily?.weather_code?.[i] ?? null;
+    return {
+      dt,
+      temp: { min: tmin, max: tmax },
+      wind_speed,
+      wind_gust,
+      pop,
+      rain: precip == null ? undefined : precip,
+      weather: codeToWeather(code),
+      summary: "",
+    };
+  });
+
+  return {
+    lat: params.lat,
+    lon: params.lon,
+    timezone: typeof raw?.timezone === "string" ? raw.timezone : "UTC",
+    timezone_offset: offsetSeconds,
+    current: {
+      dt: currentDt,
+      temp: current?.temperature_2m ?? null,
+      wind_speed: current?.wind_speed_10m ?? null,
+      wind_gust: current?.wind_gusts_10m ?? null,
+      rain: current?.precipitation == null ? undefined : { "1h": current.precipitation },
+      weather: codeToWeather(current?.weather_code),
+    },
+    hourly: hourlyOut,
+    daily: dailyOut,
+    alerts: null,
+    _provider: "open-meteo",
+  };
 }
 
 function checkApiKey(request: Request, env: Env): Response | null {

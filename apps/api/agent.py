@@ -22,7 +22,6 @@ from .ops_data import (
     catalog_item_by_sku,
     full_catalog,
 )
-from .weather import get_current_weather
 
 
 def _now_iso() -> str:
@@ -182,8 +181,6 @@ class _Trace:
         self.citations: list[dict[str, str]] = []
         self.ops_endpoints: set[str] = set()
         self.ops_as_of: Optional[str] = None
-        self.weather_as_of: Optional[str] = None
-        self.weather_location: Optional[str] = None
 
 
 def build_system_prompt() -> str:
@@ -195,7 +192,7 @@ def build_system_prompt() -> str:
             "- Be accurate. If you don't know, say so.",
             "- Never invent class times, prices, or inventory.",
             "- When asked about real-time availability (in stock, spots left, open private coaching slots), call the ops tool.",
-            "- Outdoor wall access and outdoor classes are weather-dependent. For any outdoor access/class question, call the weather tool and explain the result and safety implications.",
+            "- Outdoor wall access and outdoor classes are weather-dependent. For any outdoor access/class question, call the weather FORECAST tools (MCP) and explain the result and safety implications.",
             "- For scheduling/booking (classes, camps, private coaching), use the calendar/scheduling tools when available.",
             "- For confirmations and reminders, use the messaging/notifications tools when available.",
             "- For future outdoor planning, prefer a forecast tool when available (not just current conditions).",
@@ -206,7 +203,7 @@ def build_system_prompt() -> str:
             "- When asked about policies, class descriptions, coach bios, or general FAQs, use the knowledge search tool (RAG).",
             "- If you use knowledge search, include a short 'Sources' list at the end with the sourceIds you relied on.",
             "- If you use ops, mention the as-of timestamp returned by the tool.",
-            "- If you use weather, mention the as-of timestamp and location used by the tool.",
+            "- If you use weather, mention the as-of timestamp and location used by the tool output.",
             "- If the user intent is to buy/book something, include a machine-readable cart suggestion at the end:",
             "  - Put `CartItemsJSON:` on its own line, followed by a JSON array of `{ sku, quantity, note? }`.",
             "  - Use real SKUs (use ops catalog tools if needed).",
@@ -225,6 +222,8 @@ def build_session_prompt(session: Optional[Session]) -> str:
     gym_name = (session.gymName if session else None) or "Front Range Climbing (Boulder)"
     tz = (session.timezone if session else None) or "America/Denver"
     lines = [f"Gym: {gym_name}", f"Timezone: {tz}"]
+    # Default gym coordinates (Boulder, CO) for weather MCP calls.
+    lines.append("GymLatLon: 40.015, -105.2705")
     if session and session.userName:
         lines.append(f"UserName: {session.userName}")
     if session and session.userGoals:
@@ -491,24 +490,6 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         args_schema=OpsReserveClassArgs,
     )
 
-    class WeatherArgs(BaseModel):
-        lat: Optional[float] = Field(default=None, ge=-90, le=90)
-        lon: Optional[float] = Field(default=None, ge=-180, le=180)
-        label: Optional[str] = None
-
-    async def weather_current(lat: Optional[float] = None, lon: Optional[float] = None, label: Optional[str] = None) -> str:
-        res = await get_current_weather(lat=lat, lon=lon, label=label)
-        trace.weather_as_of = res.get("asOfISO")
-        trace.weather_location = (res.get("location") or {}).get("label")
-        return json.dumps(res, indent=2)
-
-    weather_tool = StructuredTool.from_function(
-        name="weather_current",
-        description="Get current weather for outdoor wall decisions. Use for outdoor wall access and outdoor classes.",
-        coroutine=weather_current,
-        args_schema=WeatherArgs,
-    )
-
     tools = [
         knowledge_tool,
         ops_catalog_search_tool,
@@ -517,7 +498,6 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         ops_class_search_tool,
         ops_class_tool,
         ops_reserve_class_tool,
-        weather_tool,
     ]
     return tools, trace
 
@@ -591,8 +571,6 @@ async def run(input: Input) -> Output:
         ops_freshness = {"asOfISO": trace.ops_as_of, "endpoints": sorted(list(trace.ops_endpoints))}
 
     weather_freshness = None
-    if trace.weather_as_of and trace.weather_location:
-        weather_freshness = {"asOfISO": trace.weather_as_of, "locationLabel": trace.weather_location}
 
     return Output(
         answer=answer,
