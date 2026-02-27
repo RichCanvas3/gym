@@ -11,6 +11,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from .knowledge_index import KnowledgeHit, ensure_index, search_kb
+from .mcp_tools import load_mcp_tools_from_env
 from .ops_data import (
     CAMP_ENROLLMENTS,
     CAMPS,
@@ -76,6 +77,9 @@ def build_system_prompt() -> str:
             "- Never invent class times, prices, or inventory.",
             "- When asked about real-time availability (in stock, spots left, open private coaching slots), call the ops tool.",
             "- Outdoor wall access and outdoor classes are weather-dependent. For any outdoor access/class question, call the weather tool and explain the result and safety implications.",
+            "- For scheduling/booking (classes, camps, private coaching), use the calendar/scheduling tools when available.",
+            "- For confirmations and reminders, use the messaging/notifications tools when available.",
+            "- For future outdoor planning, prefer a forecast tool when available (not just current conditions).",
             "- If the user needs to sign a waiver (first visit, waiver questions), direct them to the online waiver page at /waiver. If they are under 18, a parent/guardian must sign.",
             "- When asked about policies, class descriptions, coach bios, or general FAQs, use the knowledge search tool (RAG).",
             "- If you use knowledge search, include a short 'Sources' list at the end with the sourceIds you relied on.",
@@ -305,6 +309,8 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 
 async def run(input: Input) -> Output:
     tools, trace = make_tools()
+    mcp_tools = await load_mcp_tools_from_env()
+    all_tools = tools + mcp_tools
 
     llm = ChatOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
@@ -312,8 +318,8 @@ async def run(input: Input) -> Output:
         temperature=0.2,
     )
 
-    model = llm.bind_tools(tools)
-    tool_map = {t.name: t for t in tools}
+    model = llm.bind_tools(all_tools)
+    tool_map = {t.name: t for t in all_tools}
 
     messages: list[Any] = [
         SystemMessage(content=build_system_prompt()),

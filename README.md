@@ -36,3 +36,40 @@ Open `http://localhost:3000/chat`.
 
 Web calls `POST /api/agent/run` (server-side proxy) → `<DEPLOYMENT_URL>/runs/wait`.
 
+## MCP tools (optional)
+
+The hosted Python agent can load tools from one or more **MCP servers** (recommended transport: **Streamable HTTP**).
+
+- Configure MCP servers via `MCP_SERVERS_JSON` (see `.env.example`).
+- Tool governance:
+  - `MCP_TOOL_NAME_PREFIX=1` prefixes tool names with `<server>_` to avoid collisions.
+  - `MCP_TOOL_ALLOWLIST` / `MCP_TOOL_DENYLIST` (comma-separated) restricts which tools the model can call.
+
+Recommended MCP tool categories for a climbing gym:
+
+- **Scheduling**: class/private coaching booking + availability.
+- **Messaging**: SMS/email confirmations + reminders.
+- **Forecast weather**: hourly/daily forecast for outdoor wall operations.
+
+### SendGrid MCP server (Cloudflare Workers)
+
+This repo includes a deployable MCP server you can run on Cloudflare Workers:
+
+- App: `apps/sendgrid-mcp`
+- Endpoint: `https://<your-worker>.workers.dev/mcp`
+- Tools (prefixed in the gym agent as `sendgrid_<tool>` when `MCP_TOOL_NAME_PREFIX=1`):
+  - `sendEmail`
+  - `scheduleEmail`
+  - `sendEmailWithTemplate`
+
+Deploy steps (high level):
+
+- `pnpm -C apps/sendgrid-mcp dev` (local worker)
+- `pnpm -C apps/sendgrid-mcp deploy` (deploy)
+- Set Worker secrets:
+  - `SENDGRID_API_KEY`
+  - `SENDGRID_FROM_EMAIL`
+  - (optional) `MCP_API_KEY` (require `x-api-key` header)
+
+Then in your **gym LangSmith Deployment** env vars, set `MCP_SERVERS_JSON` to point at that `/mcp` endpoint.
+
