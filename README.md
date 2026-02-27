@@ -73,3 +73,21 @@ Deploy steps (high level):
 
 Then in your **gym LangSmith Deployment** env vars, set `MCP_SERVERS_JSON` to point at that `/mcp` endpoint.
 
+### Weather MCP server (Cloudflare Workers, OpenWeather One Call 3.0)
+
+This repo includes a deployable MCP server you can run on Cloudflare Workers:
+
+- App: `apps/weather-mcp`
+- Endpoint: `https://<your-worker>.workers.dev/mcp`
+- Tools (prefixed in the gym agent as `weather_<tool>` when `MCP_TOOL_NAME_PREFIX=1`):
+  - `weather_onecall`
+  - `weather_current`
+  - `weather_forecast_hourly` (up to 48h)
+  - `weather_forecast_daily` (up to 8 days)
+  - `weather_alerts`
+
+Worker secrets:
+
+- `OPENWEATHER_API_KEY`
+- (optional) `MCP_API_KEY` (require `x-api-key` header)
+

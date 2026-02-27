@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -26,6 +27,124 @@ from .weather import get_current_weather
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _format_usd(cents: int) -> str:
+    return f"${cents/100:.2f}"
+
+
+def _waiver_email(session: Optional["Session"]) -> str:
+    if not session or not isinstance(session.waiver, dict):
+        return ""
+    v = session.waiver.get("participantEmail")
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _waiver_participant(session: Optional["Session"]) -> str:
+    if not session or not isinstance(session.waiver, dict):
+        return ""
+    v = session.waiver.get("participantName")
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _is_minor(session: Optional["Session"]) -> Optional[bool]:
+    if not session or not isinstance(session.waiver, dict):
+        return None
+    v = session.waiver.get("isMinor")
+    return bool(v) if isinstance(v, bool) else None
+
+
+def _safe_cart_lines(session: Optional["Session"]) -> list[dict[str, Any]]:
+    if not session or not isinstance(session.cartLines, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in session.cartLines:
+        if not isinstance(it, dict):
+            continue
+        sku = it.get("sku")
+        qty = it.get("quantity", 1)
+        if not isinstance(sku, str) or not sku.strip():
+            continue
+        q = int(qty) if isinstance(qty, (int, float)) else 1
+        out.append({"sku": sku.strip(), "quantity": max(1, q)})
+    return out
+
+
+async def _send_email_via_sendgrid(to_email: str, subject: str, text: str) -> tuple[bool, str]:
+    to_email = (to_email or "").strip()
+    if not to_email:
+        return False, "missing recipient email"
+
+    mcp_tools = await load_mcp_tools_from_env()
+    tool = next((t for t in mcp_tools if getattr(t, "name", "") == "sendgrid_sendEmail"), None)
+    if not tool:
+        return False, "sendgrid_sendEmail tool not available (MCP not configured or allowlist blocked it)"
+
+    try:
+        await tool.ainvoke({"to": to_email, "subject": subject, "text": text})
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+async def _handle_checkout(session: Optional["Session"]) -> "Output":
+    cart_lines = _safe_cart_lines(session)
+    if not cart_lines:
+        return Output(
+            answer="Cart is empty.",
+            citations=[],
+        )
+
+    email = _waiver_email(session)
+    participant = _waiver_participant(session) or "Guest"
+
+    line_texts: list[str] = []
+    subtotal = 0
+    for l in cart_lines:
+        sku = str(l.get("sku"))
+        qty = int(l.get("quantity", 1))
+        item = catalog_item_by_sku(sku)
+        if not item:
+            line_texts.append(f"- {sku} x{qty} (unknown item)")
+            continue
+        line_total = int(item.priceCents) * qty
+        subtotal += line_total
+        line_texts.append(f"- {item.name} ({sku}) x{qty}: {_format_usd(line_total)}")
+
+    receipt = "\n".join(
+        [
+            f"Receipt for {participant}",
+            "",
+            *line_texts,
+            "",
+            f"Total: {_format_usd(subtotal)}",
+            f"As of: {_now_iso()}",
+        ]
+    )
+
+    emailed = False
+    email_err = ""
+    if email:
+        emailed, email_err = await _send_email_via_sendgrid(
+            to_email=email,
+            subject="Your Climb Gym Copilot receipt",
+            text=receipt,
+        )
+
+    msg = f"Checkout complete. Total: {_format_usd(subtotal)}."
+    if email:
+        msg += f" Receipt email {'sent' if emailed else 'failed'} to {email}."
+        if email_err and not emailed:
+            msg += f" ({email_err})"
+    else:
+        msg += " No email on file (complete a waiver to add email)."
+
+    return Output(
+        answer=msg,
+        citations=[],
+        cartActions=[{"op": "clear"}],
+        uiActions=[{"type": "navigate", "to": "/cart", "reason": "checkout complete"}],
+    )
 
 
 class Session(BaseModel):
@@ -80,6 +199,9 @@ def build_system_prompt() -> str:
             "- For scheduling/booking (classes, camps, private coaching), use the calendar/scheduling tools when available.",
             "- For confirmations and reminders, use the messaging/notifications tools when available.",
             "- For future outdoor planning, prefer a forecast tool when available (not just current conditions).",
+            "- For class reservations, search classes then reserve seats via the ops reservation tool, then send a confirmation email when possible.",
+            "- For checkout, provide a concise receipt and send an email receipt when possible.",
+            "- If discussing a specific outdoor class that is scheduled in the future, include forecast context for that class time when possible.",
             "- If the user needs to sign a waiver (first visit, waiver questions), direct them to the online waiver page at /waiver. If they are under 18, a parent/guardian must sign.",
             "- When asked about policies, class descriptions, coach bios, or general FAQs, use the knowledge search tool (RAG).",
             "- If you use knowledge search, include a short 'Sources' list at the end with the sourceIds you relied on.",
@@ -108,8 +230,9 @@ def build_session_prompt(session: Optional[Session]) -> str:
     if session and session.userGoals:
         lines.append(f"UserGoals: {session.userGoals}")
     if session and session.waiver and isinstance(session.waiver, dict) and session.waiver.get("id"):
+        email = session.waiver.get("participantEmail")
         lines.append(
-            f"WaiverOnFile: yes (id={session.waiver.get('id')}, participant={session.waiver.get('participantName')}, minor={session.waiver.get('isMinor')})"
+            f"WaiverOnFile: yes (id={session.waiver.get('id')}, participant={session.waiver.get('participantName')}, email={email}, minor={session.waiver.get('isMinor')})"
         )
     else:
         lines.append("WaiverOnFile: unknown")
@@ -278,6 +401,96 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         args_schema=OpsClassAvailArgs,
     )
 
+    class OpsClassSearchArgs(BaseModel):
+        query: str = Field(min_length=1)
+        limit: Optional[int] = Field(default=8, ge=1, le=20)
+
+    def ops_search_classes(query: str, limit: int = 8) -> str:
+        trace.ops_endpoints.add("classes/search")
+        trace.ops_as_of = _now_iso()
+        q = query.strip().lower()
+        items = []
+        for c in CLASSES:
+            title = str(c.get("title", ""))
+            cid = str(c.get("id", ""))
+            if q not in f"{cid} {title}".lower():
+                continue
+            is_outdoor = "outdoor" in cid.lower() or "outdoor" in title.lower()
+            items.append({**c, "isOutdoor": is_outdoor})
+        return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/search", "payload": items[:limit]}, indent=2)
+
+    ops_class_search_tool = StructuredTool.from_function(
+        name="ops_search_classes",
+        description="Search classes by text query (returns classId, title, startTimeISO, capacity, isOutdoor). Use this to find classIds for reservations.",
+        func=lambda query, limit=8: ops_search_classes(query=query, limit=limit),
+        args_schema=OpsClassSearchArgs,
+    )
+
+    class OpsReserveClassArgs(BaseModel):
+        classId: str = Field(min_length=1)
+        participantEmail: Optional[str] = None
+        participantName: Optional[str] = None
+
+    async def ops_reserve_class(classId: str, participantEmail: Optional[str] = None, participantName: Optional[str] = None) -> str:
+        trace.ops_endpoints.add("classes/reserve")
+        trace.ops_as_of = _now_iso()
+        gym_class = next((c for c in CLASSES if c["id"] == classId), None)
+        if not gym_class:
+            return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/reserve", "error": "Unknown classId"}, indent=2)
+
+        enrolled = int(CLASS_ENROLLMENTS.get(classId, 0))
+        capacity = int(gym_class.get("capacity", 0) or 0)
+        seats_left = max(0, capacity - enrolled)
+        if seats_left <= 0:
+            return json.dumps(
+                {
+                    "asOfISO": trace.ops_as_of,
+                    "endpoint": "classes/reserve",
+                    "error": "No seats left",
+                    "payload": {"classId": classId, "capacity": capacity, "enrolled": enrolled, "seatsLeft": seats_left},
+                },
+                indent=2,
+            )
+
+        CLASS_ENROLLMENTS[classId] = enrolled + 1
+        next_seats_left = max(0, capacity - (enrolled + 1))
+        reservation_id = f"res_{uuid.uuid4().hex[:12]}"
+
+        emailed = False
+        email_err = ""
+        to_email = participantEmail.strip() if isinstance(participantEmail, str) else ""
+        if to_email:
+            subject = f"Class reservation confirmed: {gym_class.get('title')}"
+            body = "\n".join(
+                [
+                    "Your class reservation is confirmed.",
+                    f"ReservationId: {reservation_id}",
+                    f"Class: {gym_class.get('title')} ({classId})",
+                    f"Start: {gym_class.get('startTimeISO')}",
+                    f"DurationMinutes: {gym_class.get('durationMinutes')}",
+                    f"As of: {trace.ops_as_of}",
+                ]
+            )
+            emailed, email_err = await _send_email_via_sendgrid(to_email=to_email, subject=subject, text=body)
+
+        payload = {
+            "reservationId": reservation_id,
+            "class": gym_class,
+            "seatsLeft": next_seats_left,
+            "participantEmail": to_email or None,
+            "participantName": participantName.strip() if isinstance(participantName, str) and participantName.strip() else None,
+            "emailSent": emailed,
+            "emailError": email_err or None,
+        }
+        return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/reserve", "payload": payload}, indent=2)
+
+    ops_reserve_class_tool = StructuredTool.from_function(
+        name="ops_reserve_class",
+        description="Reserve a seat in a class by classId. Include participantEmail to send a confirmation email via messaging tools when available.",
+        coroutine=ops_reserve_class,
+        args_schema=OpsReserveClassArgs,
+    )
+
     class WeatherArgs(BaseModel):
         lat: Optional[float] = Field(default=None, ge=-90, le=90)
         lon: Optional[float] = Field(default=None, ge=-180, le=180)
@@ -301,13 +514,18 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         ops_catalog_search_tool,
         ops_catalog_get_tool,
         ops_product_tool,
+        ops_class_search_tool,
         ops_class_tool,
+        ops_reserve_class_tool,
         weather_tool,
     ]
     return tools, trace
 
 
 async def run(input: Input) -> Output:
+    if input.message.strip() == "__CHECKOUT__":
+        return await _handle_checkout(input.session)
+
     tools, trace = make_tools()
     mcp_tools = await load_mcp_tools_from_env()
     all_tools = tools + mcp_tools

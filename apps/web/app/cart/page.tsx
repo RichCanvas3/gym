@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
+import { useWaiver } from "@/components/waiver/WaiverProvider";
 
 type CatalogItem = {
   sku: string;
@@ -22,7 +23,10 @@ function formatUSD(cents: number) {
 
 export default function CartPage() {
   const { lines, removeSku, clear } = useCart();
+  const { waiver } = useWaiver();
   const [catalogBySku, setCatalogBySku] = useState<Record<string, CatalogItem>>({});
+  const [checkoutBusy, setCheckoutBusy] = useState(false);
+  const [checkoutMsg, setCheckoutMsg] = useState<string>("");
 
   useEffect(() => {
     let cancelled = false;
@@ -115,16 +119,64 @@ export default function CartPage() {
         </main>
 
         <footer className="flex items-center justify-between">
-          <button
-            onClick={() => clear()}
-            className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium dark:border-white/10"
-          >
-            Clear cart
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => clear()}
+              className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium dark:border-white/10"
+            >
+              Clear cart
+            </button>
+            <button
+              disabled={checkoutBusy || lines.length === 0}
+              onClick={async () => {
+                setCheckoutMsg("");
+                if (!waiver?.participantEmail) {
+                  setCheckoutMsg("Checkout requires a waiver on file (for email receipt).");
+                  return;
+                }
+                setCheckoutBusy(true);
+                try {
+                  const res = await fetch("/api/checkout", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                      session: {
+                        gymName: "Front Range Climbing (Boulder)",
+                        timezone: "America/Denver",
+                        cartLines: lines,
+                        waiver: {
+                          id: waiver.id,
+                          participantName: waiver.participantName,
+                          participantEmail: waiver.participantEmail,
+                          isMinor: waiver.isMinor,
+                        },
+                      },
+                    }),
+                  });
+                  const json = (await res.json().catch(() => ({}))) as unknown;
+                  const j = json as Record<string, unknown>;
+                  if (!res.ok) {
+                    setCheckoutMsg(String(j?.error ?? j?.detail ?? "Checkout failed."));
+                    return;
+                  }
+                  clear();
+                  setCheckoutMsg(String(j?.answer ?? "Checkout complete."));
+                } finally {
+                  setCheckoutBusy(false);
+                }
+              }}
+              className="h-10 rounded-xl bg-zinc-900 px-3 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-black"
+            >
+              {checkoutBusy ? "Checking out…" : "Checkout + email receipt"}
+            </button>
+          </div>
           <Link href="/" className="text-sm text-zinc-600 underline dark:text-zinc-400">
             Home
           </Link>
         </footer>
+        {checkoutMsg ? (
+          <div className="text-sm text-zinc-600 dark:text-zinc-400">{checkoutMsg}</div>
+        ) : null}
       </div>
     </div>
   );

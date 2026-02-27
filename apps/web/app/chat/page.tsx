@@ -58,7 +58,12 @@ export default function ChatPage() {
           timezone: "America/Denver",
           cartLines: lines,
           waiver: waiver
-            ? { id: waiver.id, participantName: waiver.participantName, isMinor: waiver.isMinor }
+            ? {
+                id: waiver.id,
+                participantName: waiver.participantName,
+                participantEmail: waiver.participantEmail,
+                isMinor: waiver.isMinor,
+              }
             : undefined,
         },
       };
