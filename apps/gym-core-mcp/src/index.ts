@@ -303,6 +303,97 @@ function createServer(env: Env) {
     return { content: [{ type: "text", text: jsonText({ classDefinitions: defs }) }] };
   });
 
+  const ProductArgs = z.object({
+    sku: z.string().min(1),
+    name: z.string().min(1),
+    category: z.string().min(1),
+    priceCents: z.number().int().nonnegative(),
+    descriptionSourceId: z.string().min(3).optional(),
+  });
+
+  server.tool("core_upsert_product", "Upsert a product definition.", ProductArgs.shape, async (args) => {
+    const parsed = ProductArgs.parse(args);
+    const ts = nowISO();
+    await env.DB.prepare(
+      `
+      INSERT INTO products (sku, name, category, price_cents, description_source_id, created_at_iso, updated_at_iso)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(sku) DO UPDATE SET
+        name=excluded.name,
+        category=excluded.category,
+        price_cents=excluded.price_cents,
+        description_source_id=excluded.description_source_id,
+        updated_at_iso=excluded.updated_at_iso
+    `,
+    )
+      .bind(
+        parsed.sku,
+        parsed.name,
+        parsed.category,
+        parsed.priceCents,
+        parsed.descriptionSourceId ?? null,
+        ts,
+        ts,
+      )
+      .run();
+    return { content: [{ type: "text", text: jsonText({ sku: parsed.sku }) }] };
+  });
+
+  server.tool("core_list_products", "List product definitions.", {}, async () => {
+    const res = await env.DB.prepare(
+      `SELECT sku, name, category, price_cents, description_source_id FROM products ORDER BY category ASC, name ASC`,
+    ).all();
+    const products = (res.results ?? []).map((r: any) => ({
+      sku: String(r.sku ?? ""),
+      name: String(r.name ?? ""),
+      category: String(r.category ?? ""),
+      priceCents: Number(r.price_cents ?? 0),
+      descriptionSourceId: r.description_source_id ? String(r.description_source_id) : null,
+    }));
+    return { content: [{ type: "text", text: jsonText({ products }) }] };
+  });
+
+  server.tool(
+    "core_link_class_def_product",
+    "Associate a product SKU to a class definition.",
+    { classDefId: z.string().min(1), sku: z.string().min(1) },
+    async (args) => {
+      const parsed = z.object({ classDefId: z.string().min(1), sku: z.string().min(1) }).parse(args);
+      await env.DB.prepare(`INSERT OR IGNORE INTO class_def_products (class_def_id, sku) VALUES (?, ?)`)
+        .bind(parsed.classDefId, parsed.sku)
+        .run();
+      return { content: [{ type: "text", text: jsonText({ linked: true }) }] };
+    },
+  );
+
+  server.tool(
+    "core_list_class_def_products",
+    "List products associated to class definitions (optionally filtered by classDefId).",
+    { classDefId: z.string().min(1).optional() },
+    async (args) => {
+      const parsed = z.object({ classDefId: z.string().min(1).optional() }).parse(args);
+      const res = await env.DB.prepare(
+        `
+        SELECT c.class_def_id, p.sku, p.name, p.category, p.price_cents, p.description_source_id
+        FROM class_def_products c JOIN products p ON p.sku = c.sku
+        WHERE (? IS NULL OR c.class_def_id = ?)
+        ORDER BY c.class_def_id ASC, p.category ASC, p.name ASC
+      `,
+      )
+        .bind(parsed.classDefId ?? null, parsed.classDefId ?? null)
+        .all();
+      const items = (res.results ?? []).map((r: any) => ({
+        classDefId: String(r.class_def_id ?? ""),
+        sku: String(r.sku ?? ""),
+        name: String(r.name ?? ""),
+        category: String(r.category ?? ""),
+        priceCents: Number(r.price_cents ?? 0),
+        descriptionSourceId: r.description_source_id ? String(r.description_source_id) : null,
+      }));
+      return { content: [{ type: "text", text: jsonText({ items }) }] };
+    },
+  );
+
   server.tool(
     "core_create_order",
     "Create an order for an account (stores JSON items).",

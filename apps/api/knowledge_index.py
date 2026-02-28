@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from langchain_openai import OpenAIEmbeddings
+from .mcp_tools import load_mcp_tools_from_env
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,8 @@ def _read_markdown_docs() -> list[dict[str, Any]]:
 
 
 _CACHED_INDEX: list[IndexedChunk] | None = None
+_CACHED_INDEX_MCP: list[IndexedChunk] | None = None
+_CACHED_INDEX_MCP_BUILT_AT: float | None = None
 
 
 def build_index() -> list[IndexedChunk]:
@@ -62,11 +67,119 @@ def build_index() -> list[IndexedChunk]:
     return out
 
 
+def _tool_raw_to_json(raw: Any) -> dict[str, Any] | None:
+    try:
+        if isinstance(raw, dict):
+            content = raw.get("content")
+            if isinstance(content, list):
+                raw = content
+            else:
+                return raw
+
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    return json.loads(str(item.get("text")))
+            return None
+
+        if isinstance(raw, str):
+            return json.loads(raw)
+
+        return None
+    except Exception:
+        return None
+
+
+async def _mcp_call_json(tool_suffix: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    tools = await load_mcp_tools_from_env()
+    tool = next(
+        (
+            t
+            for t in tools
+            if isinstance(getattr(t, "name", None), str)
+            and (t.name == tool_suffix or t.name.endswith(f"_{tool_suffix}"))
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke(args if isinstance(args, dict) else {})
+        return _tool_raw_to_json(raw)
+    except Exception:
+        return None
+
+
 def ensure_index() -> list[IndexedChunk]:
     global _CACHED_INDEX
     if _CACHED_INDEX is None:
         _CACHED_INDEX = build_index()
     return _CACHED_INDEX
+
+
+async def ensure_index_with_mcp(ttl_seconds: int = 300) -> list[IndexedChunk]:
+    """
+    Builds a KB index from:
+    - local markdown in packages/knowledge/content
+    - content-mcp docs (markdown)
+    - core lists (class defs, instructors, products) as synthetic docs
+    Cached in-memory with a TTL.
+    """
+    global _CACHED_INDEX_MCP, _CACHED_INDEX_MCP_BUILT_AT
+    now = asyncio.get_running_loop().time()
+    if (
+        _CACHED_INDEX_MCP is not None
+        and _CACHED_INDEX_MCP_BUILT_AT is not None
+        and (now - _CACHED_INDEX_MCP_BUILT_AT) < ttl_seconds
+    ):
+        return _CACHED_INDEX_MCP
+
+    docs = _read_markdown_docs()
+
+    content = await _mcp_call_json("content_list_docs", {"limit": 500})
+    if isinstance(content, dict) and isinstance(content.get("docs"), list):
+        for d in content.get("docs") or []:
+            if not isinstance(d, dict):
+                continue
+            body = d.get("bodyMarkdown")
+            if not isinstance(body, str) or not body.strip():
+                continue
+            entity_type = str(d.get("entityType") or "other")
+            entity_id = str(d.get("entityId") or "")
+            locale = str(d.get("locale") or "en")
+            doc_id = str(d.get("docId") or "")
+            source_id = f"cms/{entity_type}/{entity_id}/{locale}#{doc_id}".replace("//", "/")
+            docs.append({"sourceId": source_id, "text": body})
+
+    class_defs = await _mcp_call_json("core_list_class_definitions", {})
+    if isinstance(class_defs, dict) and isinstance(class_defs.get("classDefinitions"), list):
+        docs.append({"sourceId": "core/class_definitions.json", "text": json.dumps(class_defs, indent=2)})
+
+    instructors = await _mcp_call_json("core_list_instructors", {})
+    if isinstance(instructors, dict) and isinstance(instructors.get("instructors"), list):
+        docs.append({"sourceId": "core/instructors.json", "text": json.dumps(instructors, indent=2)})
+
+    products = await _mcp_call_json("core_list_products", {})
+    if isinstance(products, dict) and isinstance(products.get("products"), list):
+        docs.append({"sourceId": "core/products.json", "text": json.dumps(products, indent=2)})
+
+    chunks: list[tuple[str, str]] = []
+    for d in docs:
+        for piece in chunk_text(str(d["text"]), chunk_size=900, overlap=150):
+            chunks.append((str(d["sourceId"]), piece))
+
+    embeddings = OpenAIEmbeddings(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        model=os.environ.get("OPENAI_EMBEDDINGS_MODEL", "text-embedding-3-large"),
+    )
+    vectors = embeddings.embed_documents([t for (_, t) in chunks]) if chunks else []
+    out: list[IndexedChunk] = []
+    for i, (sid, text) in enumerate(chunks):
+        out.append(IndexedChunk(sourceId=sid, text=text, embedding=list(vectors[i] or [])))
+
+    _CACHED_INDEX_MCP = out
+    _CACHED_INDEX_MCP_BUILT_AT = now
+    return out
 
 
 def search_kb(index: list[IndexedChunk], query: str, k: int = 4) -> tuple[str, list[KnowledgeHit]]:

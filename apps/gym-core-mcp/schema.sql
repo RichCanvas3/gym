@@ -65,6 +65,26 @@ CREATE TABLE IF NOT EXISTS class_definitions (
 
 CREATE INDEX IF NOT EXISTS idx_class_definitions_type ON class_definitions(type);
 
+CREATE TABLE IF NOT EXISTS products (
+  sku TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL, -- e.g. 'access' | 'membership' | 'rental' | 'retail' | 'camp' | 'coaching'
+  price_cents INTEGER NOT NULL,
+  description_source_id TEXT, -- rich content sourceId (optional)
+  created_at_iso TEXT NOT NULL,
+  updated_at_iso TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
+
+CREATE TABLE IF NOT EXISTS class_def_products (
+  class_def_id TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  PRIMARY KEY (class_def_id, sku),
+  FOREIGN KEY (class_def_id) REFERENCES class_definitions(class_def_id),
+  FOREIGN KEY (sku) REFERENCES products(sku)
+);
+
 CREATE TABLE IF NOT EXISTS orders (
   order_id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,

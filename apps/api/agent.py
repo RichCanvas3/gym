@@ -12,7 +12,7 @@ from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from .knowledge_index import KnowledgeHit, ensure_index, search_kb
+from .knowledge_index import KnowledgeHit, ensure_index_with_mcp, search_kb
 from .mcp_tools import load_mcp_tools_from_env
 from .ops_data import (
     CAMP_ENROLLMENTS,
@@ -566,14 +566,15 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("Missing OPENAI_API_KEY")
 
-    index = ensure_index()
     trace = _Trace()
 
     class KnowledgeSearchArgs(BaseModel):
         query: str = Field(min_length=1)
         k: Optional[int] = Field(default=4, ge=1, le=10)
 
-    def knowledge_search(query: str, k: int = 4) -> str:
+    async def knowledge_search(query: str, k: int = 4) -> str:
+        ttl = int(float(os.environ.get("KB_INDEX_TTL_SECONDS", "300")))
+        index = await ensure_index_with_mcp(ttl_seconds=max(10, ttl))
         tool_text, hits = search_kb(index, query, k=k)
         for h in hits:
             trace.citations.append({"sourceId": h.sourceId, "snippet": h.snippet})
@@ -582,7 +583,7 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     knowledge_tool = StructuredTool.from_function(
         name="knowledge_search",
         description="Search the gym knowledge base (policies, hours, class descriptions, coach bios, rentals). Use this for FAQs and policy questions.",
-        func=lambda query, k=4: knowledge_search(query=query, k=k),
+        coroutine=knowledge_search,
         args_schema=KnowledgeSearchArgs,
     )
 

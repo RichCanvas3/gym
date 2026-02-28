@@ -50,14 +50,15 @@ The hosted Python agent can load tools from one or more **MCP servers** (recomme
 If you deployed the Workers below, set these in your **LangSmith Deployment** env vars:
 
 - `MCP_TOOL_NAME_PREFIX=1`
-- `MCP_SERVERS_JSON={"core":{"transport":"streamable_http","url":"https://gym-core-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}},"sendgrid":{"transport":"streamable_http","url":"https://gym-sendgrid-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}},"weather":{"transport":"streamable_http","url":"https://gym-weather-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}},"scheduling":{"transport":"streamable_http","url":"https://gym-scheduling-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}}}`
-- `MCP_TOOL_ALLOWLIST=sendgrid_sendEmail,sendgrid_scheduleEmail,sendgrid_sendEmailWithTemplate,weather_weather_current,weather_weather_forecast_hourly,weather_weather_forecast_daily,weather_weather_alerts,scheduling_schedule_upsert_instructor,scheduling_schedule_list_instructors,scheduling_schedule_create_class,scheduling_schedule_assign_instructor,scheduling_schedule_list_classes,scheduling_schedule_list_reservations,scheduling_schedule_reserve_seat,scheduling_schedule_cancel_reservation,core_core_list_instructors,core_core_list_class_definitions,core_core_upsert_customer,core_core_record_reservation`
+- `MCP_SERVERS_JSON={"core":{"transport":"streamable_http","url":"https://gym-core-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}},"content":{"transport":"streamable_http","url":"https://gym-content-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}},"sendgrid":{"transport":"streamable_http","url":"https://gym-sendgrid-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}},"weather":{"transport":"streamable_http","url":"https://gym-weather-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}},"scheduling":{"transport":"streamable_http","url":"https://gym-scheduling-mcp.richardpedersen3.workers.dev/mcp","headers":{"x-api-key":"gym"}}}`
+- `MCP_TOOL_ALLOWLIST=sendgrid_sendEmail,sendgrid_scheduleEmail,sendgrid_sendEmailWithTemplate,weather_weather_current,weather_weather_forecast_hourly,weather_weather_forecast_daily,weather_weather_alerts,scheduling_schedule_upsert_instructor,scheduling_schedule_list_instructors,scheduling_schedule_create_class,scheduling_schedule_assign_instructor,scheduling_schedule_list_classes,scheduling_schedule_list_reservations,scheduling_schedule_reserve_seat,scheduling_schedule_cancel_reservation,core_core_list_instructors,core_core_list_class_definitions,core_core_upsert_product,core_core_list_products,core_core_link_class_def_product,core_core_list_class_def_products,core_core_upsert_customer,core_core_record_reservation,content_content_list_docs,content_content_get_doc,content_content_get_doc_by_entity,content_content_upsert_doc`
 
 Example `MCP_SERVERS_JSON` (core + scheduler + weather + sendgrid):
 
 ```json
 {
   "core": { "transport": "streamable_http", "url": "https://<core>.workers.dev/mcp", "headers": { "x-api-key": "..." } },
+  "content": { "transport": "streamable_http", "url": "https://<content>.workers.dev/mcp", "headers": { "x-api-key": "..." } },
   "scheduling": { "transport": "streamable_http", "url": "https://<scheduling>.workers.dev/mcp", "headers": { "x-api-key": "..." } },
   "weather": { "transport": "streamable_http", "url": "https://<weather>.workers.dev/mcp", "headers": { "x-api-key": "..." } },
   "sendgrid": { "transport": "streamable_http", "url": "https://<sendgrid>.workers.dev/mcp", "headers": { "x-api-key": "..." } }
@@ -69,6 +70,7 @@ Example `MCP_SERVERS_JSON` (core + scheduler + weather + sendgrid):
 Recommended MCP tool categories for a climbing gym:
 
 - **Gym-core (canonical)**: accounts/customers/instructors/class definitions/orders/reservation ledger.
+- **Content (rich)**: markdown descriptions for classes/instructors/products, linked to core ids.
 - **Scheduling**: class/private coaching booking + availability.
 - **Messaging**: SMS/email confirmations + reminders.
 - **Forecast weather**: hourly/daily forecast for outdoor wall operations.
