@@ -38,35 +38,49 @@ function demoDefaultEnabled() {
 
 export function WaiverProvider({ children }: { children: React.ReactNode }) {
   const [waiver, setWaiverState] = useState<WaiverInfo | null>(() => {
-    try {
-      if (typeof window === "undefined") return null;
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return demoDefaultEnabled() ? DEFAULT_DEMO_WAIVER : null;
-      const parsed = JSON.parse(raw) as unknown;
-      if (!parsed || typeof parsed !== "object") return null;
-      const o = parsed as Record<string, unknown>;
-      if (typeof o.id !== "string" || typeof o.createdAtISO !== "string") return null;
-      if (typeof o.accountAddress !== "string") return null;
-      if (typeof o.participantName !== "string" || typeof o.participantEmail !== "string") return null;
-      if (typeof o.participantDobISO !== "string" || typeof o.isMinor !== "boolean") return null;
-      return {
-        id: o.id,
-        createdAtISO: o.createdAtISO,
-        accountAddress: o.accountAddress,
-        participantName: o.participantName,
-        participantEmail: o.participantEmail,
-        participantDobISO: o.participantDobISO,
-        isMinor: o.isMinor,
-        guardianName: typeof o.guardianName === "string" ? o.guardianName : undefined,
-        guardianEmail: typeof o.guardianEmail === "string" ? o.guardianEmail : undefined,
-      };
-    } catch {
-      return demoDefaultEnabled() ? DEFAULT_DEMO_WAIVER : null;
-    }
+    return demoDefaultEnabled() ? DEFAULT_DEMO_WAIVER : null;
   });
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === "object") {
+          const o = parsed as Record<string, unknown>;
+          if (
+            typeof o.id === "string" &&
+            typeof o.createdAtISO === "string" &&
+            typeof o.accountAddress === "string" &&
+            typeof o.participantName === "string" &&
+            typeof o.participantEmail === "string" &&
+            typeof o.participantDobISO === "string" &&
+            typeof o.isMinor === "boolean"
+          ) {
+            setWaiverState({
+              id: o.id,
+              createdAtISO: o.createdAtISO,
+              accountAddress: o.accountAddress,
+              participantName: o.participantName,
+              participantEmail: o.participantEmail,
+              participantDobISO: o.participantDobISO,
+              isMinor: o.isMinor,
+              guardianName: typeof o.guardianName === "string" ? o.guardianName : undefined,
+              guardianEmail: typeof o.guardianEmail === "string" ? o.guardianEmail : undefined,
+            });
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (!hydrated) return;
       if (!waiver) {
         window.localStorage.removeItem(STORAGE_KEY);
       } else {
@@ -75,7 +89,7 @@ export function WaiverProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // ignore
     }
-  }, [waiver]);
+  }, [waiver, hydrated]);
 
   const value = useMemo<WaiverContextValue>(
     () => ({

@@ -19,35 +19,42 @@ const CartContext = createContext<CartContextValue | null>(null);
 const STORAGE_KEY = "climb_gym_cart_v1";
 
 export function CartProvider({ children }: { children: React.ReactNode }) {
-  const [lines, setLines] = useState<CartLine[]>(() => {
-    try {
-      if (typeof window === "undefined") return [];
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed
-        .map((x) => {
-          if (!x || typeof x !== "object") return null;
-          const o = x as Record<string, unknown>;
-          const sku = typeof o.sku === "string" ? o.sku : "";
-          const quantity = typeof o.quantity === "number" ? o.quantity : 1;
-          if (!sku) return null;
-          return { sku, quantity: Math.max(1, Math.floor(quantity)) };
-        })
-        .filter(Boolean) as CartLine[];
-    } catch {
-      return [];
-    }
-  });
+  const [lines, setLines] = useState<CartLine[]>([]);
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+          const next = parsed
+            .map((x) => {
+              if (!x || typeof x !== "object") return null;
+              const o = x as Record<string, unknown>;
+              const sku = typeof o.sku === "string" ? o.sku : "";
+              const quantity = typeof o.quantity === "number" ? o.quantity : 1;
+              if (!sku) return null;
+              return { sku, quantity: Math.max(1, Math.floor(quantity)) };
+            })
+            .filter(Boolean) as CartLine[];
+          setLines(next);
+        }
+      }
+    } catch {
+      // ignore
+    }
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (!hydrated) return;
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(lines));
     } catch {
       // ignore
     }
-  }, [lines]);
+  }, [lines, hydrated]);
 
   const value = useMemo<CartContextValue>(
     () => ({
