@@ -32,12 +32,16 @@ const DEFAULT_DEMO_WAIVER: WaiverInfo = {
   isMinor: false,
 };
 
+function demoDefaultEnabled() {
+  return (process.env.NEXT_PUBLIC_DEMO_DEFAULT_USER ?? "1").toLowerCase() !== "0";
+}
+
 export function WaiverProvider({ children }: { children: React.ReactNode }) {
   const [waiver, setWaiverState] = useState<WaiverInfo | null>(() => {
     try {
       if (typeof window === "undefined") return null;
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return null;
+      if (!raw) return demoDefaultEnabled() ? DEFAULT_DEMO_WAIVER : null;
       const parsed = JSON.parse(raw) as unknown;
       if (!parsed || typeof parsed !== "object") return null;
       const o = parsed as Record<string, unknown>;
@@ -57,20 +61,12 @@ export function WaiverProvider({ children }: { children: React.ReactNode }) {
         guardianEmail: typeof o.guardianEmail === "string" ? o.guardianEmail : undefined,
       };
     } catch {
-      return null;
+      return demoDefaultEnabled() ? DEFAULT_DEMO_WAIVER : null;
     }
   });
 
   useEffect(() => {
     try {
-      // Demo-mode default: if no waiver exists, act like Casey is signed in.
-      // Disable by setting NEXT_PUBLIC_DEMO_DEFAULT_USER=0.
-      const demoDefault =
-        (process.env.NEXT_PUBLIC_DEMO_DEFAULT_USER ?? "1").toLowerCase() !== "0";
-      if (!waiver && demoDefault) {
-        setWaiverState(DEFAULT_DEMO_WAIVER);
-        return;
-      }
       if (!waiver) {
         window.localStorage.removeItem(STORAGE_KEY);
       } else {
