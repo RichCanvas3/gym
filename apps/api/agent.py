@@ -14,13 +14,6 @@ from pydantic import BaseModel, Field
 
 from .knowledge_index import KnowledgeHit, ensure_index_with_mcp, search_kb
 from .mcp_tools import load_mcp_tools_from_env
-from .ops_data import (
-    CAMP_ENROLLMENTS,
-    CAMPS,
-    PRODUCT_AVAILABILITY,
-    catalog_item_by_sku,
-    full_catalog,
-)
 
 
 def _now_iso() -> str:
@@ -265,18 +258,31 @@ async def _handle_checkout(session: Optional["Session"]) -> "Output":
     email = _waiver_email(session)
     participant = _waiver_participant(session) or "Guest"
 
+    core_products = await _core_call_json("core_list_products", {}) or {}
+    products_list = core_products.get("products") if isinstance(core_products, dict) else None
+    products_map: dict[str, dict[str, Any]] = {}
+    if isinstance(products_list, list):
+        for p in products_list:
+            if not isinstance(p, dict):
+                continue
+            sku = str(p.get("sku") or "").strip()
+            if sku:
+                products_map[sku] = p
+
     line_texts: list[str] = []
     subtotal = 0
     for l in cart_lines:
         sku = str(l.get("sku"))
         qty = int(l.get("quantity", 1))
-        item = catalog_item_by_sku(sku)
-        if not item:
+        p = products_map.get(sku)
+        if not isinstance(p, dict):
             line_texts.append(f"- {sku} x{qty} (unknown item)")
             continue
-        line_total = int(item.priceCents) * qty
+        name = str(p.get("name") or sku)
+        price_cents = int(p.get("priceCents") or 0)
+        line_total = price_cents * qty
         subtotal += line_total
-        line_texts.append(f"- {item.name} ({sku}) x{qty}: {_format_usd(line_total)}")
+        line_texts.append(f"- {name} ({sku}) x{qty}: {_format_usd(line_total)}")
 
     receipt = "\n".join(
         [
@@ -461,7 +467,9 @@ def build_system_prompt() -> str:
             "Rules:",
             "- Be accurate. If you don't know, say so.",
             "- Never invent class times, prices, or inventory.",
-            "- When asked about real-time availability (in stock, spots left, open private coaching slots), call the ops tool.",
+            "- For class seat availability, call scheduling MCP tools (or ops_class_availability wrapper).",
+            "- For products/pricing, use gym-core MCP (products/class definitions).",
+            "- If asked about retail inventory, be explicit that inventory is not connected unless an inventory MCP tool exists.",
             "- Outdoor wall access and outdoor classes are weather-dependent. For any outdoor access/class question, call the weather FORECAST tools (MCP) and explain the result and safety implications.",
             "- For scheduling/booking (classes, camps, private coaching), use the calendar/scheduling tools when available.",
             "- For confirmations and reminders, use the messaging/notifications tools when available.",
@@ -585,71 +593,6 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         description="Search the gym knowledge base (policies, hours, class descriptions, coach bios, rentals). Use this for FAQs and policy questions.",
         coroutine=knowledge_search,
         args_schema=KnowledgeSearchArgs,
-    )
-
-    class OpsCatalogSearchArgs(BaseModel):
-        query: str = Field(min_length=1)
-        limit: Optional[int] = Field(default=8, ge=1, le=20)
-
-    def ops_search_catalog(query: str, limit: int = 8) -> str:
-        trace.ops_endpoints.add("catalog/search")
-        trace.ops_as_of = _now_iso()
-        q = query.strip().lower()
-        items = [
-            it.__dict__
-            for it in full_catalog()
-            if q in f"{it.sku} {it.name} {it.category} {(it.description or '')}".lower()
-        ][:limit]
-        return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "catalog/search", "payload": items}, indent=2)
-
-    ops_catalog_search_tool = StructuredTool.from_function(
-        name="ops_search_catalog",
-        description="Search purchasable catalog items by text query (use this to find SKUs).",
-        func=lambda query, limit=8: ops_search_catalog(query=query, limit=limit),
-        args_schema=OpsCatalogSearchArgs,
-    )
-
-    class OpsCatalogGetArgs(BaseModel):
-        sku: str = Field(min_length=1)
-
-    def ops_get_catalog_item(sku: str) -> str:
-        trace.ops_endpoints.add("catalog/item")
-        trace.ops_as_of = _now_iso()
-        item = catalog_item_by_sku(sku)
-        payload = item.__dict__ if item else None
-        return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "catalog/item", "payload": payload}, indent=2)
-
-    ops_catalog_get_tool = StructuredTool.from_function(
-        name="ops_get_catalog_item",
-        description="Get one catalog item by SKU.",
-        func=lambda sku: ops_get_catalog_item(sku=sku),
-        args_schema=OpsCatalogGetArgs,
-    )
-
-    class OpsProductAvailArgs(BaseModel):
-        sku: str = Field(min_length=1)
-        size: Optional[str] = None
-
-    def ops_product_availability(sku: str, size: Optional[str] = None) -> str:
-        trace.ops_endpoints.add("products/availability")
-        trace.ops_as_of = _now_iso()
-        match = None
-        for p in PRODUCT_AVAILABILITY:
-            if p.get("sku") != sku:
-                continue
-            if size is None and p.get("size") is None:
-                match = p
-                break
-            if size is not None and p.get("size") == size:
-                match = p
-                break
-        return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "products/availability", "payload": match}, indent=2)
-
-    ops_product_tool = StructuredTool.from_function(
-        name="ops_product_availability",
-        description="Get real-time-ish product availability (inventory). Use for in-stock questions, especially rentals like shoes by size.",
-        func=lambda sku, size=None: ops_product_availability(sku=sku, size=size),
-        args_schema=OpsProductAvailArgs,
     )
 
     class OpsClassAvailArgs(BaseModel):
@@ -868,9 +811,6 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 
     tools = [
         knowledge_tool,
-        ops_catalog_search_tool,
-        ops_catalog_get_tool,
-        ops_product_tool,
         ops_class_search_tool,
         ops_class_tool,
         ops_reserve_class_tool,

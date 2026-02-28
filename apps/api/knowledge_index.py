@@ -34,6 +34,9 @@ def _knowledge_dir() -> Path:
 
 
 def _read_markdown_docs() -> list[dict[str, Any]]:
+    include_local = os.environ.get("KB_INCLUDE_LOCAL_MARKDOWN", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if not include_local:
+        return []
     base = _knowledge_dir()
     docs: list[dict[str, Any]] = []
     for p in base.rglob("*.md"):
