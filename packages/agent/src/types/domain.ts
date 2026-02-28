@@ -28,7 +28,7 @@ export type CartAction = {
 
 export type UiAction = {
   type: "navigate";
-  to: "/waiver" | "/cart" | "/shop" | "/chat";
+  to: "/waiver" | "/cart" | "/shop" | "/chat" | "/calendar";
   reason?: string;
 };
 

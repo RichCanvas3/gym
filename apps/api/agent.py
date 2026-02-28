@@ -325,9 +325,10 @@ def build_system_prompt() -> str:
             "  - Use real SKUs (use ops catalog tools if needed).",
             "- For web UI automation, you MAY also include these machine-readable directives at the very end (each on its own line):",
             "  - `CartActionsJSON:` followed by a JSON array of `{ op: \"add\"|\"remove\"|\"clear\", sku?, quantity?, note? }`.",
-            "  - `UIActionsJSON:` followed by a JSON array of `{ type: \"navigate\", to: \"/waiver\"|\"/cart\"|\"/shop\"|\"/chat\", reason? }`.",
+            "  - `UIActionsJSON:` followed by a JSON array of `{ type: \"navigate\", to: \"/waiver\"|\"/cart\"|\"/shop\"|\"/chat\"|\"/calendar\", reason? }`.",
             "- If a waiver must be signed before proceeding, include a UI action to navigate to `/waiver`.",
             "- If you add/remove items via CartActionsJSON, include a UI action to navigate to `/cart`.",
+            "- If the user asks to view the class schedule or calendar, include a UI action to navigate to `/calendar`.",
             "",
             "Keep responses concise and actionable.",
         ]

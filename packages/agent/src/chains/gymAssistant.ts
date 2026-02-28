@@ -349,7 +349,7 @@ function extractUiAndCart(text: string): {
   answer: string;
   suggestedCartItems?: Array<{ sku: string; quantity: number; note?: string }>;
   cartActions?: Array<{ op: "add" | "remove" | "clear"; sku?: string; quantity?: number; note?: string }>;
-  uiActions?: Array<{ type: "navigate"; to: "/waiver" | "/cart" | "/shop" | "/chat"; reason?: string }>;
+  uiActions?: Array<{ type: "navigate"; to: "/waiver" | "/cart" | "/shop" | "/chat" | "/calendar"; reason?: string }>;
 } {
   let answer = text;
 
@@ -430,13 +430,15 @@ function normalizeCartActions(
 
 function normalizeUiActions(value: unknown) {
   if (!Array.isArray(value)) return undefined;
-  const out: Array<{ type: "navigate"; to: "/waiver" | "/cart" | "/shop" | "/chat"; reason?: string }> = [];
+  const out: Array<{ type: "navigate"; to: "/waiver" | "/cart" | "/shop" | "/chat" | "/calendar"; reason?: string }> = [];
   for (const it of value) {
     if (!it || typeof it !== "object") continue;
     const o = it as Record<string, unknown>;
     if (o.type !== "navigate") continue;
     const to =
-      o.to === "/waiver" || o.to === "/cart" || o.to === "/shop" || o.to === "/chat" ? o.to : "";
+      o.to === "/waiver" || o.to === "/cart" || o.to === "/shop" || o.to === "/chat" || o.to === "/calendar"
+        ? o.to
+        : "";
     const reason = typeof o.reason === "string" ? o.reason : undefined;
     if (!to) continue;
     out.push({ type: "navigate", to, reason });

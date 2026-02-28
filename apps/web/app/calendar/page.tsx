@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { useWaiver } from "@/components/waiver/WaiverProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
+import { useRouter, useSearchParams } from "next/navigation";
 
 type GymClass = {
   id: string;
@@ -35,6 +36,17 @@ function startOfDayISO(d: Date) {
   return x.toISOString().slice(0, 10);
 }
 
+function isISODate(s: string) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function addDaysISO(isoDate: string, days: number) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  const ms = d.getTime();
+  if (!Number.isFinite(ms)) return isoDate;
+  return startOfDayISO(new Date(ms + days * 24 * 3600 * 1000));
+}
+
 function formatLocalTime(iso: string) {
   const d = new Date(iso);
   return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(d);
@@ -61,7 +73,9 @@ function pickNearestHour(hourly: HourlyForecast["hourly"], targetUnix: number) {
   return best;
 }
 
-export default function CalendarPage() {
+function CalendarInner() {
+  const router = useRouter();
+  const params = useSearchParams();
   const { waiver } = useWaiver();
   const { reservations, addReservation, clearReservations } = useReservations();
 
@@ -72,19 +86,24 @@ export default function CalendarPage() {
   const [reserveBusyId, setReserveBusyId] = useState<string>("");
   const [reserveMsg, setReserveMsg] = useState<string>("");
 
+  const weekStartISO = useMemo(() => {
+    const raw = String(params?.get("start") ?? "");
+    if (raw && isISODate(raw)) return raw;
+    return startOfDayISO(new Date());
+  }, [params]);
+
+  const weekDates = useMemo(() => {
+    const dates: string[] = [];
+    for (let i = 0; i < 7; i++) dates.push(addDaysISO(weekStartISO, i));
+    return dates;
+  }, [weekStartISO]);
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      const today = new Date();
-      const dates: string[] = [];
-      for (let i = 0; i < 7; i++) {
-        const d = new Date(today.getTime() + i * 24 * 3600 * 1000);
-        dates.push(startOfDayISO(d));
-      }
-
       const all: GymClass[] = [];
       let asOfISO = "";
-      for (const dateISO of dates) {
+      for (const dateISO of weekDates) {
         const res = await fetch(`/api/ops/classes/search?date=${encodeURIComponent(dateISO)}`, { cache: "no-store" });
         const json = (await res.json().catch(() => ({}))) as unknown;
         const j = json as Record<string, unknown>;
@@ -121,7 +140,7 @@ export default function CalendarPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [weekDates]);
 
   useEffect(() => {
     let cancelled = false;
@@ -152,15 +171,19 @@ export default function CalendarPage() {
 
   const grouped = useMemo(() => {
     const map = new Map<string, GymClass[]>();
+    for (const d of weekDates) map.set(d, []);
     for (const c of classes) {
       const d = new Date(c.startTimeISO);
       const key = d.toISOString().slice(0, 10);
-      const arr = map.get(key) ?? [];
-      arr.push(c);
-      map.set(key, arr);
+      const arr = map.get(key);
+      if (arr) arr.push(c);
+    }
+    for (const [k, arr] of map.entries()) {
+      arr.sort((a, b) => toUnix(a.startTimeISO) - toUnix(b.startTimeISO));
+      map.set(k, arr);
     }
     return [...map.entries()];
-  }, [classes]);
+  }, [classes, weekDates]);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-black dark:text-zinc-50">
@@ -169,8 +192,11 @@ export default function CalendarPage() {
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Class calendar</h1>
             <p className="text-sm text-zinc-600 dark:text-zinc-400">
-              Shows the next 7 days. Outdoor classes include a weather snapshot (48h).
+              Week view. Outdoor classes include a weather snapshot (48h).
             </p>
+            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">
+              Week: {weekDates[0]} → {weekDates[6]}
+            </div>
             {classAsOfISO ? (
               <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">Schedule as-of: {classAsOfISO}</div>
             ) : null}
@@ -179,6 +205,24 @@ export default function CalendarPage() {
             ) : null}
           </div>
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => router.push(`/calendar?start=${encodeURIComponent(addDaysISO(weekStartISO, -7))}`)}
+              className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
+            >
+              Prev
+            </button>
+            <button
+              onClick={() => router.push(`/calendar?start=${encodeURIComponent(startOfDayISO(new Date()))}`)}
+              className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
+            >
+              Today
+            </button>
+            <button
+              onClick={() => router.push(`/calendar?start=${encodeURIComponent(addDaysISO(weekStartISO, 7))}`)}
+              className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
+            >
+              Next
+            </button>
             <Link
               href="/chat"
               className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
@@ -200,126 +244,127 @@ export default function CalendarPage() {
               No classes found.
             </div>
           ) : (
-            grouped.map(([dateISO, items]) => (
-              <section key={dateISO} className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-sm font-semibold">{dateISO}</h2>
-                  <div className="text-xs text-zinc-600 dark:text-zinc-400">{items.length} classes</div>
-                </div>
-                <div className="mt-3 flex flex-col gap-3">
-                  {items.map((c) => {
-                    const isOutdoor = c.id.toLowerCase().includes("outdoor") || c.title.toLowerCase().includes("outdoor");
-                    const reservedId = reservationsByClassId.get(c.id);
-                    const t = toUnix(c.startTimeISO);
-                    const h = isOutdoor ? pickNearestHour(hourly?.hourly, t) : null;
-                    const weatherLine =
-                      isOutdoor && h
-                        ? `Temp ${typeof h.temp === "number" ? h.temp.toFixed(1) : "?"}°C • wind ${
-                            typeof h.wind_speed === "number" ? h.wind_speed.toFixed(1) : "?"
-                          } m/s gust ${
-                            typeof h.wind_gust === "number" ? h.wind_gust.toFixed(1) : "?"
-                          } • precip ${
-                            typeof h.pop === "number" ? Math.round(h.pop * 100) : "?"
-                          }%`
-                        : null;
-
-                    return (
-                      <div
-                        key={c.id}
-                        className={`rounded-xl border p-3 ${
-                          reservedId
-                            ? "border-emerald-300 bg-emerald-50 dark:border-emerald-400/40 dark:bg-emerald-400/10"
-                            : "border-zinc-200 dark:border-white/10"
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-4">
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-medium">
-                              {c.title}{" "}
-                              {isOutdoor ? (
-                                <span className="ml-2 rounded-full border border-zinc-200 px-2 py-0.5 text-xs dark:border-white/10">
-                                  Outdoor
-                                </span>
-                              ) : null}
-                              {reservedId ? (
-                                <span className="ml-2 rounded-full bg-emerald-600 px-2 py-0.5 text-xs font-semibold text-white">
-                                  Reserved
-                                </span>
-                              ) : null}
-                            </div>
-                            <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-                              {formatLocalTime(c.startTimeISO)} • {c.skillLevel} • {c.type} • {c.id}
-                            </div>
-                            {weatherLine ? (
-                              <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">{weatherLine}</div>
-                            ) : null}
-                          </div>
-                          <button
-                            disabled={reserveBusyId === c.id || !!reservedId}
-                            onClick={async () => {
-                              setReserveMsg("");
-                              if (!waiver?.id || !waiver.participantEmail) {
-                                setReserveMsg("Reserve requires a saved waiver (for email confirmation).");
-                                return;
-                              }
-                              setReserveBusyId(c.id);
-                              try {
-                                const res = await fetch("/api/agent/run", {
-                                  method: "POST",
-                                  headers: { "content-type": "application/json" },
-                                  body: JSON.stringify({
-                                    message: `__RESERVE_CLASS__:${c.id}`,
-                                    session: {
-                                      gymName: "Front Range Climbing (Boulder)",
-                                      timezone: "America/Denver",
-                                      waiver: {
-                                        id: waiver.id,
-                                        participantName: waiver.participantName,
-                                        participantEmail: waiver.participantEmail,
-                                        isMinor: waiver.isMinor,
-                                      },
-                                    },
-                                  }),
-                                });
-                                const json = (await res.json().catch(() => ({}))) as unknown;
-                                const j = json as Record<string, unknown>;
-                                if (!res.ok) {
-                                  setReserveMsg(String(j?.error ?? j?.detail ?? "Reserve failed."));
-                                  return;
-                                }
-                                const r = j.reservation;
-                                if (r && typeof r === "object") {
-                                  const rr = r as Record<string, unknown>;
-                                  const reservationId = typeof rr.reservationId === "string" ? rr.reservationId : "";
-                                  if (reservationId) {
-                                    addReservation({
-                                      reservationId,
-                                      classId: c.id,
-                                      title: c.title,
-                                      startTimeISO: c.startTimeISO,
-                                      isOutdoor,
-                                      reservedAtISO: new Date().toISOString(),
-                                    });
-                                    setReserveMsg("Reserved. Check your email for confirmation.");
-                                    return;
-                                  }
-                                }
-                                setReserveMsg(String(j?.answer ?? "Reserved."));
-                              } finally {
-                                setReserveBusyId("");
-                              }
-                            }}
-                            className="h-9 rounded-xl bg-zinc-900 px-3 text-xs font-medium text-white disabled:opacity-50 dark:bg-white dark:text-black"
-                          >
-                            {reservedId ? "Reserved" : reserveBusyId === c.id ? "Reserving…" : "Reserve"}
-                          </button>
+            <section className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-7">
+                {grouped.map(([dateISO, items]) => (
+                  <div key={dateISO} className="min-w-0">
+                    <div className="flex items-center justify-between">
+                      <h2 className="text-xs font-semibold">{dateISO}</h2>
+                      <div className="text-[11px] text-zinc-600 dark:text-zinc-400">{items.length}</div>
+                    </div>
+                    <div className="mt-2 flex flex-col gap-2">
+                      {items.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-zinc-200 p-2 text-[11px] text-zinc-500 dark:border-white/10 dark:text-zinc-500">
+                          —
                         </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </section>
-            ))
+                      ) : (
+                        items.map((c) => {
+                          const isOutdoor =
+                            c.id.toLowerCase().includes("outdoor") || c.title.toLowerCase().includes("outdoor");
+                          const reservedId = reservationsByClassId.get(c.id);
+                          const t = toUnix(c.startTimeISO);
+                          const h = isOutdoor ? pickNearestHour(hourly?.hourly, t) : null;
+                          const weatherLine =
+                            isOutdoor && h
+                              ? `Temp ${typeof h.temp === "number" ? h.temp.toFixed(1) : "?"}°C • wind ${
+                                  typeof h.wind_speed === "number" ? h.wind_speed.toFixed(1) : "?"
+                                } m/s gust ${typeof h.wind_gust === "number" ? h.wind_gust.toFixed(1) : "?"}`
+                              : null;
+
+                          return (
+                            <div
+                              key={c.id}
+                              className={`rounded-xl border p-2 ${
+                                reservedId
+                                  ? "border-emerald-300 bg-emerald-50 dark:border-emerald-400/40 dark:bg-emerald-400/10"
+                                  : "border-zinc-200 dark:border-white/10"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="truncate text-xs font-medium">
+                                    {formatLocalTime(c.startTimeISO)} {c.title}
+                                  </div>
+                                  <div className="mt-0.5 text-[11px] text-zinc-600 dark:text-zinc-400">
+                                    {c.skillLevel} • {c.type}
+                                    {isOutdoor ? " • outdoor" : ""}
+                                    {reservedId ? " • reserved" : ""}
+                                  </div>
+                                  {weatherLine ? (
+                                    <div className="mt-0.5 text-[11px] text-zinc-600 dark:text-zinc-400">
+                                      {weatherLine}
+                                    </div>
+                                  ) : null}
+                                </div>
+                                <button
+                                  disabled={reserveBusyId === c.id || !!reservedId}
+                                  onClick={async () => {
+                                    setReserveMsg("");
+                                    if (!waiver?.id || !waiver.participantEmail) {
+                                      setReserveMsg("Reserve requires a saved waiver (for email confirmation).");
+                                      return;
+                                    }
+                                    setReserveBusyId(c.id);
+                                    try {
+                                      const res = await fetch("/api/agent/run", {
+                                        method: "POST",
+                                        headers: { "content-type": "application/json" },
+                                        body: JSON.stringify({
+                                          message: `__RESERVE_CLASS__:${c.id}`,
+                                          session: {
+                                            gymName: "Front Range Climbing (Boulder)",
+                                            timezone: "America/Denver",
+                                            waiver: {
+                                              id: waiver.id,
+                                              participantName: waiver.participantName,
+                                              participantEmail: waiver.participantEmail,
+                                              isMinor: waiver.isMinor,
+                                            },
+                                          },
+                                        }),
+                                      });
+                                      const json = (await res.json().catch(() => ({}))) as unknown;
+                                      const j = json as Record<string, unknown>;
+                                      if (!res.ok) {
+                                        setReserveMsg(String(j?.error ?? j?.detail ?? "Reserve failed."));
+                                        return;
+                                      }
+                                      const r = j.reservation;
+                                      if (r && typeof r === "object") {
+                                        const rr = r as Record<string, unknown>;
+                                        const reservationId = typeof rr.reservationId === "string" ? rr.reservationId : "";
+                                        if (reservationId) {
+                                          addReservation({
+                                            reservationId,
+                                            classId: c.id,
+                                            title: c.title,
+                                            startTimeISO: c.startTimeISO,
+                                            isOutdoor,
+                                            reservedAtISO: new Date().toISOString(),
+                                          });
+                                          setReserveMsg("Reserved. Check your email for confirmation.");
+                                          return;
+                                        }
+                                      }
+                                      setReserveMsg(String(j?.answer ?? "Reserved."));
+                                    } finally {
+                                      setReserveBusyId("");
+                                    }
+                                  }}
+                                  className="h-8 rounded-xl bg-zinc-900 px-2 text-[11px] font-medium text-white disabled:opacity-50 dark:bg-white dark:text-black"
+                                >
+                                  {reservedId ? "Reserved" : reserveBusyId === c.id ? "…" : "Reserve"}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
           )}
         </main>
 
@@ -338,6 +383,22 @@ export default function CalendarPage() {
         {reserveMsg ? <div className="text-sm text-zinc-600 dark:text-zinc-400">{reserveMsg}</div> : null}
       </div>
     </div>
+  );
+}
+
+export default function CalendarPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-black dark:text-zinc-50">
+          <div className="mx-auto w-full max-w-4xl px-4 py-10 text-sm text-zinc-600 dark:text-zinc-400">
+            Loading calendar…
+          </div>
+        </div>
+      }
+    >
+      <CalendarInner />
+    </Suspense>
   );
 }
 

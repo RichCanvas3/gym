@@ -108,11 +108,16 @@ export default function ChatPage() {
         return;
       }
 
-      // Auto-navigate to waiver when agent signals it's required.
+      // Auto-navigate when agent signals it.
       const ui = parseUiActions(payload?.uiActions);
       const wantsWaiver = ui.some((a) => a.type === "navigate" && a.to === "/waiver");
       if (wantsWaiver) {
         router.push("/waiver");
+        return;
+      }
+      const wantsCalendar = ui.some((a) => a.type === "navigate" && a.to === "/calendar");
+      if (wantsCalendar) {
+        router.push("/calendar");
         return;
       }
     } finally {

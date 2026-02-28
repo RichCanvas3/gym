@@ -25,6 +25,22 @@ export async function POST(req: Request) {
 
   if (!message) return NextResponse.json({ error: "Missing message" }, { status: 400 });
 
+  const m = message.toLowerCase();
+  const wantsSchedule =
+    m.includes("calendar") ||
+    m.includes("schedule") ||
+    m.includes("class times") ||
+    m.includes("class schedule") ||
+    m.includes("weekly classes") ||
+    m.includes("week schedule");
+  if (wantsSchedule) {
+    return NextResponse.json({
+      answer: "Opening the class calendar.",
+      citations: [],
+      uiActions: [{ type: "navigate", to: "/calendar", reason: "view schedule" }],
+    });
+  }
+
   const session =
     body?.session && typeof body.session === "object" ? (body.session as Record<string, unknown>) : undefined;
 
