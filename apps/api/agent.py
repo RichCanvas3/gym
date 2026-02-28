@@ -841,6 +841,23 @@ async def run(input: Input) -> Output:
     if acct and thread_id:
         await _core_call_json("core_memory_ensure_thread", {"canonicalAddress": acct, "threadId": thread_id, "title": "Gym chat"})
 
+    # Chat UI helper: fetch persisted thread history without changing state.
+    if msg == "__CHAT_HISTORY__":
+        if not thread_id:
+            return Output(answer="", citations=[], data={"messages": []})
+        mem = await _core_call_json("core_memory_list_messages", {"threadId": thread_id, "limit": 50}) or {}
+        msgs = mem.get("messages") if isinstance(mem, dict) else None
+        safe: list[dict[str, Any]] = []
+        if isinstance(msgs, list):
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role")
+                content = m.get("content")
+                if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+                    safe.append({"role": role, "content": content})
+        return Output(answer="", citations=[], data={"messages": safe})
+
     # Deterministic helper: avoid "query=tomorrow" text searches returning empty.
     if (
         not msg.startswith("__")

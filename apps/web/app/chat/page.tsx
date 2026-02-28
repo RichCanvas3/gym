@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
 import { useWaiver } from "@/components/waiver/WaiverProvider";
 import { useRouter } from "next/navigation";
+import { useEffect } from "react";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -39,6 +40,43 @@ export default function ChatPage() {
   ]);
   const [busy, setBusy] = useState(false);
   const [lastSuggestions, setLastSuggestions] = useState<SuggestedCartItem[] | null>(null);
+
+  const threadId = waiver?.accountAddress ? `thr_${waiver.accountAddress}` : "";
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadHistory() {
+      if (!threadId) return;
+      const useHosted = process.env.NEXT_PUBLIC_USE_LANGGRAPH === "1";
+      const url = useHosted ? "/api/agent/run" : "/api/chat";
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          message: "__CHAT_HISTORY__",
+          session: { gymName: "Front Range Climbing (Boulder)", timezone: "America/Denver", threadId, waiver: waiver ? { id: waiver.id, accountAddress: waiver.accountAddress, participantName: waiver.participantName, participantEmail: waiver.participantEmail, isMinor: waiver.isMinor } : undefined },
+        }),
+      });
+      const json = (await res.json().catch(() => ({}))) as any;
+      const data = json?.data;
+      const msgs = data?.messages;
+      if (!Array.isArray(msgs)) return;
+      const out: ChatMessage[] = [];
+      for (const m of msgs) {
+        if (!m || typeof m !== "object") continue;
+        const role = (m as any).role;
+        const content = (m as any).content;
+        if ((role === "user" || role === "assistant") && typeof content === "string" && content.trim()) {
+          out.push({ role, text: content });
+        }
+      }
+      if (!cancelled && out.length) setMessages(out);
+    }
+    void loadHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [threadId, waiver]);
 
   const canSend = useMemo(() => input.trim().length > 0 && !busy, [input, busy]);
 
