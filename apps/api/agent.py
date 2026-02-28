@@ -4,6 +4,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -85,6 +86,22 @@ def _parse_iso_to_unix(iso: str) -> Optional[int]:
         return int(dt.timestamp())
     except Exception:
         return None
+
+
+def _day_window_utc_from_local_date(date_iso: str, tz_name: str) -> tuple[str, str]:
+    tz = ZoneInfo(tz_name or "UTC")
+    d = datetime.fromisoformat(date_iso).date()
+    start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+    end_local = start_local + timedelta(days=1) - timedelta(milliseconds=1)
+    start_utc = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    end_utc = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return start_utc, end_utc
+
+
+def _tomorrow_date_iso(tz_name: str) -> str:
+    tz = ZoneInfo(tz_name or "UTC")
+    now_local = datetime.now(tz=tz)
+    return (now_local.date() + timedelta(days=1)).isoformat()
 
 
 async def _weather_hourly_forecast(lat: float, lon: float, hours: int = 48, units: str = "metric") -> Optional[dict[str, Any]]:
@@ -838,6 +855,37 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 
 async def run(input: Input) -> Output:
     msg = input.message.strip()
+    mlow = msg.lower()
+
+    # Deterministic helper: avoid "query=tomorrow" text searches returning empty.
+    if (
+        not msg.startswith("__")
+        and ("tomorrow" in mlow)
+        and ("class" in mlow or "classes" in mlow or "schedule" in mlow)
+    ):
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        date_iso = _tomorrow_date_iso(tz_name)
+        from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
+        sched = await _scheduling_call_json("schedule_list_classes", {"fromISO": from_iso, "toISO": to_iso})
+        classes = sched.get("classes") if isinstance(sched, dict) else []
+        items = [c for c in classes if isinstance(c, dict)] if isinstance(classes, list) else []
+        if not items:
+            return Output(
+                answer=f"No classes found for {date_iso}.",
+                citations=[],
+                uiActions=[{"type": "navigate", "to": "/calendar", "reason": "view schedule"}],
+                data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "classes": []},
+            )
+        lines = []
+        for c in items[:10]:
+            lines.append(f"- {c.get('startTimeISO')} • {c.get('title')} ({c.get('classId')})")
+        return Output(
+            answer="Tomorrow's classes:\n" + "\n".join(lines),
+            citations=[],
+            uiActions=[{"type": "navigate", "to": "/calendar", "reason": "view schedule"}],
+            data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "classes": items},
+        )
+
     if msg.startswith("__WEATHER_HOURLY__:"):
         try:
             payload = json.loads(msg.split(":", 1)[1].strip())
