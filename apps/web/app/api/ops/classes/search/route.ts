@@ -3,18 +3,6 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type ToolCallResponse = { result?: { content?: Array<{ type?: unknown; text?: unknown }> } };
-
-function extractSseDataLine(raw: string): string {
-  // Same pattern as /api/weather/hourly: pull the last "data: {...}" line.
-  const lines = raw.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (line.startsWith("data: ")) return line.slice("data: ".length).trim();
-  }
-  return "";
-}
-
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const dateISO = url.searchParams.get("date") ?? undefined;
@@ -25,44 +13,26 @@ export async function GET(req: Request) {
     | undefined;
   const type = (url.searchParams.get("type") ?? undefined) as "group" | "private" | undefined;
 
-  const mcpUrl = process.env.SCHEDULING_MCP_URL ?? "";
-  const mcpKey = process.env.SCHEDULING_MCP_API_KEY ?? "";
-  if (!mcpUrl || !mcpKey) {
-    return NextResponse.json({ error: "Missing SCHEDULING_MCP_URL or SCHEDULING_MCP_API_KEY" }, { status: 500 });
+  const deploymentUrl = process.env.LANGGRAPH_DEPLOYMENT_URL ?? "";
+  const apiKey = process.env.LANGSMITH_API_KEY ?? "";
+  const assistantId = process.env.LANGGRAPH_ASSISTANT_ID ?? "gym";
+  if (!deploymentUrl || !apiKey) {
+    return NextResponse.json({ error: "Missing LANGGRAPH_DEPLOYMENT_URL or LANGSMITH_API_KEY" }, { status: 500 });
   }
 
-  const fromISO = dateISO ? `${dateISO}T00:00:00.000Z` : undefined;
-  const toISO = dateISO ? `${dateISO}T23:59:59.999Z` : undefined;
-
-  const res = await fetch(mcpUrl.replace(/\/$/, ""), {
+  const msg = `__SCHED_CLASSES_SEARCH__:${JSON.stringify({ dateISO, skillLevel, type })}`;
+  const res = await fetch(`${deploymentUrl.replace(/\/$/, "")}/runs/wait`, {
     method: "POST",
-    headers: {
-      accept: "application/json, text/event-stream",
-      "content-type": "application/json",
-      "x-api-key": mcpKey,
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: {
-        name: "schedule_list_classes",
-        arguments: { fromISO, toISO, type },
-      },
-    }),
+    headers: { "content-type": "application/json", "x-api-key": apiKey },
+    body: JSON.stringify({ assistant_id: assistantId, input: { message: msg, session: { timezone: "UTC" } } }),
   });
-
-  const raw = await res.text();
-  if (!res.ok) {
-    return NextResponse.json({ error: "Scheduling MCP error", detail: raw }, { status: 502 });
-  }
-
-  const dataLine = extractSseDataLine(raw);
-  const parsed = (JSON.parse(dataLine) as ToolCallResponse) ?? {};
-  const txt = parsed?.result?.content?.find((c) => c?.type === "text")?.text;
-  const payload = typeof txt === "string" ? (JSON.parse(txt) as unknown) : null;
-  const p = (payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {}) as Record<string, unknown>;
-  const classes = Array.isArray(p.classes) ? (p.classes as unknown[]) : [];
+  const json = (await res.json().catch(() => ({}))) as unknown;
+  if (!res.ok) return NextResponse.json(json, { status: res.status });
+  const j = (json && typeof json === "object" ? (json as Record<string, unknown>) : {}) as Record<string, unknown>;
+  const output = j.output && typeof j.output === "object" ? (j.output as Record<string, unknown>) : undefined;
+  const data = output?.data;
+  if (data && typeof data === "object") return NextResponse.json(data);
+  const classes: unknown[] = [];
 
   const mapped = classes
     .map((x) => {

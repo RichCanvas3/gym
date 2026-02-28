@@ -116,6 +116,8 @@ Setup:
 - Create a D1 DB: `wrangler d1 create gym-scheduling`
 - Put the `database_id` into `apps/scheduling-mcp/wrangler.jsonc`
 - Apply schema (remote): `wrangler d1 execute gym-scheduling --remote --file apps/scheduling-mcp/schema.sql`
+- If upgrading from the older v1 schema (error like `no such column: customer_account_id`), run the migration instead:
+  - `wrangler d1 execute gym-scheduling --remote --file apps/scheduling-mcp/migrations/v1_to_v2_accounts.sql`
 - Run locally: `pnpm -C apps/scheduling-mcp dev`
 
 Env vars (see `.env.example`):

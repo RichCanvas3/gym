@@ -3,21 +3,6 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type ToolCallResponse = {
-  result?: {
-    content?: Array<{ type?: unknown; text?: unknown }>;
-  };
-};
-
-function extractSseDataLine(raw: string) {
-  // Find the first "data: {...}" line.
-  const lines = raw.split("\n");
-  for (const l of lines) {
-    if (l.startsWith("data: ")) return l.slice("data: ".length).trim();
-  }
-  return "";
-}
-
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const lat = Number(url.searchParams.get("lat") ?? "40.015");
@@ -25,42 +10,25 @@ export async function GET(req: Request) {
   const hours = Math.max(1, Math.min(48, Number(url.searchParams.get("hours") ?? "48")));
   const units = (url.searchParams.get("units") ?? "metric").toLowerCase();
 
-  const mcpUrl = process.env.WEATHER_MCP_URL ?? "";
-  const mcpKey = process.env.WEATHER_MCP_API_KEY ?? "";
-  if (!mcpUrl || !mcpKey) {
-    return NextResponse.json({ error: "Missing WEATHER_MCP_URL or WEATHER_MCP_API_KEY" }, { status: 500 });
+  // Weather is fetched via the agent (which uses MCP), not directly from the web app.
+  const deploymentUrl = process.env.LANGGRAPH_DEPLOYMENT_URL ?? "";
+  const apiKey = process.env.LANGSMITH_API_KEY ?? "";
+  const assistantId = process.env.LANGGRAPH_ASSISTANT_ID ?? "gym";
+  if (!deploymentUrl || !apiKey) {
+    return NextResponse.json({ error: "Missing LANGGRAPH_DEPLOYMENT_URL or LANGSMITH_API_KEY" }, { status: 500 });
   }
 
-  const res = await fetch(mcpUrl.replace(/\/$/, ""), {
+  const msg = `__WEATHER_HOURLY__:${JSON.stringify({ lat, lon, hours, units })}`;
+  const res = await fetch(`${deploymentUrl.replace(/\/$/, "")}/runs/wait`, {
     method: "POST",
-    headers: {
-      accept: "application/json, text/event-stream",
-      "content-type": "application/json",
-      "x-api-key": mcpKey,
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: {
-        name: "weather_forecast_hourly",
-        arguments: { lat, lon, hours, units },
-      },
-    }),
+    headers: { "content-type": "application/json", "x-api-key": apiKey },
+    body: JSON.stringify({ assistant_id: assistantId, input: { message: msg, session: { timezone: "UTC" } } }),
   });
-
-  const raw = await res.text();
-  if (!res.ok) return NextResponse.json({ error: raw || `HTTP ${res.status}` }, { status: res.status });
-
-  const data = extractSseDataLine(raw);
-  if (!data) return NextResponse.json({ error: "Invalid MCP SSE response" }, { status: 502 });
-
-  const parsed = JSON.parse(data) as ToolCallResponse;
-  const text = parsed?.result?.content?.[0]?.text;
-  if (typeof text !== "string") return NextResponse.json({ error: "Missing tool content text" }, { status: 502 });
-
-  // tool returns JSON text
-  const payload = JSON.parse(text) as unknown;
-  return NextResponse.json(payload);
+  const json = (await res.json().catch(() => ({}))) as unknown;
+  if (!res.ok) return NextResponse.json(json, { status: res.status });
+  const j = (json && typeof json === "object" ? (json as Record<string, unknown>) : {}) as Record<string, unknown>;
+  const output = j.output && typeof j.output === "object" ? (j.output as Record<string, unknown>) : undefined;
+  const data = output?.data;
+  return NextResponse.json(data && typeof data === "object" ? data : {});
 }
 

@@ -102,6 +102,27 @@ async def _weather_hourly_forecast(lat: float, lon: float, hours: int = 48, unit
         return None
 
 
+async def _weather_daily_forecast(lat: float, lon: float, days: int = 8, units: str = "metric") -> Optional[dict[str, Any]]:
+    mcp_tools = await load_mcp_tools_from_env()
+    tool = next(
+        (
+            t
+            for t in mcp_tools
+            if isinstance(getattr(t, "name", None), str)
+            and (t.name == "weather_weather_forecast_daily" or t.name.endswith("_weather_forecast_daily"))
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke({"lat": lat, "lon": lon, "days": days, "units": units})
+        txt = raw if isinstance(raw, str) else json.dumps(raw)
+        return json.loads(txt) if isinstance(txt, str) else None
+    except Exception:
+        return None
+
+
 async def _scheduling_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
     mcp_tools = await load_mcp_tools_from_env()
     tool = next(
@@ -323,6 +344,8 @@ class Output(BaseModel):
     cartActions: Optional[list[dict[str, Any]]] = None
     uiActions: Optional[list[dict[str, Any]]] = None
     reservation: Optional[dict[str, Any]] = None
+    data: Optional[dict[str, Any]] = None
+    schedule: Optional[dict[str, Any]] = None
 
 
 class _Trace:
@@ -732,10 +755,157 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 
 
 async def run(input: Input) -> Output:
-    if input.message.strip() == "__CHECKOUT__":
+    msg = input.message.strip()
+    if msg.startswith("__WEATHER_HOURLY__:"):
+        try:
+            payload = json.loads(msg.split(":", 1)[1].strip())
+        except Exception:
+            payload = {}
+        lat = float(payload.get("lat", _GYM_LAT)) if isinstance(payload, dict) else _GYM_LAT
+        lon = float(payload.get("lon", _GYM_LON)) if isinstance(payload, dict) else _GYM_LON
+        hours = int(payload.get("hours", 48)) if isinstance(payload, dict) else 48
+        units = str(payload.get("units", "metric")) if isinstance(payload, dict) else "metric"
+        out = await _weather_hourly_forecast(lat, lon, hours=hours, units=units)
+        return Output(answer="", citations=[], data=out or {})
+
+    if msg.startswith("__SCHED_CLASS_AVAIL__:"):
+        try:
+            payload = json.loads(msg.split(":", 1)[1].strip())
+        except Exception:
+            payload = {}
+        class_id = str(payload.get("classId", "")).strip() if isinstance(payload, dict) else ""
+        out = await _scheduling_call_json("schedule_class_availability", {"classId": class_id}) if class_id else None
+        return Output(answer="", citations=[], data=out or {"error": "Missing classId"})
+
+    if msg.startswith("__SCHED_INSTRUCTORS_SEARCH__:"):
+        try:
+            payload = json.loads(msg.split(":", 1)[1].strip())
+        except Exception:
+            payload = {}
+        skill = str(payload.get("skill", "")).strip() if isinstance(payload, dict) else ""
+        out = await _scheduling_call_json("schedule_list_instructors", {})
+        instructors = out.get("instructors") if isinstance(out, dict) else None
+        data = []
+        if isinstance(instructors, list):
+            q = skill.lower()
+            for it in instructors:
+                if not isinstance(it, dict):
+                    continue
+                skills = it.get("skills")
+                if not q:
+                    data.append(it)
+                elif isinstance(skills, list) and any(isinstance(s, str) and q in s.lower() for s in skills):
+                    data.append(it)
+        return Output(answer="", citations=[], data={"asOfISO": _now_iso(), "data": data})
+
+    if msg.startswith("__SCHED_CLASSES_SEARCH__:"):
+        try:
+            payload = json.loads(msg.split(":", 1)[1].strip())
+        except Exception:
+            payload = {}
+        date_iso = str(payload.get("dateISO") or "").strip() if isinstance(payload, dict) else ""
+        skill_level = payload.get("skillLevel") if isinstance(payload, dict) else None
+        class_type = payload.get("type") if isinstance(payload, dict) else None
+        from_iso = f"{date_iso}T00:00:00.000Z" if date_iso else None
+        to_iso = f"{date_iso}T23:59:59.999Z" if date_iso else None
+        out = await _scheduling_call_json("schedule_list_classes", {"fromISO": from_iso, "toISO": to_iso, "type": class_type})
+        classes = out.get("classes") if isinstance(out, dict) else None
+        items = []
+        if isinstance(classes, list):
+            for c in classes:
+                if not isinstance(c, dict):
+                    continue
+                if skill_level and c.get("skillLevel") != skill_level:
+                    continue
+                items.append(
+                    {
+                        "id": c.get("classId"),
+                        "title": c.get("title"),
+                        "type": c.get("type"),
+                        "skillLevel": c.get("skillLevel") or "beginner",
+                        "coachId": c.get("instructorId") or "",
+                        "startTimeISO": c.get("startTimeISO"),
+                        "durationMinutes": c.get("durationMinutes"),
+                        "capacity": c.get("capacity"),
+                    }
+                )
+        return Output(answer="", citations=[], data={"asOfISO": _now_iso(), "data": items})
+
+    if msg.startswith("__CALENDAR_WEEK__:"):
+        start_date = msg.split(":", 1)[1].strip()
+        if not start_date:
+            start_date = datetime.now(timezone.utc).date().isoformat()
+        from_iso = f"{start_date}T00:00:00.000Z"
+        end_date = (datetime.fromisoformat(start_date).date() + timedelta(days=6)).isoformat()
+        to_iso = f"{end_date}T23:59:59.999Z"
+        sched = await _scheduling_call_json("schedule_list_classes", {"fromISO": from_iso, "toISO": to_iso})
+        classes = sched.get("classes") if isinstance(sched, dict) else []
+        hourly = await _weather_hourly_forecast(_GYM_LAT, _GYM_LON, hours=48, units="metric")
+        daily = await _weather_daily_forecast(_GYM_LAT, _GYM_LON, days=8, units="metric")
+        hourly_list = hourly.get("hourly") if isinstance(hourly, dict) else None
+        daily_list = daily.get("daily") if isinstance(daily, dict) else None
+        out_items: list[dict[str, Any]] = []
+        for c in classes if isinstance(classes, list) else []:
+            if not isinstance(c, dict):
+                continue
+            start_iso = str(c.get("startTimeISO") or "")
+            t = _parse_iso_to_unix(start_iso) if start_iso else None
+            is_outdoor = bool(c.get("isOutdoor"))
+            weather = None
+            if is_outdoor and isinstance(t, int):
+                if isinstance(hourly_list, list):
+                    h = _pick_hour([x for x in hourly_list if isinstance(x, dict)], t)
+                    if h:
+                        weather = {
+                            "summary": (h.get("weather")[0].get("description") if isinstance(h.get("weather"), list) and h.get("weather") and isinstance(h.get("weather")[0], dict) else "Hourly forecast"),
+                            "temp": h.get("temp"),
+                            "wind_speed": h.get("wind_speed"),
+                            "wind_gust": h.get("wind_gust"),
+                            "pop": h.get("pop"),
+                        }
+                if weather is None and isinstance(daily_list, list):
+                    best = None
+                    best_delta = None
+                    for d in daily_list:
+                        if not isinstance(d, dict):
+                            continue
+                        dt = d.get("dt")
+                        if not isinstance(dt, int):
+                            continue
+                        delta = abs(dt - t)
+                        if best_delta is None or delta < best_delta:
+                            best = d
+                            best_delta = delta
+                    if best:
+                        weather = {
+                            "summary": (best.get("weather")[0].get("description") if isinstance(best.get("weather"), list) and best.get("weather") and isinstance(best.get("weather")[0], dict) else "Daily forecast"),
+                            "temp": (best.get("temp") or {}).get("max") if isinstance(best.get("temp"), dict) else None,
+                            "wind_speed": best.get("wind_speed"),
+                            "wind_gust": best.get("wind_gust"),
+                            "pop": best.get("pop"),
+                        }
+
+            out_items.append(
+                {
+                    "id": c.get("classId"),
+                    "title": c.get("title"),
+                    "type": c.get("type"),
+                    "skillLevel": c.get("skillLevel") or "beginner",
+                    "coachId": c.get("instructorId") or "",
+                    "startTimeISO": c.get("startTimeISO"),
+                    "durationMinutes": c.get("durationMinutes"),
+                    "capacity": c.get("capacity"),
+                    "isOutdoor": is_outdoor,
+                    "weatherForecast": weather,
+                }
+            )
+        schedule = {"asOfISO": _now_iso(), "weekStartISO": start_date, "weekEndISO": end_date, "classes": out_items}
+        return Output(answer="", citations=[], schedule=schedule)
+
+    if msg == "__CHECKOUT__":
         return await _handle_checkout(input.session)
-    if input.message.strip().startswith("__RESERVE_CLASS__:"):
-        class_id = input.message.strip().split(":", 1)[1].strip()
+    if msg.startswith("__RESERVE_CLASS__:"):
+        class_id = msg.split(":", 1)[1].strip()
         return await _handle_reserve_class(input.session, class_id)
 
     tools, trace = make_tools()

@@ -15,21 +15,15 @@ type GymClass = {
   startTimeISO: string;
   durationMinutes: number;
   capacity: number;
-};
-
-type HourlyForecast = {
-  location?: { lat?: number; lon?: number; label?: string | null };
-  hourly?: Array<{
-    dt?: number;
+  isOutdoor?: boolean;
+  weatherForecast?: {
+    summary?: string;
     temp?: number;
     wind_speed?: number;
     wind_gust?: number;
     pop?: number;
-    weather?: Array<{ id?: number; description?: string }>;
-  }>;
+  };
 };
-
-type HourPoint = NonNullable<HourlyForecast["hourly"]>[number];
 
 function startOfDayISO(d: Date) {
   const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0));
@@ -52,27 +46,6 @@ function formatLocalTime(iso: string) {
   return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(d);
 }
 
-function toUnix(iso: string) {
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0;
-}
-
-function pickNearestHour(hourly: HourlyForecast["hourly"], targetUnix: number) {
-  if (!Array.isArray(hourly) || hourly.length === 0) return null;
-  let best: HourPoint | null = null;
-  let bestDelta = Number.POSITIVE_INFINITY;
-  for (const h of hourly) {
-    const dt = typeof h?.dt === "number" ? h.dt : NaN;
-    if (!Number.isFinite(dt)) continue;
-    const delta = Math.abs(dt - targetUnix);
-    if (delta < bestDelta) {
-      best = h;
-      bestDelta = delta;
-    }
-  }
-  return best;
-}
-
 function CalendarInner() {
   const router = useRouter();
   const params = useSearchParams();
@@ -81,7 +54,6 @@ function CalendarInner() {
 
   const [classes, setClasses] = useState<GymClass[]>([]);
   const [classAsOfISO, setClassAsOfISO] = useState<string>("");
-  const [hourly, setHourly] = useState<HourlyForecast | null>(null);
   const [weatherErr, setWeatherErr] = useState<string>("");
   const [reserveBusyId, setReserveBusyId] = useState<string>("");
   const [reserveMsg, setReserveMsg] = useState<string>("");
@@ -101,38 +73,50 @@ function CalendarInner() {
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      const all: GymClass[] = [];
-      let asOfISO = "";
-      for (const dateISO of weekDates) {
-        const res = await fetch(`/api/ops/classes/search?date=${encodeURIComponent(dateISO)}`, { cache: "no-store" });
-        const json = (await res.json().catch(() => ({}))) as unknown;
+      setWeatherErr("");
+      const res = await fetch(`/api/calendar/week?start=${encodeURIComponent(weekStartISO)}`, { cache: "no-store" });
+      const json = (await res.json().catch(() => ({}))) as unknown;
+      if (!res.ok) {
         const j = json as Record<string, unknown>;
-        const items = Array.isArray(j?.data) ? (j.data as unknown[]) : [];
-        if (typeof j?.asOfISO === "string") asOfISO = j.asOfISO;
-        for (const x of items) {
-          if (!x || typeof x !== "object") continue;
-          const o = x as Record<string, unknown>;
-          const id = typeof o.id === "string" ? o.id : "";
-          const title = typeof o.title === "string" ? o.title : "";
-          const type = o.type === "group" || o.type === "private" ? o.type : null;
-          const skillLevel =
-            o.skillLevel === "beginner" || o.skillLevel === "intermediate" || o.skillLevel === "advanced"
-              ? o.skillLevel
-              : null;
-          const coachId = typeof o.coachId === "string" ? o.coachId : "";
-          const startTimeISO = typeof o.startTimeISO === "string" ? o.startTimeISO : "";
-          const durationMinutes = typeof o.durationMinutes === "number" ? o.durationMinutes : NaN;
-          const capacity = typeof o.capacity === "number" ? o.capacity : NaN;
-          if (!id || !title || !type || !skillLevel || !coachId || !startTimeISO) continue;
-          if (!Number.isFinite(durationMinutes) || !Number.isFinite(capacity)) continue;
-          all.push({ id, title, type, skillLevel, coachId, startTimeISO, durationMinutes, capacity });
-        }
+        if (!cancelled) setWeatherErr(String(j?.error ?? j?.detail ?? "Calendar fetch failed."));
+        return;
       }
-
-      all.sort((a, b) => toUnix(a.startTimeISO) - toUnix(b.startTimeISO));
-
+      const j = json as Record<string, unknown>;
+      const items = Array.isArray(j?.classes) ? (j.classes as unknown[]) : [];
+      const asOfISO = typeof j?.asOfISO === "string" ? j.asOfISO : "";
+      const out: GymClass[] = [];
+      for (const x of items) {
+        if (!x || typeof x !== "object") continue;
+        const o = x as Record<string, unknown>;
+        const id = typeof o.id === "string" ? o.id : "";
+        const title = typeof o.title === "string" ? o.title : "";
+        const type = o.type === "group" || o.type === "private" ? o.type : null;
+        const skillLevel =
+          o.skillLevel === "beginner" || o.skillLevel === "intermediate" || o.skillLevel === "advanced"
+            ? o.skillLevel
+            : null;
+        const coachId = typeof o.coachId === "string" ? o.coachId : "";
+        const startTimeISO = typeof o.startTimeISO === "string" ? o.startTimeISO : "";
+        const durationMinutes = typeof o.durationMinutes === "number" ? o.durationMinutes : NaN;
+        const capacity = typeof o.capacity === "number" ? o.capacity : NaN;
+        if (!id || !title || !type || !skillLevel || !startTimeISO) continue;
+        if (!Number.isFinite(durationMinutes) || !Number.isFinite(capacity)) continue;
+        const isOutdoor = typeof o.isOutdoor === "boolean" ? o.isOutdoor : undefined;
+        const wf = o.weatherForecast && typeof o.weatherForecast === "object" ? (o.weatherForecast as Record<string, unknown>) : null;
+        const weatherForecast = wf
+          ? {
+              summary: typeof wf.summary === "string" ? wf.summary : undefined,
+              temp: typeof wf.temp === "number" ? wf.temp : undefined,
+              wind_speed: typeof wf.wind_speed === "number" ? wf.wind_speed : undefined,
+              wind_gust: typeof wf.wind_gust === "number" ? wf.wind_gust : undefined,
+              pop: typeof wf.pop === "number" ? wf.pop : undefined,
+            }
+          : undefined;
+        out.push({ id, title, type, skillLevel, coachId, startTimeISO, durationMinutes, capacity, isOutdoor, weatherForecast });
+      }
+      out.sort((a, b) => Date.parse(a.startTimeISO) - Date.parse(b.startTimeISO));
       if (!cancelled) {
-        setClasses(all);
+        setClasses(out);
         setClassAsOfISO(asOfISO);
       }
     }
@@ -140,28 +124,7 @@ function CalendarInner() {
     return () => {
       cancelled = true;
     };
-  }, [weekDates]);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function loadWeather() {
-      setWeatherErr("");
-      const res = await fetch("/api/weather/hourly?lat=40.015&lon=-105.2705&hours=48&units=metric", {
-        cache: "no-store",
-      });
-      const json = (await res.json().catch(() => ({}))) as unknown;
-      if (!res.ok) {
-        const j = json as Record<string, unknown>;
-        if (!cancelled) setWeatherErr(String(j?.error ?? "Weather fetch failed."));
-        return;
-      }
-      if (!cancelled) setHourly(json as HourlyForecast);
-    }
-    void loadWeather();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  }, [weekStartISO]);
 
   const reservationsByClassId = useMemo(() => {
     const map = new Map<string, string>();
@@ -179,7 +142,7 @@ function CalendarInner() {
       if (arr) arr.push(c);
     }
     for (const [k, arr] of map.entries()) {
-      arr.sort((a, b) => toUnix(a.startTimeISO) - toUnix(b.startTimeISO));
+      arr.sort((a, b) => Date.parse(a.startTimeISO) - Date.parse(b.startTimeISO));
       map.set(k, arr);
     }
     return [...map.entries()];
@@ -259,16 +222,16 @@ function CalendarInner() {
                         </div>
                       ) : (
                         items.map((c) => {
-                          const isOutdoor =
-                            c.id.toLowerCase().includes("outdoor") || c.title.toLowerCase().includes("outdoor");
+                          const isOutdoor = Boolean(c.isOutdoor);
                           const reservedId = reservationsByClassId.get(c.id);
-                          const t = toUnix(c.startTimeISO);
-                          const h = isOutdoor ? pickNearestHour(hourly?.hourly, t) : null;
+                          const wf = c.weatherForecast;
                           const weatherLine =
-                            isOutdoor && h
-                              ? `Temp ${typeof h.temp === "number" ? h.temp.toFixed(1) : "?"}°C • wind ${
-                                  typeof h.wind_speed === "number" ? h.wind_speed.toFixed(1) : "?"
-                                } m/s gust ${typeof h.wind_gust === "number" ? h.wind_gust.toFixed(1) : "?"}`
+                            isOutdoor && wf
+                              ? `${wf.summary ?? "Forecast"} • Temp ${
+                                  typeof wf.temp === "number" ? wf.temp.toFixed(1) : "?"
+                                }°C • wind ${typeof wf.wind_speed === "number" ? wf.wind_speed.toFixed(1) : "?"} m/s gust ${
+                                  typeof wf.wind_gust === "number" ? wf.wind_gust.toFixed(1) : "?"
+                                } • precip ${typeof wf.pop === "number" ? Math.round(wf.pop * 100) : "?"}%`
                               : null;
 
                           return (
