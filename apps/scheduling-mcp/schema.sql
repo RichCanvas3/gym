@@ -2,12 +2,33 @@
 
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS instructors (
-  instructor_id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  skills_json TEXT,
+-- Canonical accounts (instructors + customers) for identity integrity.
+-- Canonical address is typically a normalized email (lowercased, trimmed).
+CREATE TABLE IF NOT EXISTS accounts (
+  account_id TEXT PRIMARY KEY,
+  canonical_address TEXT NOT NULL UNIQUE,
+  email TEXT,
+  display_name TEXT,
+  phone_e164 TEXT,
   created_at_iso TEXT NOT NULL,
   updated_at_iso TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS instructors (
+  instructor_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL UNIQUE,
+  skills_json TEXT,
+  created_at_iso TEXT NOT NULL,
+  updated_at_iso TEXT NOT NULL,
+  FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+);
+
+CREATE TABLE IF NOT EXISTS customers (
+  customer_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL UNIQUE,
+  created_at_iso TEXT NOT NULL,
+  updated_at_iso TEXT NOT NULL,
+  FOREIGN KEY (account_id) REFERENCES accounts(account_id)
 );
 
 CREATE TABLE IF NOT EXISTS classes (
@@ -33,14 +54,14 @@ CREATE INDEX IF NOT EXISTS idx_classes_instructor_time ON classes(instructor_id,
 CREATE TABLE IF NOT EXISTS reservations (
   reservation_id TEXT PRIMARY KEY,
   class_id TEXT NOT NULL,
-  customer_email TEXT NOT NULL,
-  customer_name TEXT,
+  customer_account_id TEXT NOT NULL,
   status TEXT NOT NULL, -- 'active' | 'cancelled'
   reserved_at_iso TEXT NOT NULL,
   cancelled_at_iso TEXT,
-  FOREIGN KEY (class_id) REFERENCES classes(class_id)
+  FOREIGN KEY (class_id) REFERENCES classes(class_id),
+  FOREIGN KEY (customer_account_id) REFERENCES accounts(account_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_reservations_class_status ON reservations(class_id, status);
-CREATE INDEX IF NOT EXISTS idx_reservations_customer_email ON reservations(customer_email);
+CREATE INDEX IF NOT EXISTS idx_reservations_customer_account ON reservations(customer_account_id);
 

@@ -98,11 +98,15 @@ This repo includes a **D1-backed** scheduling MCP server you can run on Cloudfla
 - App: `apps/scheduling-mcp`
 - Endpoint: `https://<your-worker>.workers.dev/mcp`
 - Tools (prefixed in the gym agent as `scheduling_<tool>` when `MCP_TOOL_NAME_PREFIX=1`):
+  - `schedule_upsert_account`
   - `schedule_upsert_instructor`
   - `schedule_list_instructors`
+  - `schedule_upsert_customer`
   - `schedule_create_class`
+  - `schedule_get_class`
   - `schedule_assign_instructor`
   - `schedule_list_classes`
+  - `schedule_class_availability`
   - `schedule_list_reservations`
   - `schedule_reserve_seat`
   - `schedule_cancel_reservation`
@@ -111,7 +115,7 @@ Setup:
 
 - Create a D1 DB: `wrangler d1 create gym-scheduling`
 - Put the `database_id` into `apps/scheduling-mcp/wrangler.jsonc`
-- Apply schema: `wrangler d1 execute gym-scheduling --file apps/scheduling-mcp/schema.sql`
+- Apply schema (remote): `wrangler d1 execute gym-scheduling --remote --file apps/scheduling-mcp/schema.sql`
 - Run locally: `pnpm -C apps/scheduling-mcp dev`
 
 Env vars (see `.env.example`):

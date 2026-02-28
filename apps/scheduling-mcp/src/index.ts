@@ -9,6 +9,8 @@ export type Env = {
 };
 
 const ClassType = z.enum(["group", "private"]);
+const AccountAddress = z.string().min(3);
+const AccountRole = z.enum(["instructor", "customer", "both"]);
 
 function nowISO() {
   return new Date().toISOString();
@@ -28,11 +30,105 @@ function jsonText(obj: unknown) {
   return JSON.stringify(obj, null, 2);
 }
 
+function canonicalizeAddress(address: string) {
+  return (address || "").trim().toLowerCase();
+}
+
 async function requireApiKey(request: Request, env: Env) {
   const want = (env.MCP_API_KEY ?? "").trim();
   if (!want) return;
   const got = (request.headers.get("x-api-key") ?? "").trim();
   if (got !== want) throw new Error("Unauthorized (bad x-api-key)");
+}
+
+async function ensureAccount(
+  db: D1Database,
+  args: {
+    canonicalAddress: string;
+    email?: string | null;
+    displayName?: string | null;
+    phoneE164?: string | null;
+  },
+) {
+  const addr = canonicalizeAddress(args.canonicalAddress);
+  if (!addr) throw new Error("Missing canonicalAddress");
+  const existing = await db
+    .prepare(`SELECT account_id, canonical_address, email, display_name, phone_e164 FROM accounts WHERE canonical_address = ? LIMIT 1`)
+    .bind(addr)
+    .first();
+  if (existing && typeof (existing as any).account_id === "string") {
+    return {
+      accountId: String((existing as any).account_id),
+      canonicalAddress: String((existing as any).canonical_address ?? addr),
+      email: (existing as any).email ? String((existing as any).email) : null,
+      displayName: (existing as any).display_name ? String((existing as any).display_name) : null,
+      phoneE164: (existing as any).phone_e164 ? String((existing as any).phone_e164) : null,
+      created: false,
+    };
+  }
+
+  const accountId = crypto.randomUUID();
+  const ts = nowISO();
+  await db
+    .prepare(
+      `
+      INSERT INTO accounts (account_id, canonical_address, email, display_name, phone_e164, created_at_iso, updated_at_iso)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    )
+    .bind(
+      accountId,
+      addr,
+      args.email ?? null,
+      args.displayName ?? null,
+      args.phoneE164 ?? null,
+      ts,
+      ts,
+    )
+    .run();
+
+  return {
+    accountId,
+    canonicalAddress: addr,
+    email: args.email ?? null,
+    displayName: args.displayName ?? null,
+    phoneE164: args.phoneE164 ?? null,
+    created: true,
+  };
+}
+
+async function ensureInstructor(db: D1Database, args: { accountId: string; skillsJson: string | null }) {
+  const existing = await db.prepare(`SELECT instructor_id FROM instructors WHERE account_id = ? LIMIT 1`).bind(args.accountId).first();
+  const ts = nowISO();
+  if (existing && (existing as any).instructor_id) {
+    const instructorId = String((existing as any).instructor_id);
+    await db.prepare(`UPDATE instructors SET skills_json = COALESCE(?, skills_json), updated_at_iso = ? WHERE instructor_id = ?`)
+      .bind(args.skillsJson, ts, instructorId)
+      .run();
+    return { instructorId, created: false };
+  }
+  const instructorId = `inst_${crypto.randomUUID()}`;
+  await db
+    .prepare(
+      `INSERT INTO instructors (instructor_id, account_id, skills_json, created_at_iso, updated_at_iso) VALUES (?, ?, ?, ?, ?)`,
+    )
+    .bind(instructorId, args.accountId, args.skillsJson, ts, ts)
+    .run();
+  return { instructorId, created: true };
+}
+
+async function ensureCustomer(db: D1Database, args: { accountId: string }) {
+  const existing = await db.prepare(`SELECT customer_id FROM customers WHERE account_id = ? LIMIT 1`).bind(args.accountId).first();
+  const ts = nowISO();
+  if (existing && (existing as any).customer_id) {
+    return { customerId: String((existing as any).customer_id), created: false };
+  }
+  const customerId = `cust_${crypto.randomUUID()}`;
+  await db
+    .prepare(`INSERT INTO customers (customer_id, account_id, created_at_iso, updated_at_iso) VALUES (?, ?, ?, ?)`)
+    .bind(customerId, args.accountId, ts, ts)
+    .run();
+  return { customerId, created: true };
 }
 
 async function checkInstructorConflict(db: D1Database, args: { instructorId: string; startUnix: number; endUnix: number; excludeClassId?: string }) {
@@ -63,47 +159,129 @@ function createServer(env: Env) {
   });
 
   server.tool(
-    "schedule_upsert_instructor",
-    "Create/update an instructor (skills optional).",
+    "schedule_upsert_account",
+    "Create/update an account (canonical address).",
     {
-      instructorId: z.string().min(1),
-      name: z.string().min(1),
+      canonicalAddress: AccountAddress,
+      role: AccountRole.optional(),
+      email: z.string().email().optional(),
+      displayName: z.string().min(1).optional(),
+      phoneE164: z.string().min(7).optional(),
       skills: z.array(z.string()).optional(),
     },
     async (args) => {
       const parsed = z
         .object({
-          instructorId: z.string().min(1),
-          name: z.string().min(1),
+          canonicalAddress: AccountAddress,
+          role: AccountRole.optional(),
+          email: z.string().email().optional(),
+          displayName: z.string().min(1).optional(),
+          phoneE164: z.string().min(7).optional(),
           skills: z.array(z.string()).optional(),
         })
         .parse(args);
 
-      const ts = nowISO();
+      const account = await ensureAccount(env.DB, {
+        canonicalAddress: parsed.canonicalAddress,
+        email: parsed.email ?? parsed.canonicalAddress,
+        displayName: parsed.displayName ?? null,
+        phoneE164: parsed.phoneE164 ?? null,
+      });
+
+      const role = parsed.role ?? "customer";
       const skillsJson = parsed.skills ? JSON.stringify(parsed.skills) : null;
+      let instructorId: string | null = null;
+      let customerId: string | null = null;
+      if (role === "instructor" || role === "both") {
+        const inst = await ensureInstructor(env.DB, { accountId: account.accountId, skillsJson });
+        instructorId = inst.instructorId;
+      }
+      if (role === "customer" || role === "both") {
+        const cust = await ensureCustomer(env.DB, { accountId: account.accountId });
+        customerId = cust.customerId;
+      }
 
-      await env.DB.prepare(
-        `
-        INSERT INTO instructors (instructor_id, name, skills_json, created_at_iso, updated_at_iso)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(instructor_id) DO UPDATE SET
-          name=excluded.name,
-          skills_json=excluded.skills_json,
-          updated_at_iso=excluded.updated_at_iso
-      `,
-      )
-        .bind(parsed.instructorId, parsed.name, skillsJson, ts, ts)
-        .run();
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText({
+              account: {
+                accountId: account.accountId,
+                canonicalAddress: account.canonicalAddress,
+                email: account.email,
+                displayName: account.displayName,
+                phoneE164: account.phoneE164,
+              },
+              instructorId,
+              customerId,
+            }),
+          },
+        ],
+      };
+    },
+  );
 
-      return { content: [{ type: "text", text: jsonText({ instructor: parsed }) }] };
+  server.tool(
+    "schedule_upsert_instructor",
+    "Create/update an instructor. Uses an account canonical address for identity.",
+    {
+      canonicalAddress: AccountAddress,
+      displayName: z.string().min(1),
+      skills: z.array(z.string()).optional(),
+    },
+    async (args) => {
+      const parsed = z
+        .object({
+          canonicalAddress: AccountAddress,
+          displayName: z.string().min(1),
+          skills: z.array(z.string()).optional(),
+        })
+        .parse(args);
+
+      const skillsJson = parsed.skills ? JSON.stringify(parsed.skills) : null;
+      const account = await ensureAccount(env.DB, {
+        canonicalAddress: parsed.canonicalAddress,
+        email: parsed.canonicalAddress,
+        displayName: parsed.displayName,
+      });
+      const inst = await ensureInstructor(env.DB, { accountId: account.accountId, skillsJson });
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText({
+              instructor: {
+                instructorId: inst.instructorId,
+                accountId: account.accountId,
+                canonicalAddress: account.canonicalAddress,
+                displayName: account.displayName,
+                skills: parsed.skills ?? null,
+              },
+            }),
+          },
+        ],
+      };
     },
   );
 
   server.tool("schedule_list_instructors", "List instructors.", {}, async () => {
-    const res = await env.DB.prepare(`SELECT instructor_id, name, skills_json, created_at_iso, updated_at_iso FROM instructors ORDER BY name ASC`).all();
+    const res = await env.DB.prepare(
+      `
+      SELECT i.instructor_id, i.account_id, i.skills_json, i.created_at_iso, i.updated_at_iso,
+             a.canonical_address, a.display_name, a.email, a.phone_e164
+      FROM instructors i
+      JOIN accounts a ON a.account_id = i.account_id
+      ORDER BY a.display_name ASC
+      `,
+    ).all();
     const instructors = (res.results ?? []).map((r: any) => ({
       instructorId: String(r.instructor_id ?? ""),
-      name: String(r.name ?? ""),
+      accountId: String(r.account_id ?? ""),
+      canonicalAddress: String(r.canonical_address ?? ""),
+      displayName: String(r.display_name ?? ""),
+      email: r.email ? String(r.email) : null,
+      phoneE164: r.phone_e164 ? String(r.phone_e164) : null,
       skills: (() => {
         try {
           const v = r.skills_json ? JSON.parse(String(r.skills_json)) : null;
@@ -117,6 +295,51 @@ function createServer(env: Env) {
     }));
     return { content: [{ type: "text", text: jsonText({ instructors }) }] };
   });
+
+  server.tool(
+    "schedule_upsert_customer",
+    "Create/update a customer account (canonical address).",
+    {
+      canonicalAddress: AccountAddress,
+      displayName: z.string().min(1).optional(),
+      phoneE164: z.string().min(7).optional(),
+    },
+    async (args) => {
+      const parsed = z
+        .object({
+          canonicalAddress: AccountAddress,
+          displayName: z.string().min(1).optional(),
+          phoneE164: z.string().min(7).optional(),
+        })
+        .parse(args);
+
+      const account = await ensureAccount(env.DB, {
+        canonicalAddress: parsed.canonicalAddress,
+        email: parsed.canonicalAddress,
+        displayName: parsed.displayName ?? null,
+        phoneE164: parsed.phoneE164 ?? null,
+      });
+      const cust = await ensureCustomer(env.DB, { accountId: account.accountId });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText({
+              customer: {
+                customerId: cust.customerId,
+                accountId: account.accountId,
+                canonicalAddress: account.canonicalAddress,
+                displayName: account.displayName,
+                email: account.email,
+                phoneE164: account.phoneE164,
+              },
+            }),
+          },
+        ],
+      };
+    },
+  );
 
   server.tool(
     "schedule_create_class",
@@ -317,15 +540,65 @@ function createServer(env: Env) {
   );
 
   server.tool(
+    "schedule_get_class",
+    "Get a class by classId.",
+    { classId: z.string().min(1) },
+    async (args) => {
+      const parsed = z.object({ classId: z.string().min(1) }).parse(args);
+      const r = await env.DB.prepare(
+        `
+        SELECT class_id, title, type, skill_level, start_time_iso, duration_minutes, capacity, instructor_id, is_outdoor
+        FROM classes WHERE class_id = ? LIMIT 1
+      `,
+      )
+        .bind(parsed.classId)
+        .first();
+      if (!r) return { content: [{ type: "text", text: jsonText({ gymClass: null }) }] };
+      const gymClass = {
+        classId: String((r as any).class_id ?? ""),
+        title: String((r as any).title ?? ""),
+        type: (r as any).type === "group" || (r as any).type === "private" ? (r as any).type : String((r as any).type ?? ""),
+        skillLevel: (r as any).skill_level ? String((r as any).skill_level) : null,
+        startTimeISO: String((r as any).start_time_iso ?? ""),
+        durationMinutes: Number((r as any).duration_minutes ?? 0),
+        capacity: Number((r as any).capacity ?? 0),
+        instructorId: (r as any).instructor_id ? String((r as any).instructor_id) : null,
+        isOutdoor: Boolean(Number((r as any).is_outdoor ?? 0)),
+      };
+      return { content: [{ type: "text", text: jsonText({ gymClass }) }] };
+    },
+  );
+
+  server.tool(
+    "schedule_class_availability",
+    "Get seat availability for a class (capacity, reserved, seatsLeft).",
+    { classId: z.string().min(1) },
+    async (args) => {
+      const parsed = z.object({ classId: z.string().min(1) }).parse(args);
+      const cls = await env.DB.prepare(`SELECT class_id, capacity FROM classes WHERE class_id = ? LIMIT 1`).bind(parsed.classId).first();
+      if (!cls) return { content: [{ type: "text", text: jsonText({ error: "Unknown classId" }) }] };
+      const capacity = Number((cls as any).capacity ?? 0);
+      const current = await env.DB.prepare(`SELECT COUNT(*) as c FROM reservations WHERE class_id = ? AND status = 'active'`).bind(parsed.classId).first();
+      const reserved = Number((current as any)?.c ?? 0);
+      const seatsLeft = Math.max(0, capacity - reserved);
+      return { content: [{ type: "text", text: jsonText({ classId: parsed.classId, capacity, reserved, seatsLeft }) }] };
+    },
+  );
+
+  server.tool(
     "schedule_reserve_seat",
     "Reserve a seat in a class (capacity enforced).",
-    { classId: z.string().min(1), customerEmail: z.string().email(), customerName: z.string().optional() },
+    {
+      classId: z.string().min(1),
+      customerCanonicalAddress: AccountAddress,
+      customerDisplayName: z.string().min(1).optional(),
+    },
     async (args) => {
       const parsed = z
         .object({
           classId: z.string().min(1),
-          customerEmail: z.string().email(),
-          customerName: z.string().optional(),
+          customerCanonicalAddress: AccountAddress,
+          customerDisplayName: z.string().min(1).optional(),
         })
         .parse(args);
 
@@ -336,6 +609,13 @@ function createServer(env: Env) {
 
       const capacity = Number((cls as any).capacity ?? NaN);
       if (!Number.isFinite(capacity) || capacity <= 0) throw new Error("Bad capacity");
+
+      const account = await ensureAccount(env.DB, {
+        canonicalAddress: parsed.customerCanonicalAddress,
+        email: parsed.customerCanonicalAddress,
+        displayName: parsed.customerDisplayName ?? null,
+      });
+      await ensureCustomer(env.DB, { accountId: account.accountId });
 
       // Best-effort atomicity: begin/commit around count+insert (SQLite transaction).
       const reservationId = `res_${crypto.randomUUID()}`;
@@ -352,11 +632,11 @@ function createServer(env: Env) {
 
         await env.DB.prepare(
           `
-          INSERT INTO reservations (reservation_id, class_id, customer_email, customer_name, status, reserved_at_iso)
-          VALUES (?, ?, ?, ?, 'active', ?)
+          INSERT INTO reservations (reservation_id, class_id, customer_account_id, status, reserved_at_iso)
+          VALUES (?, ?, ?, 'active', ?)
         `,
         )
-          .bind(reservationId, parsed.classId, parsed.customerEmail, parsed.customerName ?? null, ts)
+          .bind(reservationId, parsed.classId, account.accountId, ts)
           .run();
 
         await env.DB.exec("COMMIT");
@@ -373,8 +653,9 @@ function createServer(env: Env) {
               reservation: {
                 reservationId,
                 classId: parsed.classId,
-                customerEmail: parsed.customerEmail,
-                customerName: parsed.customerName ?? null,
+                customerAccountId: account.accountId,
+                customerCanonicalAddress: account.canonicalAddress,
+                customerDisplayName: account.displayName,
                 status: "active",
                 reservedAtISO: ts,
               },
@@ -405,31 +686,44 @@ function createServer(env: Env) {
   server.tool(
     "schedule_list_reservations",
     "List reservations (optional filters).",
-    { classId: z.string().optional(), customerEmail: z.string().email().optional(), status: z.enum(["active", "cancelled"]).optional() },
+    {
+      classId: z.string().optional(),
+      customerCanonicalAddress: AccountAddress.optional(),
+      status: z.enum(["active", "cancelled"]).optional(),
+    },
     async (args) => {
       const parsed = z
         .object({
           classId: z.string().optional(),
-          customerEmail: z.string().email().optional(),
+          customerCanonicalAddress: AccountAddress.optional(),
           status: z.enum(["active", "cancelled"]).optional(),
         })
         .parse(args);
 
+      const canonical = parsed.customerCanonicalAddress ? canonicalizeAddress(parsed.customerCanonicalAddress) : null;
+      let accountId: string | null = null;
+      if (canonical) {
+        const acc = await env.DB.prepare(`SELECT account_id FROM accounts WHERE canonical_address = ? LIMIT 1`).bind(canonical).first();
+        accountId = acc && (acc as any).account_id ? String((acc as any).account_id) : null;
+      }
+
       const res = await env.DB.prepare(
         `
-        SELECT reservation_id, class_id, customer_email, customer_name, status, reserved_at_iso, cancelled_at_iso
+        SELECT r.reservation_id, r.class_id, r.customer_account_id, r.status, r.reserved_at_iso, r.cancelled_at_iso,
+               a.canonical_address, a.display_name
         FROM reservations
-        WHERE (? IS NULL OR class_id = ?)
-          AND (? IS NULL OR customer_email = ?)
-          AND (? IS NULL OR status = ?)
+        JOIN accounts a ON a.account_id = r.customer_account_id
+        WHERE (? IS NULL OR r.class_id = ?)
+          AND (? IS NULL OR r.customer_account_id = ?)
+          AND (? IS NULL OR r.status = ?)
         ORDER BY reserved_at_iso DESC
       `,
       )
         .bind(
           parsed.classId ?? null,
           parsed.classId ?? null,
-          parsed.customerEmail ?? null,
-          parsed.customerEmail ?? null,
+          accountId,
+          accountId,
           parsed.status ?? null,
           parsed.status ?? null,
         )
@@ -438,8 +732,9 @@ function createServer(env: Env) {
       const reservations = (res.results ?? []).map((r: any) => ({
         reservationId: String(r.reservation_id ?? ""),
         classId: String(r.class_id ?? ""),
-        customerEmail: String(r.customer_email ?? ""),
-        customerName: r.customer_name ? String(r.customer_name) : null,
+        customerAccountId: String(r.customer_account_id ?? ""),
+        customerCanonicalAddress: String(r.canonical_address ?? ""),
+        customerDisplayName: r.display_name ? String(r.display_name) : null,
         status: String(r.status ?? ""),
         reservedAtISO: String(r.reserved_at_iso ?? ""),
         cancelledAtISO: r.cancelled_at_iso ? String(r.cancelled_at_iso) : null,

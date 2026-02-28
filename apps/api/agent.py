@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -16,8 +16,6 @@ from .mcp_tools import load_mcp_tools_from_env
 from .ops_data import (
     CAMP_ENROLLMENTS,
     CAMPS,
-    CLASS_ENROLLMENTS,
-    CLASSES,
     PRODUCT_AVAILABILITY,
     catalog_item_by_sku,
     full_catalog,
@@ -98,6 +96,31 @@ async def _weather_hourly_forecast(lat: float, lon: float, hours: int = 48, unit
         return None
     try:
         raw = await tool.ainvoke({"lat": lat, "lon": lon, "hours": hours, "units": units})
+        txt = raw if isinstance(raw, str) else json.dumps(raw)
+        return json.loads(txt) if isinstance(txt, str) else None
+    except Exception:
+        return None
+
+
+async def _scheduling_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    mcp_tools = await load_mcp_tools_from_env()
+    tool = next(
+        (
+            t
+            for t in mcp_tools
+            if isinstance(getattr(t, "name", None), str)
+            and (
+                t.name == f"scheduling_{tool_suffix}"
+                or t.name.endswith(f"_{tool_suffix}")
+                or t.name == tool_suffix
+            )
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke(args if isinstance(args, dict) else {})
         txt = raw if isinstance(raw, str) else json.dumps(raw)
         return json.loads(txt) if isinstance(txt, str) else None
     except Exception:
@@ -205,46 +228,56 @@ async def _handle_reserve_class(session: Optional["Session"], class_id: str) -> 
     participant_email = _waiver_email(session)
     participant_name = _waiver_participant(session)
 
-    # Reuse the same reservation logic as the tool.
-    # (This path avoids LLM variability and returns structured reservation details.)
-    gym_class = next((c for c in CLASSES if c["id"] == class_id), None)
-    if not gym_class:
-        return Output(answer="Unknown classId.", citations=[])
+    if not participant_email:
+        return Output(
+            answer="Reservation requires a saved waiver with participantEmail.",
+            citations=[],
+            uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need email for reservation"}],
+        )
 
-    enrolled = int(CLASS_ENROLLMENTS.get(class_id, 0))
-    capacity = int(gym_class.get("capacity", 0) or 0)
-    seats_left = max(0, capacity - enrolled)
-    if seats_left <= 0:
-        return Output(answer="No seats left for that class.", citations=[])
+    cls_resp = await _scheduling_call_json("schedule_get_class", {"classId": class_id})
+    cls = cls_resp.get("gymClass") if isinstance(cls_resp, dict) else None
+    if not isinstance(cls, dict):
+        return Output(answer="Unknown classId (not found in scheduling).", citations=[])
 
-    CLASS_ENROLLMENTS[class_id] = enrolled + 1
-    reservation_id = f"res_{uuid.uuid4().hex[:12]}"
+    reserve_resp = await _scheduling_call_json(
+        "schedule_reserve_seat",
+        {
+            "classId": class_id,
+            "customerCanonicalAddress": participant_email,
+            "customerDisplayName": participant_name or None,
+        },
+    )
+    reservation_obj = reserve_resp.get("reservation") if isinstance(reserve_resp, dict) else None
+    if not isinstance(reservation_obj, dict):
+        err = reserve_resp.get("error") if isinstance(reserve_resp, dict) else None
+        return Output(answer=str(err or "Reservation failed."), citations=[])
+
+    reservation_id = str(reservation_obj.get("reservationId") or "")
 
     emailed = False
     email_err = ""
-    if participant_email:
-        subject = f"Class reservation confirmed: {gym_class.get('title')}"
-        body = "\n".join(
-            [
-                "Your class reservation is confirmed.",
-                f"ReservationId: {reservation_id}",
-                f"Class: {gym_class.get('title')} ({class_id})",
-                f"Start: {gym_class.get('startTimeISO')}",
-                f"DurationMinutes: {gym_class.get('durationMinutes')}",
-                f"As of: {_now_iso()}",
-            ]
-        )
-        emailed, email_err = await _send_email_via_sendgrid(
-            to_email=participant_email,
-            subject=subject,
-            text=body,
-        )
+    subject = f"Class reservation confirmed: {cls.get('title')}"
+    body = "\n".join(
+        [
+            "Your class reservation is confirmed.",
+            f"ReservationId: {reservation_id}",
+            f"Class: {cls.get('title')} ({class_id})",
+            f"Start: {cls.get('startTimeISO')}",
+            f"DurationMinutes: {cls.get('durationMinutes')}",
+            f"As of: {_now_iso()}",
+        ]
+    )
+    emailed, email_err = await _send_email_via_sendgrid(
+        to_email=participant_email,
+        subject=subject,
+        text=body,
+    )
 
-    answer = f"Reserved: {gym_class.get('title')} at {gym_class.get('startTimeISO')}."
-    if participant_email:
-        answer += f" Email {'sent' if emailed else 'failed'} to {participant_email}."
-        if email_err and not emailed:
-            answer += f" ({email_err})"
+    answer = f"Reserved: {cls.get('title')} at {cls.get('startTimeISO')}."
+    answer += f" Email {'sent' if emailed else 'failed'} to {participant_email}."
+    if email_err and not emailed:
+        answer += f" ({email_err})"
 
     return Output(
         answer=answer,
@@ -253,8 +286,8 @@ async def _handle_reserve_class(session: Optional["Session"], class_id: str) -> 
         reservation={
             "reservationId": reservation_id,
             "classId": class_id,
-            "title": str(gym_class.get("title") or ""),
-            "startTimeISO": str(gym_class.get("startTimeISO") or ""),
+            "title": str(cls.get("title") or ""),
+            "startTimeISO": str(cls.get("startTimeISO") or ""),
             "emailSent": emailed,
             "emailError": email_err or None,
         },
@@ -499,21 +532,22 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     class OpsClassAvailArgs(BaseModel):
         classId: str = Field(min_length=1)
 
-    def ops_class_availability(classId: str) -> str:
+    async def ops_class_availability(classId: str) -> str:
         trace.ops_endpoints.add("classes/availability")
         trace.ops_as_of = _now_iso()
-        gym_class = next((c for c in CLASSES if c["id"] == classId), None)
         payload = None
-        if gym_class:
-            enrolled = int(CLASS_ENROLLMENTS.get(classId, 0))
-            seats_left = max(0, int(gym_class["capacity"]) - enrolled)
-            payload = {"classId": classId, "capacity": gym_class["capacity"], "enrolled": enrolled, "seatsLeft": seats_left}
+        resp = await _scheduling_call_json("schedule_class_availability", {"classId": classId})
+        if isinstance(resp, dict) and isinstance(resp.get("capacity"), (int, float)):
+            capacity = int(resp.get("capacity") or 0)
+            reserved = int(resp.get("reserved") or 0)
+            seats_left = int(resp.get("seatsLeft") or max(0, capacity - reserved))
+            payload = {"classId": classId, "capacity": capacity, "enrolled": reserved, "seatsLeft": seats_left}
         return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/availability", "payload": payload}, indent=2)
 
     ops_class_tool = StructuredTool.from_function(
         name="ops_class_availability",
         description="Get real-time-ish class seat availability by classId.",
-        func=lambda classId: ops_class_availability(classId=classId),
+        coroutine=ops_class_availability,
         args_schema=OpsClassAvailArgs,
     )
 
@@ -529,6 +563,30 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         # If query is too generic (e.g. "tomorrow classes"), return upcoming classes.
         broad = any(k in q for k in ["tomorrow", "today", "upcoming", "next", "classes"]) or len(q) < 4
 
+        # Pull classes from scheduling MCP (D1-backed) for a reasonable window.
+        now = datetime.now(timezone.utc)
+        from_iso = None
+        to_iso = None
+        if "today" in q:
+            d = now.date()
+            from_iso = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+            to_iso = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
+        elif "tomorrow" in q:
+            d = (now + timedelta(days=1)).date()
+            from_iso = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+            to_iso = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
+        else:
+            from_iso = now.isoformat()
+            to_iso = (now + timedelta(days=7)).isoformat()
+
+        sched = await _scheduling_call_json(
+            "schedule_list_classes",
+            {"fromISO": from_iso, "toISO": to_iso},
+        )
+        sched_items = []
+        if isinstance(sched, dict) and isinstance(sched.get("classes"), list):
+            sched_items = [x for x in sched["classes"] if isinstance(x, dict)]
+
         # Fetch hourly forecast once so we can attach to outdoor classes.
         forecast = await _weather_hourly_forecast(_GYM_LAT, _GYM_LON, hours=48, units="metric")
         hourly = []
@@ -536,15 +594,27 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
             hourly = [x for x in forecast["hourly"] if isinstance(x, dict)]
 
         items: list[dict[str, Any]] = []
-        for c in CLASSES:
+        for c in sched_items:
             title = str(c.get("title", ""))
-            cid = str(c.get("id", ""))
+            cid = str(c.get("classId", ""))
+            if not cid or not title:
+                continue
             if not broad and q not in f"{cid} {title}".lower():
                 continue
-            is_outdoor = "outdoor" in cid.lower() or "outdoor" in title.lower()
-            out = {**c, "isOutdoor": is_outdoor}
+            is_outdoor = bool(c.get("isOutdoor")) or ("outdoor" in cid.lower() or "outdoor" in title.lower())
+            out = {
+                "id": cid,
+                "title": title,
+                "type": c.get("type"),
+                "skillLevel": c.get("skillLevel") or "beginner",
+                "coachId": c.get("instructorId") or "",
+                "startTimeISO": c.get("startTimeISO"),
+                "durationMinutes": c.get("durationMinutes"),
+                "capacity": c.get("capacity"),
+                "isOutdoor": is_outdoor,
+            }
             if is_outdoor and hourly:
-                start_iso = str(c.get("startTimeISO") or "")
+                start_iso = str(out.get("startTimeISO") or "")
                 t = _parse_iso_to_unix(start_iso) if start_iso else None
                 if isinstance(t, int):
                     h = _pick_hour(hourly, t)
@@ -596,31 +666,28 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     async def ops_reserve_class(classId: str, participantEmail: Optional[str] = None, participantName: Optional[str] = None) -> str:
         trace.ops_endpoints.add("classes/reserve")
         trace.ops_as_of = _now_iso()
-        gym_class = next((c for c in CLASSES if c["id"] == classId), None)
-        if not gym_class:
+        to_email = participantEmail.strip() if isinstance(participantEmail, str) else ""
+        if not to_email:
+            return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/reserve", "error": "Missing participantEmail"}, indent=2)
+
+        cls_resp = await _scheduling_call_json("schedule_get_class", {"classId": classId})
+        gym_class = cls_resp.get("gymClass") if isinstance(cls_resp, dict) else None
+        if not isinstance(gym_class, dict):
             return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/reserve", "error": "Unknown classId"}, indent=2)
 
-        enrolled = int(CLASS_ENROLLMENTS.get(classId, 0))
-        capacity = int(gym_class.get("capacity", 0) or 0)
-        seats_left = max(0, capacity - enrolled)
-        if seats_left <= 0:
-            return json.dumps(
-                {
-                    "asOfISO": trace.ops_as_of,
-                    "endpoint": "classes/reserve",
-                    "error": "No seats left",
-                    "payload": {"classId": classId, "capacity": capacity, "enrolled": enrolled, "seatsLeft": seats_left},
-                },
-                indent=2,
-            )
+        reserve_resp = await _scheduling_call_json(
+            "schedule_reserve_seat",
+            {"classId": classId, "customerCanonicalAddress": to_email, "customerDisplayName": participantName or None},
+        )
+        reservation_obj = reserve_resp.get("reservation") if isinstance(reserve_resp, dict) else None
+        if not isinstance(reservation_obj, dict):
+            err = reserve_resp.get("error") if isinstance(reserve_resp, dict) else None
+            return json.dumps({"asOfISO": trace.ops_as_of, "endpoint": "classes/reserve", "error": str(err or "Reserve failed")}, indent=2)
 
-        CLASS_ENROLLMENTS[classId] = enrolled + 1
-        next_seats_left = max(0, capacity - (enrolled + 1))
-        reservation_id = f"res_{uuid.uuid4().hex[:12]}"
+        reservation_id = str(reservation_obj.get("reservationId") or "")
 
         emailed = False
         email_err = ""
-        to_email = participantEmail.strip() if isinstance(participantEmail, str) else ""
         if to_email:
             subject = f"Class reservation confirmed: {gym_class.get('title')}"
             body = "\n".join(
@@ -638,7 +705,6 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         payload = {
             "reservationId": reservation_id,
             "class": gym_class,
-            "seatsLeft": next_seats_left,
             "participantEmail": to_email or None,
             "participantName": participantName.strip() if isinstance(participantName, str) and participantName.strip() else None,
             "emailSent": emailed,
