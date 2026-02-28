@@ -14,7 +14,7 @@
 	},
 	"d1_databases": [
 		{
-			"binding": "gym_content",
+			"binding": "DB",
 			"database_name": "gym-content",
 			"database_id": "f5b71add-b730-4269-b742-e8360b1d67cc",
 			"remote": true

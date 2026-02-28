@@ -858,6 +858,170 @@ async def run(input: Input) -> Output:
                     safe.append({"role": role, "content": content})
         return Output(answer="", citations=[], data={"messages": safe})
 
+    # Deterministic helper: "book/reserve next available" for a class definition mentioned in-thread.
+    if (not msg.startswith("__")) and any(k in mlow for k in ["next available", "next opening", "next slot"]) and any(
+        k in mlow for k in ["book", "reserve", "schedule"]
+    ):
+        hint = mlow
+        if thread_id and any(k in mlow for k in ["this", "that", "it"]):
+            mem = await _core_call_json("core_memory_list_messages", {"threadId": thread_id, "limit": 10}) or {}
+            msgs = mem.get("messages") if isinstance(mem, dict) else None
+            if isinstance(msgs, list):
+                for m in reversed(msgs):
+                    if isinstance(m, dict) and m.get("role") == "assistant" and isinstance(m.get("content"), str):
+                        hint = hint + "\n" + str(m.get("content") or "").lower()
+                        break
+
+        core_defs = await _core_call_json("core_list_class_definitions", {}) or {}
+        defs_list = core_defs.get("classDefinitions") if isinstance(core_defs, dict) else None
+        best_def: Optional[dict[str, Any]] = None
+        best_score = 0
+        if isinstance(defs_list, list):
+            for d in defs_list:
+                if not isinstance(d, dict):
+                    continue
+                title = str(d.get("title") or "").strip()
+                if not title:
+                    continue
+                t = title.lower()
+                if t in hint:
+                    score = len(t)
+                    if score > best_score:
+                        best_score = score
+                        best_def = d
+
+        if not best_def and "private coaching" in hint and isinstance(defs_list, list):
+            for d in defs_list:
+                if isinstance(d, dict) and "private coaching" in str(d.get("title") or "").lower():
+                    best_def = d
+                    break
+
+        class_def_id = str(best_def.get("classDefId") or "").strip() if isinstance(best_def, dict) else ""
+        if not class_def_id:
+            answer = "I can book the next available time, but I need the class name (e.g., 'Private Coaching (60 min)')."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[])
+
+        class_type = str(best_def.get("type") or "").strip() if isinstance(best_def, dict) else ""
+        now_utc = datetime.now(timezone.utc)
+        from_iso = now_utc.isoformat()
+        to_iso = (now_utc + timedelta(days=14)).isoformat()
+        sched = await _scheduling_call_json(
+            "schedule_list_classes",
+            {"fromISO": from_iso, "toISO": to_iso, "type": class_type if class_type in {"group", "private"} else None},
+        )
+        classes = sched.get("classes") if isinstance(sched, dict) else None
+        candidates: list[dict[str, Any]] = []
+        if isinstance(classes, list):
+            for c in classes:
+                if not isinstance(c, dict):
+                    continue
+                if str(c.get("classDefId") or "").strip() != class_def_id:
+                    continue
+                candidates.append(c)
+        def _start_key(c: dict[str, Any]) -> float:
+            s = c.get("startTimeISO")
+            if isinstance(s, str) and s.strip():
+                try:
+                    # Accept "Z" suffix.
+                    iso = s.strip().replace("Z", "+00:00")
+                    return datetime.fromisoformat(iso).timestamp()
+                except Exception:
+                    return 10**18
+            return 10**18
+
+        candidates.sort(key=_start_key)
+
+        picked: Optional[dict[str, Any]] = None
+        for c in candidates[:20]:
+            cid = str(c.get("classId") or "").strip()
+            if not cid:
+                continue
+            avail = await _scheduling_call_json("schedule_class_availability", {"classId": cid}) or {}
+            seats_left = int(avail.get("seatsLeft") or 0) if isinstance(avail, dict) else 0
+            if seats_left > 0:
+                picked = c
+                break
+
+        if not picked:
+            answer = f"No upcoming availability found for {str(best_def.get('title') or 'that class')} in the next 14 days."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[])
+
+        if not acct:
+            return Output(
+                answer="Booking requires a saved waiver with accountAddress (canonical).",
+                citations=[],
+                uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address for booking"}],
+            )
+
+        class_id = str(picked.get("classId") or "").strip()
+        reserve_resp = await _scheduling_call_json(
+            "schedule_reserve_seat",
+            {"classId": class_id, "customerAccountAddress": acct},
+        )
+        reservation_obj = reserve_resp.get("reservation") if isinstance(reserve_resp, dict) else None
+        if not isinstance(reservation_obj, dict):
+            err = reserve_resp.get("error") if isinstance(reserve_resp, dict) else None
+            answer = str(err or "Reservation failed.")
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[])
+
+        reservation_id = str(reservation_obj.get("reservationId") or "")
+        await _core_call_json("core_upsert_customer", {"canonicalAddress": acct})  # best-effort
+        await _core_call_json(
+            "core_record_reservation",
+            {
+                "canonicalAddress": acct,
+                "schedulerClassId": class_id,
+                "schedulerReservationId": reservation_id,
+                "classDefId": class_def_id,
+                "status": "active",
+            },
+        )
+
+        wants_cart = "cart" in mlow or "add to cart" in mlow
+        cart_actions = None
+        ui_actions = None
+        if wants_cart:
+            links = await _core_call_json("core_list_class_def_products", {"classDefId": class_def_id}) or {}
+            items = links.get("items") if isinstance(links, dict) else None
+            sku = ""
+            if isinstance(items, list) and items and isinstance(items[0], dict):
+                sku = str(items[0].get("sku") or "").strip()
+            if sku:
+                cart_actions = [
+                    {
+                        "op": "add",
+                        "sku": sku,
+                        "quantity": 1,
+                        "note": f"Reserved session {str(picked.get('startTimeISO') or '').strip()} ({class_id})",
+                    }
+                ]
+                ui_actions = [{"type": "navigate", "to": "/cart", "reason": "added booking to cart"}]
+
+        answer = f"Reserved next available: {str(best_def.get('title') or '').strip()} at {str(picked.get('startTimeISO') or '').strip()}."
+        if wants_cart:
+            answer += " Added to your cart." if cart_actions else " I couldn't find a matching product SKU to add to cart."
+
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+
+        return Output(
+            answer=answer,
+            citations=[],
+            cartActions=cart_actions,
+            uiActions=ui_actions,
+            reservation={"reservationId": reservation_id, "classId": class_id, "title": str(best_def.get("title") or ""), "startTimeISO": str(picked.get("startTimeISO") or "")},
+        )
+
     # Deterministic helper: avoid "query=tomorrow" text searches returning empty.
     if (
         not msg.startswith("__")
