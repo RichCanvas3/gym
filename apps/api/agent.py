@@ -104,6 +104,34 @@ def _tomorrow_date_iso(tz_name: str) -> str:
     return (now_local.date() + timedelta(days=1)).isoformat()
 
 
+def _tool_raw_to_json(raw: Any) -> Optional[dict[str, Any]]:
+    """
+    MCP tools (via langchain-mcp-adapters) commonly return a list of content blocks:
+      [{"type":"text","text":"{...json...}"}]
+    Normalize that into a parsed JSON object.
+    """
+    try:
+        if isinstance(raw, dict):
+            content = raw.get("content")
+            if isinstance(content, list):
+                raw = content
+            else:
+                return raw
+
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    return json.loads(str(item.get("text")))
+            return None
+
+        if isinstance(raw, str):
+            return json.loads(raw)
+
+        return None
+    except Exception:
+        return None
+
+
 async def _weather_hourly_forecast(lat: float, lon: float, hours: int = 48, units: str = "metric") -> Optional[dict[str, Any]]:
     mcp_tools = await load_mcp_tools_from_env()
     # Prefer the conventional prefixed name, but accept any server prefix.
@@ -120,8 +148,7 @@ async def _weather_hourly_forecast(lat: float, lon: float, hours: int = 48, unit
         return None
     try:
         raw = await tool.ainvoke({"lat": lat, "lon": lon, "hours": hours, "units": units})
-        txt = raw if isinstance(raw, str) else json.dumps(raw)
-        return json.loads(txt) if isinstance(txt, str) else None
+        return _tool_raw_to_json(raw)
     except Exception:
         return None
 
@@ -141,8 +168,7 @@ async def _weather_daily_forecast(lat: float, lon: float, days: int = 8, units: 
         return None
     try:
         raw = await tool.ainvoke({"lat": lat, "lon": lon, "days": days, "units": units})
-        txt = raw if isinstance(raw, str) else json.dumps(raw)
-        return json.loads(txt) if isinstance(txt, str) else None
+        return _tool_raw_to_json(raw)
     except Exception:
         return None
 
@@ -166,8 +192,7 @@ async def _scheduling_call_json(tool_suffix: str, args: dict[str, Any]) -> Optio
         return None
     try:
         raw = await tool.ainvoke(args if isinstance(args, dict) else {})
-        txt = raw if isinstance(raw, str) else json.dumps(raw)
-        return json.loads(txt) if isinstance(txt, str) else None
+        return _tool_raw_to_json(raw)
     except Exception:
         return None
 
@@ -191,8 +216,7 @@ async def _core_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[di
         return None
     try:
         raw = await tool.ainvoke(args if isinstance(args, dict) else {})
-        txt = raw if isinstance(raw, str) else json.dumps(raw)
-        return json.loads(txt) if isinstance(txt, str) else None
+        return _tool_raw_to_json(raw)
     except Exception:
         return None
 
