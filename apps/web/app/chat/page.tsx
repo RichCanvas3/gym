@@ -60,6 +60,7 @@ export default function ChatPage() {
           waiver: waiver
             ? {
                 id: waiver.id,
+                accountAddress: waiver.accountAddress,
                 participantName: waiver.participantName,
                 participantEmail: waiver.participantEmail,
                 isMinor: waiver.isMinor,

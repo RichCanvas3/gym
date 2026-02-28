@@ -1,0 +1,23 @@
+/**
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gym-core-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "gym_core",
+			"database_name": "gym-core",
+			"database_id": "aefaef97-cca4-4e26-80ef-b00aa4772cc1",
+			"remote": true
+		}
+	]
+}

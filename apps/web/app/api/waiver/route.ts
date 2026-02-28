@@ -5,6 +5,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type WaiverPayload = {
+  accountAddress: string;
   participantName: string;
   participantEmail: string;
   participantDobISO: string; // YYYY-MM-DD
@@ -34,13 +35,14 @@ export async function POST(req: Request) {
   const body = (await req.json().catch(() => null)) as Partial<WaiverPayload> | null;
   if (!body) return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
 
+  const accountAddress = asTrimmedString(body.accountAddress);
   const participantName = asTrimmedString(body.participantName);
   const participantEmail = asTrimmedString(body.participantEmail);
   const participantDobISO = asTrimmedString(body.participantDobISO);
   const participantSignature = asTrimmedString(body.participantSignature);
   const isMinor = body.isMinor === true;
 
-  if (!participantName || !participantEmail || !participantDobISO || !participantSignature) {
+  if (!accountAddress || !participantName || !participantEmail || !participantDobISO || !participantSignature) {
     return NextResponse.json({ error: "Missing required participant fields" }, { status: 400 });
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(participantDobISO)) {
@@ -76,6 +78,7 @@ export async function POST(req: Request) {
   const record: WaiverRecord = {
     id,
     createdAtISO,
+    accountAddress,
     participantName,
     participantEmail,
     participantDobISO,

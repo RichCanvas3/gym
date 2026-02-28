@@ -263,8 +263,8 @@ function CalendarInner() {
                                   disabled={reserveBusyId === c.id || !!reservedId}
                                   onClick={async () => {
                                     setReserveMsg("");
-                                    if (!waiver?.id || !waiver.participantEmail) {
-                                      setReserveMsg("Reserve requires a saved waiver (for email confirmation).");
+                                    if (!waiver?.id || !waiver.accountAddress) {
+                                      setReserveMsg("Reserve requires a saved waiver with a canonical account address.");
                                       return;
                                     }
                                     setReserveBusyId(c.id);
@@ -279,6 +279,7 @@ function CalendarInner() {
                                             timezone: "America/Denver",
                                             waiver: {
                                               id: waiver.id,
+                                              accountAddress: waiver.accountAddress,
                                               participantName: waiver.participantName,
                                               participantEmail: waiver.participantEmail,
                                               isMinor: waiver.isMinor,

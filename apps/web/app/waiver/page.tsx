@@ -19,6 +19,7 @@ function computeIsMinor(dobISO: string) {
 
 export default function WaiverPage() {
   const { setWaiver, waiver, clearWaiver } = useWaiver();
+  const [accountAddress, setAccountAddress] = useState("");
   const [participantName, setParticipantName] = useState("");
   const [participantEmail, setParticipantEmail] = useState("");
   const [participantDobISO, setParticipantDobISO] = useState("");
@@ -43,6 +44,7 @@ export default function WaiverPage() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          accountAddress,
           participantName,
           participantEmail,
           participantDobISO,
@@ -65,6 +67,7 @@ export default function WaiverPage() {
       setWaiver({
         id: ok.id,
         createdAtISO: ok.createdAtISO,
+        accountAddress: accountAddress.trim(),
         participantName: participantName.trim(),
         participantEmail: participantEmail.trim(),
         participantDobISO: participantDobISO.trim(),
@@ -101,7 +104,8 @@ export default function WaiverPage() {
               <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-white/10 dark:bg-white/5">
                 <div className="font-semibold">Waiver on file (this browser)</div>
                 <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-                  {waiver.participantName} • {waiver.participantEmail} • ID{" "}
+                  {waiver.participantName} • {waiver.participantEmail} • Account{" "}
+                  <span className="font-mono">{waiver.accountAddress}</span> • ID{" "}
                   <span className="font-mono">{waiver.id}</span>
                 </div>
                 <button
@@ -112,6 +116,17 @@ export default function WaiverPage() {
                 </button>
               </div>
             ) : null}
+            <Field label="Canonical account address (required for identity)">
+              <input
+                value={accountAddress}
+                onChange={(e) => setAccountAddress(e.target.value)}
+                placeholder="e.g. acct_... (from your account table address)"
+                className="h-11 w-full rounded-xl border border-zinc-200 bg-white px-3 text-sm dark:border-white/10 dark:bg-zinc-950"
+              />
+              <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                This is the canonical address used for reservations (not email).
+              </div>
+            </Field>
             <Field label="Participant full name">
               <input
                 value={participantName}

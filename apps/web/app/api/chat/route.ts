@@ -60,13 +60,14 @@ function parseSession(value: unknown): GymAssistantSession | undefined {
   if (v.waiver && typeof v.waiver === "object") {
     const w = v.waiver as Record<string, unknown>;
     const id = typeof w.id === "string" ? w.id : "";
+    const accountAddress = typeof w.accountAddress === "string" ? w.accountAddress : "";
     const participantName = typeof w.participantName === "string" ? w.participantName : "";
     const participantEmail = typeof w.participantEmail === "string" ? w.participantEmail : "";
     const isMinor = typeof w.isMinor === "boolean" ? w.isMinor : false;
-    if (id && participantName) {
+    if (id && participantName && accountAddress) {
       session.waiver = participantEmail
-        ? { id, participantName, participantEmail, isMinor }
-        : { id, participantName, isMinor };
+        ? { id, accountAddress, participantName, participantEmail, isMinor }
+        : { id, accountAddress, participantName, isMinor };
     }
   }
   return session;

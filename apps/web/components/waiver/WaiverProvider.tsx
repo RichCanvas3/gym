@@ -5,6 +5,7 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from "
 export type WaiverInfo = {
   id: string;
   createdAtISO: string;
+  accountAddress: string;
   participantName: string;
   participantEmail: string;
   participantDobISO: string;
@@ -20,7 +21,7 @@ type WaiverContextValue = {
 };
 
 const WaiverContext = createContext<WaiverContextValue | null>(null);
-const STORAGE_KEY = "climb_gym_waiver_v1";
+const STORAGE_KEY = "climb_gym_waiver_v2";
 
 export function WaiverProvider({ children }: { children: React.ReactNode }) {
   const [waiver, setWaiverState] = useState<WaiverInfo | null>(() => {
@@ -32,11 +33,13 @@ export function WaiverProvider({ children }: { children: React.ReactNode }) {
       if (!parsed || typeof parsed !== "object") return null;
       const o = parsed as Record<string, unknown>;
       if (typeof o.id !== "string" || typeof o.createdAtISO !== "string") return null;
+      if (typeof o.accountAddress !== "string") return null;
       if (typeof o.participantName !== "string" || typeof o.participantEmail !== "string") return null;
       if (typeof o.participantDobISO !== "string" || typeof o.isMinor !== "boolean") return null;
       return {
         id: o.id,
         createdAtISO: o.createdAtISO,
+        accountAddress: o.accountAddress,
         participantName: o.participantName,
         participantEmail: o.participantEmail,
         participantDobISO: o.participantDobISO,

@@ -16,7 +16,7 @@ export function buildSessionPrompt(session?: GymAssistantSession) {
   if (userGoals) lines.push(`UserGoals: ${userGoals}`);
   if (waiver?.id) {
     lines.push(
-      `WaiverOnFile: yes (id=${waiver.id}, participant=${waiver.participantName}${
+      `WaiverOnFile: yes (id=${waiver.id}, accountAddress=${waiver.accountAddress}, participant=${waiver.participantName}${
         waiver.participantEmail ? `, email=${waiver.participantEmail}` : ""
       }, minor=${waiver.isMinor})`,
     );

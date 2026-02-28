@@ -48,6 +48,6 @@ export type GymAssistantSession = {
   userName?: string;
   userGoals?: string;
   cartLines?: Array<{ sku: string; quantity: number }>;
-  waiver?: { id: string; participantName: string; participantEmail?: string; isMinor: boolean };
+  waiver?: { id: string; accountAddress: string; participantName: string; participantEmail?: string; isMinor: boolean };
 };
 
