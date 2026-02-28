@@ -22,6 +22,15 @@ type WaiverContextValue = {
 
 const WaiverContext = createContext<WaiverContextValue | null>(null);
 const STORAGE_KEY = "climb_gym_waiver_v2";
+const DEFAULT_DEMO_WAIVER: WaiverInfo = {
+  id: "waiver_demo_casey",
+  createdAtISO: "2026-02-01T00:00:00Z",
+  accountAddress: "acct_cust_casey",
+  participantName: "Casey Morgan",
+  participantEmail: "casey@example.com",
+  participantDobISO: "1990-01-01",
+  isMinor: false,
+};
 
 export function WaiverProvider({ children }: { children: React.ReactNode }) {
   const [waiver, setWaiverState] = useState<WaiverInfo | null>(() => {
@@ -54,6 +63,14 @@ export function WaiverProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     try {
+      // Demo-mode default: if no waiver exists, act like Casey is signed in.
+      // Disable by setting NEXT_PUBLIC_DEMO_DEFAULT_USER=0.
+      const demoDefault =
+        (process.env.NEXT_PUBLIC_DEMO_DEFAULT_USER ?? "1").toLowerCase() !== "0";
+      if (!waiver && demoDefault) {
+        setWaiverState(DEFAULT_DEMO_WAIVER);
+        return;
+      }
       if (!waiver) {
         window.localStorage.removeItem(STORAGE_KEY);
       } else {
