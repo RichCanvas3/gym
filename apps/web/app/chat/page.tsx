@@ -1,11 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
 import { useWaiver } from "@/components/waiver/WaiverProvider";
 import { useRouter } from "next/navigation";
-import { useEffect } from "react";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -31,52 +30,122 @@ export default function ChatPage() {
   const { lines, addLine, removeSku, clear } = useCart();
   const { waiver } = useWaiver();
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      text:
-        "Hi — ask about classes, policies, rentals, or check availability (e.g., rental shoes size 11).",
-    },
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const [lastSuggestions, setLastSuggestions] = useState<SuggestedCartItem[] | null>(null);
 
-  const threadId = waiver?.accountAddress ? `thr_${waiver.accountAddress}` : "";
+  const threadId = waiver?.accountAddress ? `thr_${waiver.accountAddress}` : "thr_demo";
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     async function loadHistory() {
-      if (!threadId) return;
+      const tid = threadId || "thr_demo";
+
+      // Load from browser cache first (fast, works even if server memory isn't ready).
+      let loadedAny = false;
+      try {
+        const raw = window.localStorage.getItem("climb_gym_chat_threads_v1");
+        if (raw) {
+          const parsed = JSON.parse(raw) as unknown;
+          if (parsed && typeof parsed === "object") {
+            const map = parsed as Record<string, unknown>;
+            const arr = map[tid];
+            if (Array.isArray(arr)) {
+              const cached: ChatMessage[] = [];
+              for (const x of arr) {
+                if (!x || typeof x !== "object") continue;
+                const o = x as Record<string, unknown>;
+                const role = o.role === "user" || o.role === "assistant" ? o.role : null;
+                const text = typeof o.text === "string" ? o.text : "";
+                if (role && text.trim()) cached.push({ role, text });
+              }
+              if (!cancelled && cached.length) {
+                setMessages(cached);
+                loadedAny = true;
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+
       const useHosted = process.env.NEXT_PUBLIC_USE_LANGGRAPH === "1";
       const url = useHosted ? "/api/agent/run" : "/api/chat";
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          message: "__CHAT_HISTORY__",
-          session: { gymName: "Front Range Climbing (Boulder)", timezone: "America/Denver", threadId, waiver: waiver ? { id: waiver.id, accountAddress: waiver.accountAddress, participantName: waiver.participantName, participantEmail: waiver.participantEmail, isMinor: waiver.isMinor } : undefined },
-        }),
-      });
-      const json = (await res.json().catch(() => ({}))) as any;
-      const data = json?.data;
-      const msgs = data?.messages;
-      if (!Array.isArray(msgs)) return;
-      const out: ChatMessage[] = [];
-      for (const m of msgs) {
-        if (!m || typeof m !== "object") continue;
-        const role = (m as any).role;
-        const content = (m as any).content;
-        if ((role === "user" || role === "assistant") && typeof content === "string" && content.trim()) {
-          out.push({ role, text: content });
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            message: "__CHAT_HISTORY__",
+            session: {
+              gymName: "Front Range Climbing (Boulder)",
+              timezone: "America/Denver",
+              threadId: tid,
+              waiver: waiver
+                ? {
+                    id: waiver.id,
+                    accountAddress: waiver.accountAddress,
+                    participantName: waiver.participantName,
+                    participantEmail: waiver.participantEmail,
+                    isMinor: waiver.isMinor,
+                  }
+                : undefined,
+            },
+          }),
+        });
+        const json = (await res.json().catch(() => ({}))) as any;
+        const data = json?.data;
+        const msgs = data?.messages;
+        if (Array.isArray(msgs)) {
+          const out: ChatMessage[] = [];
+          for (const m of msgs) {
+            if (!m || typeof m !== "object") continue;
+            const role = (m as any).role;
+            const content = (m as any).content;
+            if ((role === "user" || role === "assistant") && typeof content === "string" && content.trim()) {
+              out.push({ role, text: content });
+            }
+          }
+          if (!cancelled && out.length) {
+            setMessages(out);
+            loadedAny = true;
+          }
         }
+      } catch {
+        // ignore
       }
-      if (!cancelled && out.length) setMessages(out);
+
+      if (!cancelled && !loadedAny) {
+        setMessages([
+          {
+            role: "assistant",
+            text: "Hi — ask about classes, policies, rentals, or check availability.",
+          },
+        ]);
+      }
+      if (!cancelled) setHydrated(true);
     }
     void loadHistory();
     return () => {
       cancelled = true;
     };
   }, [threadId, waiver]);
+
+  useEffect(() => {
+    const tid = threadId || "thr_demo";
+    try {
+      if (!hydrated) return;
+      const raw = window.localStorage.getItem("climb_gym_chat_threads_v1");
+      const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+      const map: Record<string, unknown> = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+      map[tid] = messages;
+      window.localStorage.setItem("climb_gym_chat_threads_v1", JSON.stringify(map));
+    } catch {
+      // ignore
+    }
+  }, [messages, threadId, hydrated]);
 
   const canSend = useMemo(() => input.trim().length > 0 && !busy, [input, busy]);
 
@@ -95,7 +164,7 @@ export default function ChatPage() {
           gymName: "Front Range Climbing (Boulder)",
           timezone: "America/Denver",
           cartLines: lines,
-          threadId: waiver?.accountAddress ? `thr_${waiver.accountAddress}` : undefined,
+          threadId: threadId || "thr_demo",
           waiver: waiver
             ? {
                 id: waiver.id,
