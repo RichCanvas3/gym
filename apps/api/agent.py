@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
@@ -214,6 +214,14 @@ async def _core_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[di
         return None
 
 
+async def _memory_append(thread_id: str, role: str, content: str) -> None:
+    thread_id = (thread_id or "").strip()
+    content = (content or "").strip()
+    if not thread_id or not content:
+        return
+    await _core_call_json("core_memory_append_message", {"threadId": thread_id, "role": role, "content": content})
+
+
 def _pick_hour(hourly: list[dict[str, Any]], target_unix: int) -> Optional[dict[str, Any]]:
     best = None
     best_delta = None
@@ -407,7 +415,7 @@ async def _handle_reserve_class(session: Optional["Session"], class_id: str) -> 
     return Output(
         answer=answer,
         citations=[],
-        uiActions=[{"type": "navigate", "to": "/calendar", "reason": "reservation complete"}],
+              uiActions=[],
         reservation={
             "reservationId": reservation_id,
             "classId": class_id,
@@ -426,6 +434,7 @@ class Session(BaseModel):
     userGoals: Optional[str] = None
     cartLines: Optional[list[dict[str, Any]]] = None
     waiver: Optional[dict[str, Any]] = None
+    threadId: Optional[str] = None
 
 
 class Input(BaseModel):
@@ -484,13 +493,13 @@ def build_system_prompt() -> str:
             "- If you use weather, mention the as-of timestamp and location used by the tool output.",
             "- If the user intent is to buy/book something, include a machine-readable cart suggestion at the end:",
             "  - Put `CartItemsJSON:` on its own line, followed by a JSON array of `{ sku, quantity, note? }`.",
-            "  - Use real SKUs (use ops catalog tools if needed).",
+            "  - Use real SKUs (use gym-core products when possible).",
             "- For web UI automation, you MAY also include these machine-readable directives at the very end (each on its own line):",
             "  - `CartActionsJSON:` followed by a JSON array of `{ op: \"add\"|\"remove\"|\"clear\", sku?, quantity?, note? }`.",
             "  - `UIActionsJSON:` followed by a JSON array of `{ type: \"navigate\", to: \"/waiver\"|\"/cart\"|\"/shop\"|\"/chat\"|\"/calendar\", reason? }`.",
             "- If a waiver must be signed before proceeding, include a UI action to navigate to `/waiver`.",
             "- If you add/remove items via CartActionsJSON, include a UI action to navigate to `/cart`.",
-            "- If the user asks to view the class schedule or calendar, include a UI action to navigate to `/calendar`.",
+            "- Only navigate to `/calendar` if the user explicitly asks for a calendar/week view.",
             "",
             "Keep responses concise and actionable.",
         ]
@@ -822,6 +831,16 @@ async def run(input: Input) -> Output:
     msg = input.message.strip()
     mlow = msg.lower()
 
+    acct = _waiver_account_address(input.session)
+    thread_id = ""
+    if input.session and isinstance(input.session.threadId, str) and input.session.threadId.strip():
+        thread_id = input.session.threadId.strip()
+    elif acct:
+        thread_id = f"thr_{acct}"
+
+    if acct and thread_id:
+        await _core_call_json("core_memory_ensure_thread", {"canonicalAddress": acct, "threadId": thread_id, "title": "Gym chat"})
+
     # Deterministic helper: avoid "query=tomorrow" text searches returning empty.
     if (
         not msg.startswith("__")
@@ -834,20 +853,28 @@ async def run(input: Input) -> Output:
         sched = await _scheduling_call_json("schedule_list_classes", {"fromISO": from_iso, "toISO": to_iso})
         classes = sched.get("classes") if isinstance(sched, dict) else []
         items = [c for c in classes if isinstance(c, dict)] if isinstance(classes, list) else []
+        wants_calendar = "calendar" in mlow or "week view" in mlow or "week" in mlow
         if not items:
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", f"No classes found for {date_iso}.")
             return Output(
                 answer=f"No classes found for {date_iso}.",
                 citations=[],
-                uiActions=[{"type": "navigate", "to": "/calendar", "reason": "view schedule"}],
+                uiActions=[{"type": "navigate", "to": "/calendar", "reason": "view schedule"}] if wants_calendar else [],
                 data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "classes": []},
             )
         lines = []
         for c in items[:10]:
             lines.append(f"- {c.get('startTimeISO')} • {c.get('title')} ({c.get('classId')})")
+        answer = "Tomorrow's classes:\n" + "\n".join(lines)
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
         return Output(
-            answer="Tomorrow's classes:\n" + "\n".join(lines),
+            answer=answer,
             citations=[],
-            uiActions=[{"type": "navigate", "to": "/calendar", "reason": "view schedule"}],
+            uiActions=[{"type": "navigate", "to": "/calendar", "reason": "view schedule"}] if wants_calendar else [],
             data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "classes": items},
         )
 
@@ -1023,10 +1050,18 @@ async def run(input: Input) -> Output:
         return Output(answer="", citations=[], schedule=schedule)
 
     if msg == "__CHECKOUT__":
-        return await _handle_checkout(input.session)
+        out = await _handle_checkout(input.session)
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", out.answer)
+        return out
     if msg.startswith("__RESERVE_CLASS__:"):
         class_id = msg.split(":", 1)[1].strip()
-        return await _handle_reserve_class(input.session, class_id)
+        out = await _handle_reserve_class(input.session, class_id)
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", out.answer)
+        return out
 
     tools, trace = make_tools()
     mcp_tools = await load_mcp_tools_from_env()
@@ -1041,9 +1076,30 @@ async def run(input: Input) -> Output:
     model = llm.bind_tools(all_tools)
     tool_map = {t.name: t for t in all_tools}
 
+    history: list[Any] = []
+    if thread_id:
+        mem = await _core_call_json("core_memory_list_messages", {"threadId": thread_id, "limit": 12}) or {}
+        msgs = mem.get("messages") if isinstance(mem, dict) else None
+        if isinstance(msgs, list):
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role") or "")
+                content = str(m.get("content") or "")
+                if not content.strip():
+                    continue
+                # Avoid echoing deterministic control messages into context.
+                if content.strip().startswith("__"):
+                    continue
+                if role == "user":
+                    history.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    history.append(AIMessage(content=content))
+
     messages: list[Any] = [
         SystemMessage(content=build_system_prompt()),
         SystemMessage(content=build_session_prompt(input.session)),
+        *history,
         HumanMessage(content=input.message),
     ]
 
@@ -1093,6 +1149,10 @@ async def run(input: Input) -> Output:
         ops_freshness = {"asOfISO": trace.ops_as_of, "endpoints": sorted(list(trace.ops_endpoints))}
 
     weather_freshness = None
+
+    if thread_id:
+        await _memory_append(thread_id, "user", msg)
+        await _memory_append(thread_id, "assistant", answer)
 
     return Output(
         answer=answer,

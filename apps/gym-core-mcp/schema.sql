@@ -113,3 +113,38 @@ CREATE TABLE IF NOT EXISTS reservation_records (
 CREATE INDEX IF NOT EXISTS idx_reservation_records_account ON reservation_records(account_id, created_at_iso);
 CREATE INDEX IF NOT EXISTS idx_reservation_records_scheduler ON reservation_records(scheduler_reservation_id);
 
+-- Persistent user memory (chat threads + messages)
+CREATE TABLE IF NOT EXISTS chat_threads (
+  thread_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  title TEXT,
+  created_at_iso TEXT NOT NULL,
+  updated_at_iso TEXT NOT NULL,
+  FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_threads_account ON chat_threads(account_id, updated_at_iso);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  message_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  role TEXT NOT NULL, -- 'user' | 'assistant' | 'system'
+  content TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL,
+  FOREIGN KEY (thread_id) REFERENCES chat_threads(thread_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at_iso);
+
+-- Persistent KB index (embeddings + text)
+CREATE TABLE IF NOT EXISTS kb_chunks (
+  chunk_id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  embedding_json TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL,
+  updated_at_iso TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_source ON kb_chunks(source_id);
+

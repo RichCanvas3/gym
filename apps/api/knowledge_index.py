@@ -139,6 +139,30 @@ async def ensure_index_with_mcp(ttl_seconds: int = 300) -> list[IndexedChunk]:
 
     docs = _read_markdown_docs()
 
+    # If a persisted KB exists in gym-core, prefer it (fast, survives restarts).
+    persist_enabled = os.environ.get("KB_PERSIST_TO_CORE", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if persist_enabled:
+        persisted = await _mcp_call_json("core_kb_list_chunks", {"limit": 2000, "offset": 0})
+        if isinstance(persisted, dict) and isinstance(persisted.get("chunks"), list) and (persisted.get("chunks") or []):
+            out: list[IndexedChunk] = []
+            for c in persisted.get("chunks") or []:
+                if not isinstance(c, dict):
+                    continue
+                sid = c.get("sourceId")
+                txt = c.get("text")
+                emb = c.get("embedding")
+                if not isinstance(sid, str) or not isinstance(txt, str) or not isinstance(emb, list):
+                    continue
+                try:
+                    embedding = [float(x) for x in emb]
+                except Exception:
+                    continue
+                out.append(IndexedChunk(sourceId=sid, text=txt, embedding=embedding))
+            if out:
+                _CACHED_INDEX_MCP = out
+                _CACHED_INDEX_MCP_BUILT_AT = now
+                return out
+
     content = await _mcp_call_json("content_list_docs", {"limit": 500})
     if isinstance(content, dict) and isinstance(content.get("docs"), list):
         for d in content.get("docs") or []:
@@ -179,6 +203,24 @@ async def ensure_index_with_mcp(ttl_seconds: int = 300) -> list[IndexedChunk]:
     out: list[IndexedChunk] = []
     for i, (sid, text) in enumerate(chunks):
         out.append(IndexedChunk(sourceId=sid, text=text, embedding=list(vectors[i] or [])))
+
+    # Persist index to gym-core (best effort) so hosted runs can reuse it.
+    if persist_enabled and out:
+        batch: list[dict[str, Any]] = []
+        for idx, c in enumerate(out):
+            batch.append(
+                {
+                    "chunkId": f"{c.sourceId}#{idx}",
+                    "sourceId": c.sourceId,
+                    "text": c.text,
+                    "embedding": c.embedding,
+                }
+            )
+            if len(batch) >= 200:
+                await _mcp_call_json("core_kb_upsert_chunks", {"chunks": batch})
+                batch = []
+        if batch:
+            await _mcp_call_json("core_kb_upsert_chunks", {"chunks": batch})
 
     _CACHED_INDEX_MCP = out
     _CACHED_INDEX_MCP_BUILT_AT = now

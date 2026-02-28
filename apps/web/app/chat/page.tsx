@@ -57,6 +57,7 @@ export default function ChatPage() {
           gymName: "Front Range Climbing (Boulder)",
           timezone: "America/Denver",
           cartLines: lines,
+          threadId: waiver?.accountAddress ? `thr_${waiver.accountAddress}` : undefined,
           waiver: waiver
             ? {
                 id: waiver.id,

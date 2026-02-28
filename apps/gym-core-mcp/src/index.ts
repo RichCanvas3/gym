@@ -394,6 +394,155 @@ function createServer(env: Env) {
     },
   );
 
+  // Persistent memory (chat threads/messages)
+  server.tool(
+    "core_memory_ensure_thread",
+    "Ensure a chat thread exists for a canonicalAddress (persistent memory).",
+    { canonicalAddress: AccountAddress, threadId: z.string().min(3).optional(), title: z.string().min(1).optional() },
+    async (args) => {
+      const parsed = z
+        .object({ canonicalAddress: AccountAddress, threadId: z.string().min(3).optional(), title: z.string().min(1).optional() })
+        .parse(args);
+      const acc = await ensureAccount(env.DB, { canonicalAddress: parsed.canonicalAddress });
+      const threadId = (parsed.threadId ?? `thr_${acc.canonicalAddress}`).trim();
+      const ts = nowISO();
+      await env.DB.prepare(
+        `INSERT INTO chat_threads (thread_id, account_id, title, created_at_iso, updated_at_iso)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET updated_at_iso=excluded.updated_at_iso, title=COALESCE(excluded.title, chat_threads.title)`,
+      )
+        .bind(threadId, acc.accountId, parsed.title ?? null, ts, ts)
+        .run();
+      return { content: [{ type: "text", text: jsonText({ threadId }) }] };
+    },
+  );
+
+  server.tool(
+    "core_memory_append_message",
+    "Append a message to a chat thread.",
+    { threadId: z.string().min(3), role: z.enum(["user", "assistant", "system"]), content: z.string().min(1) },
+    async (args) => {
+      const parsed = z
+        .object({ threadId: z.string().min(3), role: z.enum(["user", "assistant", "system"]), content: z.string().min(1) })
+        .parse(args);
+      const messageId = `msg_${crypto.randomUUID()}`;
+      const ts = nowISO();
+      await env.DB.prepare(
+        `INSERT INTO chat_messages (message_id, thread_id, role, content, created_at_iso) VALUES (?, ?, ?, ?, ?)`,
+      )
+        .bind(messageId, parsed.threadId, parsed.role, parsed.content, ts)
+        .run();
+      await env.DB.prepare(`UPDATE chat_threads SET updated_at_iso = ? WHERE thread_id = ?`).bind(ts, parsed.threadId).run();
+      return { content: [{ type: "text", text: jsonText({ messageId }) }] };
+    },
+  );
+
+  server.tool(
+    "core_memory_list_messages",
+    "List recent messages for a chat thread (chronological).",
+    { threadId: z.string().min(3), limit: z.number().int().positive().max(100).optional() },
+    async (args) => {
+      const parsed = z.object({ threadId: z.string().min(3), limit: z.number().int().positive().max(100).optional() }).parse(args);
+      const limit = parsed.limit ?? 24;
+      const res = await env.DB.prepare(
+        `SELECT role, content, created_at_iso FROM chat_messages WHERE thread_id = ? ORDER BY created_at_iso DESC LIMIT ?`,
+      )
+        .bind(parsed.threadId, limit)
+        .all();
+      const rows = (res.results ?? []).map((r: any) => ({
+        role: String(r.role ?? ""),
+        content: String(r.content ?? ""),
+        createdAtISO: String(r.created_at_iso ?? ""),
+      }));
+      const messages = rows.reverse();
+      return { content: [{ type: "text", text: jsonText({ messages }) }] };
+    },
+  );
+
+  // Persistent KB chunks (embeddings index)
+  server.tool(
+    "core_kb_upsert_chunks",
+    "Upsert KB chunks (text + embedding) for persistent retrieval.",
+    {
+      chunks: z
+        .array(
+          z.object({
+            chunkId: z.string().min(1),
+            sourceId: z.string().min(1),
+            text: z.string().min(1),
+            embedding: z.array(z.number()),
+          }),
+        )
+        .min(1)
+        .max(500),
+    },
+    async (args) => {
+      const parsed = z
+        .object({
+          chunks: z
+            .array(
+              z.object({
+                chunkId: z.string().min(1),
+                sourceId: z.string().min(1),
+                text: z.string().min(1),
+                embedding: z.array(z.number()),
+              }),
+            )
+            .min(1)
+            .max(500),
+        })
+        .parse(args);
+      const ts = nowISO();
+      for (const c of parsed.chunks) {
+        await env.DB.prepare(
+          `INSERT INTO kb_chunks (chunk_id, source_id, text, embedding_json, created_at_iso, updated_at_iso)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(chunk_id) DO UPDATE SET
+             source_id=excluded.source_id,
+             text=excluded.text,
+             embedding_json=excluded.embedding_json,
+             updated_at_iso=excluded.updated_at_iso`,
+        )
+          .bind(c.chunkId, c.sourceId, c.text, JSON.stringify(c.embedding), ts, ts)
+          .run();
+      }
+      return { content: [{ type: "text", text: jsonText({ upserted: parsed.chunks.length }) }] };
+    },
+  );
+
+  server.tool(
+    "core_kb_list_chunks",
+    "List KB chunks (text + embedding) for retrieval.",
+    { limit: z.number().int().positive().max(2000).optional(), offset: z.number().int().nonnegative().optional() },
+    async (args) => {
+      const parsed = z
+        .object({ limit: z.number().int().positive().max(2000).optional(), offset: z.number().int().nonnegative().optional() })
+        .parse(args);
+      const limit = parsed.limit ?? 2000;
+      const offset = parsed.offset ?? 0;
+      const res = await env.DB.prepare(
+        `SELECT chunk_id, source_id, text, embedding_json, updated_at_iso FROM kb_chunks ORDER BY source_id ASC LIMIT ? OFFSET ?`,
+      )
+        .bind(limit, offset)
+        .all();
+      const chunks = (res.results ?? []).map((r: any) => ({
+        chunkId: String(r.chunk_id ?? ""),
+        sourceId: String(r.source_id ?? ""),
+        text: String(r.text ?? ""),
+        embedding: (() => {
+          try {
+            const v = JSON.parse(String(r.embedding_json ?? "[]"));
+            return Array.isArray(v) ? v : [];
+          } catch {
+            return [];
+          }
+        })(),
+        updatedAtISO: String(r.updated_at_iso ?? ""),
+      }));
+      return { content: [{ type: "text", text: jsonText({ chunks }) }] };
+    },
+  );
+
   server.tool(
     "core_create_order",
     "Create an order for an account (stores JSON items).",

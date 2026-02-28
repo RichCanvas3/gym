@@ -480,6 +480,7 @@ function CalendarInner() {
                                             session: {
                                               gymName: "Front Range Climbing (Boulder)",
                                               timezone: "America/Denver",
+                                              threadId: waiver?.accountAddress ? `thr_${waiver.accountAddress}` : undefined,
                                               waiver: {
                                                 id: waiver.id,
                                                 accountAddress: waiver.accountAddress,
