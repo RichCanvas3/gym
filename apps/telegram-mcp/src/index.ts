@@ -64,15 +64,24 @@ async function upsertChat(env: Env, chat: any) {
     .run();
 }
 
+function numOrNull(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = parseInt(v, 10);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 async function insertMessage(env: Env, msg: any) {
   const chatId = msg?.chat?.id;
-  const messageId = msg?.message_id;
-  if ((typeof chatId !== "number" && typeof chatId !== "string") || typeof messageId !== "number") return;
+  const messageId = numOrNull(msg?.message_id);
+  if ((typeof chatId !== "number" && typeof chatId !== "string") || messageId == null) return;
   const chat_id = String(chatId);
-  const message_thread_id = typeof msg?.message_thread_id === "number" ? msg.message_thread_id : null;
-  const id = `${chat_id}:${messageId}${message_thread_id ? `:${message_thread_id}` : ""}`;
-  const from_user_id = typeof msg?.from?.id === "number" ? msg.from.id : null;
-  const date_unix = typeof msg?.date === "number" ? msg.date : null;
+  const message_thread_id = numOrNull(msg?.message_thread_id);
+  const id = `${chat_id}:${messageId}${message_thread_id != null ? `:${message_thread_id}` : ""}`;
+  const from_user_id = numOrNull(msg?.from?.id);
+  const date_unix = numOrNull(msg?.date);
   const text = typeof msg?.text === "string" ? msg.text : null;
   const ts = nowISO();
   await env.DB.prepare(
@@ -80,7 +89,7 @@ async function insertMessage(env: Env, msg: any) {
       id, chat_id, message_id, message_thread_id, from_user_id, date_unix, text, raw_json, created_at_iso
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, chat_id, messageId, message_thread_id, from_user_id, date_unix, text, JSON.stringify(msg), ts)
+    .bind(id, chat_id, messageId, message_thread_id ?? null, from_user_id ?? null, date_unix ?? null, text, JSON.stringify(msg), ts)
     .run();
 }
 
@@ -98,9 +107,12 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
     .run();
 
   const msg = update?.message ?? update?.edited_message ?? update?.channel_post ?? update?.edited_channel_post;
-  if (msg) {
+  const chatFromMember = update?.my_chat_member?.chat ?? update?.chat_member?.chat;
+  if (msg?.chat) {
     await upsertChat(env, msg.chat);
     await insertMessage(env, msg);
+  } else if (chatFromMember) {
+    await upsertChat(env, chatFromMember);
   }
 
   return new Response("ok", { status: 200 });
