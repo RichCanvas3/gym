@@ -75,6 +75,7 @@ Recommended MCP tool categories for a climbing gym:
 - **Messaging**: SMS/email confirmations + reminders.
 - **Forecast weather**: hourly/daily forecast for outdoor wall operations.
 - **Personal calendar**: connect a user's Google Calendar for conflict checks + creating events.
+- **Telegram**: bot-based chat + webhook ingestion + searchable message store (OpenClaw-style).
 
 ### SendGrid MCP server (Cloudflare Workers)
 

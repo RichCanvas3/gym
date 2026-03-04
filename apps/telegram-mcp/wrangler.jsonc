@@ -1,0 +1,28 @@
+/**
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gym-telegram-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "gym-telegram",
+			"database_id": "d9d24798-cbe3-466c-8cd2-0bcd7eea4f99"
+		},
+		{
+			"binding": "gym_telegram",
+			"database_name": "gym-telegram",
+			"database_id": "d9d24798-cbe3-466c-8cd2-0bcd7eea4f99",
+			"remote": true
+		}
+	]
+}

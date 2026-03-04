@@ -118,6 +118,28 @@ importers:
         specifier: ^4.69.0
         version: 4.69.0(@cloudflare/workers-types@4.20260305.0)
 
+  apps/telegram-mcp:
+    dependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: 1.26.0
+        version: 1.26.0(@cfworker/json-schema@4.1.1)(zod@4.3.6)
+      agents:
+        specifier: ^0.6.0
+        version: 0.6.0(@cloudflare/workers-types@4.20260305.0)(ai@6.0.103(zod@4.3.6))(react@19.2.3)(zod@4.3.6)
+      zod:
+        specifier: ^4.3.6
+        version: 4.3.6
+    devDependencies:
+      '@cloudflare/workers-types':
+        specifier: ^4.20260305.0
+        version: 4.20260305.0
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      wrangler:
+        specifier: ^4.69.0
+        version: 4.69.0(@cloudflare/workers-types@4.20260305.0)
+
   apps/weather-mcp:
     dependencies:
       '@modelcontextprotocol/sdk':
