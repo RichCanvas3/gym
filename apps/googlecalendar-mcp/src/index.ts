@@ -398,11 +398,27 @@ async function handleOAuthCallback(request: Request, env: Env): Promise<Response
   return new Response("Google Calendar connected. You can close this tab.", { status: 200 });
 }
 
+function chatSuccessHtml(connected: boolean) {
+  const title = connected ? "Google Calendar connected" : "Google Calendar";
+  const body = connected
+    ? "<p>Google Calendar is connected for this gym account. You can close this tab and return to the app.</p>"
+    : "<p>Use the link from your app to connect Google Calendar.</p>";
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${title}</title><style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:2rem auto;padding:0 1rem;line-height:1.5}</style></head><body><h1>${title}</h1>${body}</body></html>`;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
     if (url.pathname === "/oauth/start") return handleOAuthStart(request, env);
     if (url.pathname === "/oauth/callback") return handleOAuthCallback(request, env);
+    // Browser success page after OAuth — no API key (unlike /mcp)
+    if (url.pathname === "/chat") {
+      const connected = url.searchParams.get("googleCalendar") === "connected";
+      return new Response(chatSuccessHtml(connected), {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
 
     try {
       await requireApiKey(request, env);

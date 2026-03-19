@@ -1,12 +1,17 @@
 import { createMcpHandler } from "agents/mcp";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+
+const TELEGRAM_URI_PREFIX = "telegram://chat/";
+const TELEGRAM_URI_SUFFIX = "/messages";
 
 export type Env = {
   MCP_API_KEY?: string;
   DB: D1Database;
   TELEGRAM_BOT_TOKEN?: string;
-  TELEGRAM_WEBHOOK_SECRET?: string; // optional; compare with header x-telegram-bot-api-secret-token
+  TELEGRAM_WEBHOOK_SECRET?: string;
+  MCP_SESSION_ID?: string; // set from mcp-session-id header for subscribe + pending flush
 };
 
 function nowISO() {
@@ -93,11 +98,58 @@ async function insertMessage(env: Env, msg: any) {
     .run();
 }
 
+/** Resolve resource URI to chatId. By-id: telegram://chat/{chatId}/messages. By-title: telegram://chat/by-title/{title}/messages */
+async function uriToChatId(uri: string, env: Env): Promise<string | null> {
+  if (!uri.startsWith(TELEGRAM_URI_PREFIX) || !uri.endsWith(TELEGRAM_URI_SUFFIX)) return null;
+  const middle = uri.slice(TELEGRAM_URI_PREFIX.length, -TELEGRAM_URI_SUFFIX.length);
+  if (middle.startsWith("by-title/")) {
+    const title = decodeURIComponent(middle.slice("by-title/".length));
+    const row = await env.DB.prepare(`SELECT chat_id FROM telegram_chats WHERE title = ? LIMIT 1`)
+      .bind(title)
+      .first<{ chat_id: string }>();
+    return row?.chat_id ?? null;
+  }
+  return middle ? middle : null;
+}
+
+/** Return both possible resource URIs for a chat (by id and by title) for matching subscriptions */
+function chatToResourceUris(chatId: string, title: string | null): string[] {
+  const byId = `${TELEGRAM_URI_PREFIX}${chatId}${TELEGRAM_URI_SUFFIX}`;
+  const uris = [byId];
+  if (title && title.trim()) {
+    uris.push(`${TELEGRAM_URI_PREFIX}by-title/${encodeURIComponent(title.trim())}${TELEGRAM_URI_SUFFIX}`);
+  }
+  return uris;
+}
+
+/** Get and clear pending notifications for a session. Returns list of resource_uri. */
+async function getAndClearPendingNotifications(env: Env, sessionId: string): Promise<{ resource_uri: string }[]> {
+  if (!sessionId.trim()) return [];
+  const res = await env.DB.prepare(
+    `SELECT resource_uri FROM telegram_pending_notifications WHERE session_id = ?`,
+  )
+    .bind(sessionId)
+    .all();
+  const rows = (res.results ?? []) as { resource_uri: string }[];
+  await env.DB.prepare(`DELETE FROM telegram_pending_notifications WHERE session_id = ?`)
+    .bind(sessionId)
+    .run();
+  return rows;
+}
+
 async function handleWebhook(request: Request, env: Env): Promise<Response> {
   const want = (env.TELEGRAM_WEBHOOK_SECRET ?? "").trim();
   if (want) {
     const got = (request.headers.get("x-telegram-bot-api-secret-token") ?? "").trim();
-    if (got !== want) return new Response("Unauthorized", { status: 401 });
+    if (got !== want) {
+      return new Response(
+        jsonText({
+          error: "Webhook secret mismatch",
+          hint: "Either set Telegram webhook with secret_token matching TELEGRAM_WEBHOOK_SECRET, or remove TELEGRAM_WEBHOOK_SECRET (wrangler secret delete TELEGRAM_WEBHOOK_SECRET) to accept without a secret.",
+        }),
+        { status: 401, headers: { "content-type": "application/json" } },
+      );
+    }
   }
   const update = (await request.json().catch(() => null)) as any;
   const updateId = update?.update_id;
@@ -108,18 +160,124 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
 
   const msg = update?.message ?? update?.edited_message ?? update?.channel_post ?? update?.edited_channel_post;
   const chatFromMember = update?.my_chat_member?.chat ?? update?.chat_member?.chat;
+  let chatId: string | null = null;
+  let title: string | null = null;
   if (msg?.chat) {
     await upsertChat(env, msg.chat);
     await insertMessage(env, msg);
+    chatId = String(msg.chat?.id ?? "");
+    title = msg.chat?.title ? String(msg.chat.title) : null;
   } else if (chatFromMember) {
     await upsertChat(env, chatFromMember);
+    chatId = String(chatFromMember?.id ?? "");
+    title = chatFromMember?.title ? String(chatFromMember.title) : null;
+  }
+
+  if (chatId) {
+    const uris = chatToResourceUris(chatId, title);
+    const subs = await env.DB.prepare(
+      `SELECT DISTINCT session_id, resource_uri FROM telegram_resource_subscriptions WHERE resource_uri IN (${uris.map(() => "?").join(",")})`,
+    )
+      .bind(...uris)
+      .all();
+    const ts = nowISO();
+    for (const row of (subs.results ?? []) as { session_id: string; resource_uri: string }[]) {
+      await env.DB.prepare(
+        `INSERT INTO telegram_pending_notifications (session_id, resource_uri, created_at_iso) VALUES (?, ?, ?)`,
+      )
+        .bind(row.session_id, row.resource_uri, ts)
+        .run();
+    }
   }
 
   return new Response("ok", { status: 200 });
 }
 
 function createServer(env: Env) {
-  const server = new McpServer({ name: "Telegram MCP (Bot API + D1)", version: "0.1.0" });
+  const server = new McpServer(
+    { name: "Telegram MCP (Bot API + D1)", version: "0.1.0" },
+    { capabilities: { resources: { listChanged: true, subscribe: true } } },
+  );
+
+  const listChats = async () => {
+    const res = await env.DB.prepare(
+      `SELECT chat_id, type, title FROM telegram_chats ORDER BY updated_at_iso DESC LIMIT 100`,
+    )
+      .all();
+    const resources: { uri: string; name: string; title: string; mimeType: string }[] = [];
+    for (const r of (res.results ?? []) as { chat_id: string; type: string | null; title: string | null }[]) {
+      resources.push({
+        uri: `${TELEGRAM_URI_PREFIX}${r.chat_id}${TELEGRAM_URI_SUFFIX}`,
+        name: r.title ?? `Chat ${r.chat_id}`,
+        title: r.title ?? `Chat ${r.chat_id}`,
+        mimeType: "application/json",
+      });
+      if (r.title?.trim()) {
+        resources.push({
+          uri: `${TELEGRAM_URI_PREFIX}by-title/${encodeURIComponent(r.title.trim())}${TELEGRAM_URI_SUFFIX}`,
+          name: r.title,
+          title: r.title,
+          mimeType: "application/json",
+        });
+      }
+    }
+    return { resources };
+  };
+
+  const readChatMessages = async (uri: URL) => {
+    const chatId = await uriToChatId(uri.toString(), env);
+    if (!chatId) return { contents: [{ uri: uri.toString(), mimeType: "text/plain", text: "Chat not found" }] };
+    const res = await env.DB.prepare(
+      `SELECT message_id, from_user_id, date_unix, text FROM telegram_messages WHERE chat_id = ? ORDER BY date_unix DESC LIMIT 50`,
+    )
+      .bind(chatId)
+      .all();
+    const messages = (res.results ?? []).map((r: any) => ({
+      messageId: r.message_id,
+      fromUserId: r.from_user_id,
+      dateUnix: r.date_unix,
+      text: r.text,
+    }));
+    return {
+      contents: [{ uri: uri.toString(), mimeType: "application/json", text: jsonText({ chatId, messages }) }],
+    };
+  };
+
+  server.resource(
+    "telegram_chat_messages",
+    new ResourceTemplate(`${TELEGRAM_URI_PREFIX}{chatId}${TELEGRAM_URI_SUFFIX}`, { list: listChats }),
+    { title: "Telegram chat messages (by id)", description: "Recent messages for a chat by chatId", mimeType: "application/json" },
+    async (uri, _variables, _extra) => readChatMessages(uri),
+  );
+  server.resource(
+    "telegram_chat_messages_by_title",
+    new ResourceTemplate(`${TELEGRAM_URI_PREFIX}by-title/{title}${TELEGRAM_URI_SUFFIX}`, { list: listChats }),
+    { title: "Telegram chat messages (by title)", description: "Recent messages for a chat by title", mimeType: "application/json" },
+    async (uri, _variables, _extra) => readChatMessages(uri),
+  );
+
+  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    const sessionId = (env.MCP_SESSION_ID ?? "").trim();
+    if (!sessionId) return {};
+    const uri = (request.params?.uri ?? "").trim();
+    if (!uri.startsWith(TELEGRAM_URI_PREFIX) || !uri.endsWith(TELEGRAM_URI_SUFFIX)) return {};
+    const ts = nowISO();
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO telegram_resource_subscriptions (session_id, resource_uri, created_at_iso) VALUES (?, ?, ?)`,
+    )
+      .bind(sessionId, uri, ts)
+      .run();
+    return {};
+  });
+  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+    const sessionId = (env.MCP_SESSION_ID ?? "").trim();
+    if (!sessionId) return {};
+    const uri = (request.params?.uri ?? "").trim();
+    await env.DB.prepare(`DELETE FROM telegram_resource_subscriptions WHERE session_id = ? AND resource_uri = ?`)
+      .bind(sessionId, uri)
+      .run();
+    return {};
+  });
 
   server.tool("telegram_ping", "Health check", {}, async () => {
     return { content: [{ type: "text", text: jsonText({ ok: true, asOfISO: nowISO() }) }] };
@@ -352,7 +510,55 @@ function createServer(env: Env) {
     },
   );
 
+  server.tool(
+    "telegram_poll_notifications",
+    "Return and clear pending resource-updated notifications for this session. Call after subscribing to chat resources to get URIs that had new messages.",
+    {},
+    async () => {
+      const sessionId = (env.MCP_SESSION_ID ?? "").trim();
+      const pending = await getAndClearPendingNotifications(env, sessionId);
+      return {
+        content: [{ type: "text", text: jsonText({ sessionId: sessionId || null, updatedUris: pending.map((p) => p.resource_uri) }) }],
+      };
+    },
+  );
+
   return server;
+}
+
+/** Prepend SSE events for notifications/resources/updated to the response stream */
+async function prependNotificationEvents(
+  body: ReadableStream<Uint8Array>,
+  pending: { resource_uri: string }[],
+): Promise<ReadableStream<Uint8Array>> {
+  const encoder = new TextEncoder();
+  const prefix = pending
+    .map(
+      (p) =>
+        `event: message\ndata: ${JSON.stringify({
+          jsonrpc: "2.0",
+          method: "notifications/resources/updated",
+          params: { uri: p.resource_uri },
+        })}\n\n`,
+    )
+    .join("");
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(prefix));
+      const reader = body.getReader();
+      function pump() {
+        reader.read().then(({ done, value }) => {
+          if (done) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(value);
+          pump();
+        });
+      }
+      pump();
+    },
+  });
 }
 
 export default {
@@ -375,9 +581,36 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
+    let sessionId = request.headers.get("mcp-session-id")?.trim() || undefined;
+    if (!sessionId) sessionId = crypto.randomUUID();
+    (env as Env).MCP_SESSION_ID = sessionId;
+    const requestWithSession =
+      request.headers.get("mcp-session-id") !== null
+        ? request
+        : new Request(request, { headers: (() => { const h = new Headers(request.headers); h.set("mcp-session-id", sessionId!); return h; })() });
+    const pending = await getAndClearPendingNotifications(env, sessionId);
+
     try {
       const server = createServer(env);
-      return createMcpHandler(server, { route: "/mcp" })(request, env, ctx);
+      let response = await createMcpHandler(server, { route: "/mcp" })(requestWithSession, env, ctx);
+      if (
+        pending.length > 0 &&
+        response.ok &&
+        response.headers.get("content-type")?.includes("text/event-stream") &&
+        response.body
+      ) {
+        response = new Response(await prependNotificationEvents(response.body, pending), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      }
+      if (sessionId && !response.headers.has("mcp-session-id")) {
+        const headers = new Headers(response.headers);
+        headers.set("mcp-session-id", sessionId);
+        response = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+      }
+      return response;
     } catch (e) {
       return new Response(jsonText({ error: String((e as any)?.message ?? e ?? "internal error") }), {
         status: 500,

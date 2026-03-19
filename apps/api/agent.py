@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import uuid
@@ -432,6 +433,8 @@ class Session(BaseModel):
     timezone: Optional[str] = None
     userName: Optional[str] = None
     userGoals: Optional[str] = None
+    """User-defined outcomes + executable checklist; synced from the chat UI (GoalBundleJSON). Domain-agnostic."""
+    goalBundle: Optional[dict[str, Any]] = None
     cartLines: Optional[list[dict[str, Any]]] = None
     waiver: Optional[dict[str, Any]] = None
     threadId: Optional[str] = None
@@ -459,6 +462,7 @@ class Output(BaseModel):
     reservation: Optional[dict[str, Any]] = None
     data: Optional[dict[str, Any]] = None
     schedule: Optional[dict[str, Any]] = None
+    goalBundle: Optional[dict[str, Any]] = None
 
 
 class _Trace:
@@ -501,6 +505,18 @@ def build_system_prompt() -> str:
             "- If you add/remove items via CartActionsJSON, include a UI action to navigate to `/cart`.",
             "- Only navigate to `/calendar` if the user explicitly asks for a calendar/week view.",
             "",
+            "Goal / outcome execution (domain-agnostic—like a small app state machine):",
+            "- The user defines outcomes; you help operationalize them. Do not assume fitness, racing, or any single domain unless the user’s text implies it.",
+            "- Session may include UserGoals (free text) and GoalBundle (structured JSON). Treat GoalBundle as the persisted spec the UI and tools can act on.",
+            "- When you break work into milestones or a time-ordered checklist, end the reply with `GoalBundleJSON:` then compact JSON (merge with prior bundle when updating):",
+            '  {"version":1,"primaryGoal":{"text":"<main outcome>","targetDateISO":"YYYY-MM-DD|null"},"weeklyFocus":["<near-term priorities>"],"trainingPlan":[{"id":"stable-id","dayLabel":"<time bucket or phase>","activity":"<concrete action>","startTimeISO":null,"endTimeISO":null,"completed":false}],"suggestedNext":["<optional next automation hints>"}',
+            "- Field `trainingPlan` is a generic checklist of executable items (name is legacy); you may also use `actionPlan` with the same array shape—either is accepted.",
+            "- Use dayLabel/activity for whatever fits the domain (e.g. sprint name + task, week + deliverable, date + habit). Fill startTimeISO/endTimeISO when the user’s timezone and timing are known so calendar MCP can run.",
+            "- Slash commands: `/goal status` dumps the bundle; `/goal tick` completes the next incomplete checklist item; `/goal tick N` or `/goal tick <substring>` matches row or label. `/goal set …` → merge into primaryGoal / focus via GoalBundleJSON.",
+            "- Execution: when the user asks to put “this” or “the plan” on a calendar, use the checklist you or GoalBundle already defined—call Google Calendar MCP (e.g. googlecalendar_create_event) per item with waiver accountAddress; don’t demand unrelated generic “event details”.",
+            "- If Calendar MCP isn’t connected, explain and point to /oauth/start?accountAddress=<their address>.",
+            "- Other integrations (email, class booking, scheduling, gym catalog) are tools toward the user’s stated outcomes—pick what fits their ask, not a fixed playbook.",
+            "",
             "Keep responses concise and actionable.",
         ]
     )
@@ -516,6 +532,9 @@ def build_session_prompt(session: Optional[Session]) -> str:
         lines.append(f"UserName: {session.userName}")
     if session and session.userGoals:
         lines.append(f"UserGoals: {session.userGoals}")
+    gb = _session_goal_bundle(session)
+    if gb.get("primaryGoal") or gb.get("weeklyFocus") or gb.get("trainingPlan") or gb.get("suggestedNext"):
+        lines.append("GoalBundle (user outcomes + checklist; update via GoalBundleJSON when the plan changes):\n" + json.dumps(gb, indent=2)[:12000])
     if session and session.waiver and isinstance(session.waiver, dict) and session.waiver.get("id"):
         email = session.waiver.get("participantEmail")
         addr = session.waiver.get("accountAddress")
@@ -577,6 +596,130 @@ def _extract_json_line(text: str, marker: str) -> tuple[str, Any | None]:
         return clean, json.loads(json_part)
     except Exception:
         return clean, None
+
+
+def _default_goal_bundle() -> dict[str, Any]:
+    return {"version": 1, "primaryGoal": None, "weeklyFocus": [], "trainingPlan": [], "suggestedNext": []}
+
+
+def _session_goal_bundle(session: Optional[Session]) -> dict[str, Any]:
+    base = _default_goal_bundle()
+    raw = getattr(session, "goalBundle", None) if session else None
+    if not isinstance(raw, dict):
+        return base
+    if "primaryGoal" in raw:
+        base["primaryGoal"] = raw.get("primaryGoal")
+    if isinstance(raw.get("weeklyFocus"), list):
+        base["weeklyFocus"] = [str(x) for x in raw["weeklyFocus"] if x is not None][:20]
+    plan_src = raw.get("trainingPlan")
+    if not isinstance(plan_src, list) and isinstance(raw.get("actionPlan"), list):
+        plan_src = raw["actionPlan"]
+    if isinstance(plan_src, list):
+        plan: list[dict[str, Any]] = []
+        for it in plan_src[:31]:
+            if not isinstance(it, dict):
+                continue
+            plan.append(
+                {
+                    "id": str(it.get("id") or "").strip() or f"row-{len(plan)}",
+                    "dayLabel": str(it.get("dayLabel") or it.get("day") or "").strip(),
+                    "activity": str(it.get("activity") or "").strip(),
+                    "startTimeISO": it.get("startTimeISO") if isinstance(it.get("startTimeISO"), str) else None,
+                    "endTimeISO": it.get("endTimeISO") if isinstance(it.get("endTimeISO"), str) else None,
+                    "completed": bool(it.get("completed")) if "completed" in it else False,
+                }
+            )
+        base["trainingPlan"] = plan
+    if isinstance(raw.get("suggestedNext"), list):
+        base["suggestedNext"] = [str(x) for x in raw["suggestedNext"] if x is not None][:12]
+    return base
+
+
+def _format_goal_status(bundle: dict[str, Any]) -> str:
+    lines: list[str] = []
+    pg = bundle.get("primaryGoal")
+    if isinstance(pg, dict) and pg.get("text"):
+        lines.append(f"Primary goal: {pg.get('text')}")
+        if pg.get("targetDateISO"):
+            lines.append(f"Target date: {pg.get('targetDateISO')}")
+    wf = bundle.get("weeklyFocus")
+    if isinstance(wf, list) and wf:
+        lines.append("Near-term focus: " + "; ".join(str(x) for x in wf[:8]))
+    tp = bundle.get("trainingPlan")
+    if isinstance(tp, list) and tp:
+        lines.append("Checklist (use /goal tick or /goal tick N):")
+        for i, it in enumerate(tp, start=1):
+            if not isinstance(it, dict):
+                continue
+            mark = "✓" if it.get("completed") else "○"
+            dl = it.get("dayLabel") or "?"
+            act = it.get("activity") or ""
+            lines.append(f"  {i}. {mark} {dl}: {act}")
+    if not lines:
+        return "No structured goal data yet. Describe what you want to achieve, or say /goal set … in natural language."
+    return "\n".join(lines)
+
+
+async def _handle_goal_slash_commands(msg: str, session: Optional[Session], thread_id: str) -> Optional[Output]:
+    stripped = msg.strip()
+    if not stripped.lower().startswith("/goal "):
+        return None
+    rest = stripped[len("/goal ") :].strip()
+    sub = rest.lower()
+    bundle = copy.deepcopy(_session_goal_bundle(session))
+
+    if sub.startswith("tick"):
+        tick_arg = rest[4:].strip().lower()
+        plan = bundle.get("trainingPlan")
+        if not isinstance(plan, list) or not plan:
+            answer = "Nothing to tick yet—ask me to break your outcome into steps first so we can save a checklist to your goal bundle. Try /goal status."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], goalBundle=bundle)
+
+        idx_to_tick = -1
+        if tick_arg.isdigit():
+            n = int(tick_arg)
+            if 1 <= n <= len(plan):
+                idx_to_tick = n - 1
+        elif tick_arg:
+            for i, it in enumerate(plan):
+                if isinstance(it, dict):
+                    dl = str(it.get("dayLabel") or "").lower()
+                    act = str(it.get("activity") or "").lower()
+                    if tick_arg in dl or tick_arg in act:
+                        idx_to_tick = i
+                        break
+        else:
+            for i, it in enumerate(plan):
+                if isinstance(it, dict) and not it.get("completed"):
+                    idx_to_tick = i
+                    break
+            if idx_to_tick < 0:
+                idx_to_tick = len(plan) - 1
+
+        if idx_to_tick < 0 or idx_to_tick >= len(plan):
+            answer = "Couldn’t match that row. Use /goal status for numbers, then /goal tick 2 (for row 2)."
+        else:
+            row = plan[idx_to_tick]
+            if isinstance(row, dict):
+                row["completed"] = True
+            item = plan[idx_to_tick] if isinstance(plan[idx_to_tick], dict) else {}
+            answer = f"Marked complete: **{item.get('dayLabel', '')}** — {item.get('activity', '')}"
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], goalBundle=bundle)
+
+    if sub == "status" or sub.startswith("status "):
+        answer = _format_goal_status(bundle)
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], goalBundle=bundle)
+
+    return None
 
 
 def make_tools() -> tuple[list[StructuredTool], Any]:
@@ -857,6 +1000,10 @@ async def run(input: Input) -> Output:
                 if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
                     safe.append({"role": role, "content": content})
         return Output(answer="", citations=[], data={"messages": safe})
+
+    goal_cmd = await _handle_goal_slash_commands(msg, input.session, thread_id)
+    if goal_cmd is not None:
+        return goal_cmd
 
     # Deterministic helper: "book/reserve next available" for a class definition mentioned in-thread.
     if (not msg.startswith("__")) and any(k in mlow for k in ["next available", "next opening", "next slot"]) and any(
@@ -1320,10 +1467,14 @@ async def run(input: Input) -> Output:
                 )
             )
 
-    # Extract optional UI/cart directives (order: UI, cart actions, legacy cart items)
+    # Extract optional UI/cart/goal directives (order: UI, cart actions, goal bundle, legacy cart items)
     txt, ui_actions = _extract_json_line(raw, "UIActionsJSON:")
     txt, cart_actions = _extract_json_line(txt, "CartActionsJSON:")
+    txt, goal_bundle_raw = _extract_json_line(txt, "GoalBundleJSON:")
     answer, suggested = _extract_cart(txt)
+    goal_out = goal_bundle_raw if isinstance(goal_bundle_raw, dict) else None
+    if goal_out and isinstance(goal_out.get("actionPlan"), list) and not goal_out.get("trainingPlan"):
+        goal_out = {**goal_out, "trainingPlan": goal_out["actionPlan"]}
 
     ops_freshness = None
     if trace.ops_as_of and trace.ops_endpoints:
@@ -1343,5 +1494,6 @@ async def run(input: Input) -> Output:
         suggestedCartItems=suggested,
         cartActions=cart_actions if isinstance(cart_actions, list) else None,
         uiActions=ui_actions if isinstance(ui_actions, list) else None,
+        goalBundle=goal_out,
     )
 

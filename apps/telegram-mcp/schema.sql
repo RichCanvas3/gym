@@ -34,3 +34,22 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
   raw_json TEXT NOT NULL
 );
 
+-- MCP resource subscriptions: session_id + resource_uri (client subscribes to chat messages)
+CREATE TABLE IF NOT EXISTS telegram_resource_subscriptions (
+  session_id TEXT NOT NULL,
+  resource_uri TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL,
+  PRIMARY KEY (session_id, resource_uri)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_resource_subscriptions_uri ON telegram_resource_subscriptions(resource_uri);
+
+-- Pending notifications: flushed on next MCP request for that session
+CREATE TABLE IF NOT EXISTS telegram_pending_notifications (
+  session_id TEXT NOT NULL,
+  resource_uri TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_pending_notifications_session ON telegram_pending_notifications(session_id);
+
