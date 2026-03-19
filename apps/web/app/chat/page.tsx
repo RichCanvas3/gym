@@ -17,7 +17,10 @@ type ChatApiResponse = {
   suggestedCartItems?: unknown;
   cartActions?: unknown;
   uiActions?: unknown;
+  goalBundle?: Record<string, unknown>;
 };
+
+const GOAL_BUNDLE_STORAGE_KEY = "climb_gym_goal_bundle_v1";
 
 type SuggestedCartItem = {
   sku: string;
@@ -33,6 +36,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const [lastSuggestions, setLastSuggestions] = useState<SuggestedCartItem[] | null>(null);
+  const [goalBundle, setGoalBundle] = useState<Record<string, unknown> | null>(null);
 
   const threadId = waiver?.accountAddress ? `thr_${waiver.accountAddress}` : "thr_demo";
   const [hydrated, setHydrated] = useState(false);
@@ -45,6 +49,17 @@ export default function ChatPage() {
       // Load from browser cache first (fast, works even if server memory isn't ready).
       let loadedAny = false;
       try {
+        const goalRaw = window.localStorage.getItem(GOAL_BUNDLE_STORAGE_KEY);
+        if (goalRaw && !cancelled) {
+          const goalParsed = JSON.parse(goalRaw) as unknown;
+          if (goalParsed && typeof goalParsed === "object") {
+            const byThread = goalParsed as Record<string, unknown>;
+            const b = byThread[tid];
+            if (b && typeof b === "object" && !Array.isArray(b)) {
+              setGoalBundle(b as Record<string, unknown>);
+            }
+          }
+        }
         const raw = window.localStorage.getItem("climb_gym_chat_threads_v1");
         if (raw) {
           const parsed = JSON.parse(raw) as unknown;
@@ -83,6 +98,7 @@ export default function ChatPage() {
               gymName: "Front Range Climbing (Boulder)",
               timezone: "America/Denver",
               threadId: tid,
+              goalBundle: goalBundle ?? undefined,
               waiver: waiver
                 ? {
                     id: waiver.id,
@@ -165,6 +181,7 @@ export default function ChatPage() {
           timezone: "America/Denver",
           cartLines: lines,
           threadId: threadId || "thr_demo",
+          goalBundle: goalBundle ?? undefined,
           waiver: waiver
             ? {
                 id: waiver.id,
@@ -196,6 +213,19 @@ export default function ChatPage() {
       }
       setMessages((m) => [...m, { role: "assistant", text: String(payload?.answer ?? "") }]);
       setLastSuggestions(parseSuggestions(payload?.suggestedCartItems));
+
+      if (payload?.goalBundle && typeof payload.goalBundle === "object" && !Array.isArray(payload.goalBundle)) {
+        setGoalBundle(payload.goalBundle);
+        const tid = threadId || "thr_demo";
+        try {
+          const raw = window.localStorage.getItem(GOAL_BUNDLE_STORAGE_KEY);
+          const map: Record<string, unknown> = (raw && JSON.parse(raw)) || {};
+          map[tid] = payload.goalBundle;
+          window.localStorage.setItem(GOAL_BUNDLE_STORAGE_KEY, JSON.stringify(map));
+        } catch {
+          // ignore
+        }
+      }
 
       // Auto-apply cart actions, then navigate to /cart if requested.
       const cartOps = parseCartActions(payload?.cartActions);

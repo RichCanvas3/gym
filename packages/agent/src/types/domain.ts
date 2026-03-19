@@ -40,6 +40,8 @@ export type GymAssistantResult = {
   suggestedCartItems?: CartItemSuggestion[];
   cartActions?: CartAction[];
   uiActions?: UiAction[];
+  /** Persisted outcome/checklist state; merge into client store so goals survive refresh. */
+  goalBundle?: Record<string, unknown>;
 };
 
 export type GymAssistantSession = {
@@ -49,5 +51,6 @@ export type GymAssistantSession = {
   userGoals?: string;
   cartLines?: Array<{ sku: string; quantity: number }>;
   waiver?: { id: string; accountAddress: string; participantName: string; participantEmail?: string; isMinor: boolean };
+  goalBundle?: Record<string, unknown>;
 };
 

@@ -29,6 +29,9 @@ function parseSession(value: unknown): GymAssistantSession | undefined {
   if (typeof v.timezone === "string") session.timezone = v.timezone;
   if (typeof v.userName === "string") session.userName = v.userName;
   if (typeof v.userGoals === "string") session.userGoals = v.userGoals;
+  if (v.goalBundle && typeof v.goalBundle === "object" && !Array.isArray(v.goalBundle)) {
+    session.goalBundle = v.goalBundle as Record<string, unknown>;
+  }
   if (Array.isArray(v.cartLines)) {
     session.cartLines = v.cartLines
       .map((x) => {
