@@ -331,6 +331,31 @@ type MealAnalysisJson = {
   notes?: string;
 };
 
+type MealTextAnalysisJson = {
+  meal?: string | null;
+  /** If the text mentions a different time than the base timestamp, return the corrected absolute timestamp (prefer Z/UTC ISO). */
+  atISO?: string | null;
+  items?: Array<{
+    name?: string;
+    portion_g?: number | null;
+    calories?: number;
+    protein_g?: number;
+    carbs_g?: number;
+    fat_g?: number;
+    fiber_g?: number | null;
+    notes?: string;
+  }>;
+  totals?: {
+    calories?: number;
+    protein_g?: number;
+    carbs_g?: number;
+    fat_g?: number;
+    fiber_g?: number | null;
+  };
+  confidence?: number;
+  notes?: string;
+};
+
 async function visionAnalyzeMealPhoto(
   env: Env,
   imageDataUrl: string,
@@ -393,6 +418,55 @@ Use realistic estimates; set confidence 0–1 based on image clarity and ambigui
     return JSON.parse(content) as MealAnalysisJson;
   } catch {
     throw new Error("vision: invalid JSON");
+  }
+}
+
+async function visionAnalyzeMealText(
+  env: Env,
+  text: string,
+  baseAtISO: string,
+  tzName?: string | null,
+): Promise<MealTextAnalysisJson> {
+  const key = env.VISION_API_KEY?.trim();
+  if (!key) throw new Error("VISION_API_KEY not configured on weight-management-mcp");
+  const baseRaw = (env.VISION_OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim().replace(/\/$/, "");
+  let base: string;
+  try {
+    const u = new URL(baseRaw);
+    if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("not http(s)");
+    base = baseRaw;
+  } catch {
+    throw new Error(`VISION_OPENAI_BASE_URL must be an absolute http(s) URL; could not parse: ${baseRaw.slice(0, 96)}`);
+  }
+  const model = env.VISION_MODEL ?? "gpt-4o-mini";
+  const system = `You extract meal logs from casual text.\nReturn ONLY valid JSON with this exact shape:\n{\n  \"meal\": \"breakfast\"|\"lunch\"|\"dinner\"|\"snack\"|null,\n  \"atISO\": \"<ISO timestamp (prefer Z/UTC)>\"|null,\n  \"items\": [{\"name\":\"string\",\"portion_g\":null,\"calories\":0,\"protein_g\":0,\"carbs_g\":0,\"fat_g\":0,\"fiber_g\":null,\"notes\":\"\"}],\n  \"totals\": {\"calories\":0,\"protein_g\":0,\"carbs_g\":0,\"fat_g\":0,\"fiber_g\":null},\n  \"confidence\": 0.5,\n  \"notes\": \"\"\n}\nRules:\n- Use the provided BaseAtISO + Timezone as the default time.\n- If the text mentions a different time (e.g. \"around 9am\"), set atISO to the corrected absolute timestamp for that same local date.\n- If you can't estimate macros, set them to 0 but still estimate calories when possible.\n- Confidence 0–1 based on ambiguity.`;
+  const user = `BaseAtISO: ${baseAtISO}\nTimezone: ${(tzName ?? "").trim() || "unknown"}\nText: ${text}`;
+  const body = {
+    model,
+    temperature: 0.2,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+
+  const resp = await fetch(`${base}/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(`meal_text HTTP ${resp.status}: ${t.slice(0, 600)}`);
+  }
+  const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content !== "string") throw new Error("meal_text: empty content");
+  try {
+    return JSON.parse(content) as MealTextAnalysisJson;
+  } catch {
+    throw new Error("meal_text: invalid JSON");
   }
 }
 
@@ -490,6 +564,31 @@ function toolList() {
           sodium_mg: { type: "number" },
           source: { type: "string" },
           analysisId: { type: "string" },
+          sourceRef: {
+            type: "object",
+            properties: { chatId: { type: "string" }, messageId: { type: "number" } },
+          },
+        },
+        required: ["scope", "text"],
+      },
+    },
+    {
+      name: "weight_log_meal_from_text",
+      description:
+        "Interpret a casual meal text (e.g. from Telegram), estimate calories/macros, time-tag, and persist both wm_meal_analyses + wm_food_entries. Optional sourceRef provides idempotency.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: scopeSchema,
+          text: { type: "string" },
+          atISO: {
+            type: "string",
+            description: "Base timestamp (e.g. message time). If text mentions a different time, worker may adjust.",
+          },
+          atMs: { type: "number" },
+          tzName: { type: "string", description: "IANA tz name (e.g. America/Denver) to interpret times like '9am'." },
+          meal: { type: "string", description: "Optional override (breakfast/lunch/dinner/snack). If omitted, extracted from text." },
+          source: { type: "string" },
           sourceRef: {
             type: "object",
             properties: { chatId: { type: "string" }, messageId: { type: "number" } },
@@ -807,6 +906,123 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       )
       .run();
     return { ok: true, id, scope_id: sid, at_ms, meal, text };
+  }
+
+  if (name === "weight_log_meal_from_text") {
+    const rawText = normStr(args.text);
+    if (!rawText) throw new Error("text required");
+    const { chatId, messageId } = parseSourceRef(args);
+
+    if (chatId && messageId != null) {
+      const existing = await env.DB.prepare(
+        `SELECT id, analysis_id, at_ms, meal, calories
+         FROM wm_food_entries
+         WHERE scope_id=?1 AND telegram_chat_id=?2 AND telegram_message_id=?3
+         LIMIT 1`,
+      )
+        .bind(sid, chatId, messageId)
+        .first<{
+          id: string;
+          analysis_id?: string | null;
+          at_ms: number;
+          meal?: string | null;
+          calories?: number | null;
+        }>();
+      if (existing?.id) {
+        return {
+          ok: true,
+          deduped: true,
+          scope_id: sid,
+          foodEntryId: existing.id,
+          analysisId: existing.analysis_id ?? null,
+          at_ms: existing.at_ms,
+          meal: existing.meal ?? null,
+          calories: existing.calories ?? null,
+        };
+      }
+    }
+
+    const baseAtMs = "atMs" in args ? parseAtMs(args.atMs) : parseAtMs(args.atISO);
+    const baseAtISO = new Date(baseAtMs).toISOString();
+    const tzName = normStr(args.tzName);
+
+    const analysis = await visionAnalyzeMealText(env, rawText, baseAtISO, tzName);
+    const model = (env.VISION_MODEL ?? "gpt-4o-mini").trim();
+
+    const at_ms_from_model =
+      analysis?.atISO && typeof analysis.atISO === "string" && analysis.atISO.trim()
+        ? Date.parse(analysis.atISO.trim())
+        : NaN;
+    const at_ms = Number.isFinite(at_ms_from_model) ? Math.trunc(at_ms_from_model) : baseAtMs;
+
+    const overrideMeal = normStr(args.meal);
+    const meal =
+      overrideMeal ??
+      (analysis?.meal && typeof analysis.meal === "string" ? normStr(analysis.meal) : null);
+
+    const totals = analysis && typeof analysis === "object" ? (analysis.totals ?? {}) : {};
+    const calories = typeof totals.calories === "number" ? totals.calories : null;
+    const protein_g = typeof totals.protein_g === "number" ? totals.protein_g : null;
+    const carbs_g = typeof totals.carbs_g === "number" ? totals.carbs_g : null;
+    const fat_g = typeof totals.fat_g === "number" ? totals.fat_g : null;
+    const fiber_g = typeof totals.fiber_g === "number" ? totals.fiber_g : null;
+
+    const ts = nowMs();
+    const analysisId = crypto.randomUUID();
+    const summary =
+      calories != null
+        ? `~${Math.round(calories)} kcal (confidence ${typeof analysis.confidence === "number" ? analysis.confidence.toFixed(2) : "?"})`
+        : "meal text analysis";
+    const analysisRef: Record<string, unknown> = { source: "meal_text", baseAtISO, tzName: tzName ?? null };
+
+    await env.DB.prepare(
+      `INSERT INTO wm_meal_analyses
+       (id, scope_id, at_ms, model, summary, raw_json, image_ref_json, telegram_chat_id, telegram_message_id, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`,
+    )
+      .bind(analysisId, sid, at_ms, model, summary, JSON.stringify(analysis), JSON.stringify(analysisRef), chatId, messageId, ts)
+      .run();
+
+    const foodEntryId = crypto.randomUUID();
+    const source = normStr(args.source) ?? "meal_text";
+    await env.DB.prepare(
+      `INSERT INTO wm_food_entries
+       (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+    )
+      .bind(
+        foodEntryId,
+        sid,
+        at_ms,
+        meal,
+        rawText,
+        calories,
+        protein_g,
+        carbs_g,
+        fat_g,
+        fiber_g,
+        null,
+        null,
+        source,
+        chatId,
+        messageId,
+        analysisId,
+        ts,
+      )
+      .run();
+
+    return {
+      ok: true,
+      scope_id: sid,
+      analysisId,
+      foodEntryId,
+      at_ms,
+      meal,
+      summary,
+      totals: { calories, protein_g, carbs_g, fat_g, fiber_g },
+      confidence: typeof analysis.confidence === "number" ? analysis.confidence : null,
+      notes: typeof analysis.notes === "string" ? analysis.notes : null,
+    };
   }
 
   if (name === "weight_list_food") {

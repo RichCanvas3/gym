@@ -4,9 +4,8 @@ Monorepo with:
 
 - Next.js web UI: `apps/web`
 - Hosted agent (LangGraph for LangSmith Deployments): `langgraph.json` + `apps/api/graph.py`
-- Local JS agent (optional): `apps/web/app/api/chat/route.ts`
 
-## Local dev (web + local JS agent)
+## Local dev (web)
 
 ```bash
 pnpm install
@@ -29,7 +28,6 @@ Open `http://localhost:3000/chat`.
   - (optional) `OPENAI_EMBEDDINGS_MODEL=text-embedding-3-large`
 
 3) In your Next.js host (Vercel/etc), set env vars:
-- `NEXT_PUBLIC_USE_LANGGRAPH=1`
 - `LANGGRAPH_DEPLOYMENT_URL=<deployment base url>`
 - `LANGGRAPH_ASSISTANT_ID=gym`
 - `LANGSMITH_API_KEY=<server-side secret>`
@@ -44,6 +42,25 @@ The hosted Python agent can load tools from one or more **MCP servers** (recomme
 - Tool governance:
   - `MCP_TOOL_NAME_PREFIX=1` prefixes tool names with `<server>_` to avoid collisions.
   - `MCP_TOOL_ALLOWLIST` / `MCP_TOOL_DENYLIST` (comma-separated) restricts which tools the model can call.
+
+### Personal fitness MCPs (Strava + Weight + Telegram meals)
+
+If you deployed these workers, add them to your **LangSmith Deployment** env vars:
+
+- `MCP_SERVERS_JSON` add entries like:
+
+```json
+{
+  "strava": { "transport": "streamable_http", "url": "https://<strava>.workers.dev/mcp", "headers": { "x-api-key": "..." } },
+  "weight": { "transport": "streamable_http", "url": "https://<weight>.workers.dev/mcp", "headers": { "x-api-key": "..." } },
+  "telegram": { "transport": "streamable_http", "url": "https://<telegram>.workers.dev/mcp", "headers": { "x-api-key": "..." } }
+}
+```
+
+- `MCP_TOOL_ALLOWLIST` add (minimum):
+  - `strava_strava_sync,strava_strava_list_workouts,strava_strava_get_workout,strava_strava_latest_workout`
+  - `weight_weight_day_summary,weight_weight_log_weight,weight_weight_list_weights,weight_weight_log_food,weight_weight_list_food,weight_weight_log_meal_from_text`
+  - `telegram_telegram_list_chats,telegram_telegram_list_messages,telegram_telegram_search_messages`
 
 ### LangSmith Deployment env vars (copy/paste example)
 

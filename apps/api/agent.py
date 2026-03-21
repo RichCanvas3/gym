@@ -215,6 +215,78 @@ async def _core_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[di
         return None
 
 
+async def _strava_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    mcp_tools = await load_mcp_tools_from_env()
+    tool = next(
+        (
+            t
+            for t in mcp_tools
+            if isinstance(getattr(t, "name", None), str)
+            and (
+                t.name == f"strava_{tool_suffix}"
+                or t.name.endswith(f"_{tool_suffix}")
+                or t.name == tool_suffix
+            )
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke(args if isinstance(args, dict) else {})
+        return _tool_raw_to_json(raw)
+    except Exception:
+        return None
+
+
+async def _weight_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    mcp_tools = await load_mcp_tools_from_env()
+    tool = next(
+        (
+            t
+            for t in mcp_tools
+            if isinstance(getattr(t, "name", None), str)
+            and (
+                t.name == f"weight_{tool_suffix}"
+                or t.name.endswith(f"_{tool_suffix}")
+                or t.name == tool_suffix
+            )
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke(args if isinstance(args, dict) else {})
+        return _tool_raw_to_json(raw)
+    except Exception:
+        return None
+
+
+async def _telegram_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    mcp_tools = await load_mcp_tools_from_env()
+    tool = next(
+        (
+            t
+            for t in mcp_tools
+            if isinstance(getattr(t, "name", None), str)
+            and (
+                t.name == f"telegram_{tool_suffix}"
+                or t.name.endswith(f"_{tool_suffix}")
+                or t.name == tool_suffix
+            )
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke(args if isinstance(args, dict) else {})
+        return _tool_raw_to_json(raw)
+    except Exception:
+        return None
+
+
 async def _memory_append(thread_id: str, role: str, content: str) -> None:
     thread_id = (thread_id or "").strip()
     content = (content or "").strip()
@@ -508,6 +580,7 @@ def build_system_prompt() -> str:
             "Goal / outcome execution (domain-agnostic—like a small app state machine):",
             "- The user defines outcomes; you help operationalize them. Do not assume fitness, racing, or any single domain unless the user’s text implies it.",
             "- Session may include UserGoals (free text) and GoalBundle (structured JSON). Treat GoalBundle as the persisted spec the UI and tools can act on.",
+            "- If the user's outcomes involve training, exercise, nutrition, or weight, use Strava MCP (workouts) and Weight MCP (day summaries / food logs / weigh-ins) when available to ground updates and progress.",
             "- When you break work into milestones or a time-ordered checklist, end the reply with `GoalBundleJSON:` then compact JSON (merge with prior bundle when updating):",
             '  {"version":1,"primaryGoal":{"text":"<main outcome>","targetDateISO":"YYYY-MM-DD|null"},"weeklyFocus":["<near-term priorities>"],"trainingPlan":[{"id":"stable-id","dayLabel":"<time bucket or phase>","activity":"<concrete action>","startTimeISO":null,"endTimeISO":null,"completed":false}],"suggestedNext":["<optional next automation hints>"}',
             "- Field `trainingPlan` is a generic checklist of executable items (name is legacy); you may also use `actionPlan` with the same array shape—either is accepted.",
@@ -599,7 +672,7 @@ def _extract_json_line(text: str, marker: str) -> tuple[str, Any | None]:
 
 
 def _default_goal_bundle() -> dict[str, Any]:
-    return {"version": 1, "primaryGoal": None, "weeklyFocus": [], "trainingPlan": [], "suggestedNext": []}
+    return {"version": 1, "primaryGoal": None, "weeklyFocus": [], "trainingPlan": [], "suggestedNext": [], "integrations": {}}
 
 
 def _session_goal_bundle(session: Optional[Session]) -> dict[str, Any]:
@@ -632,6 +705,8 @@ def _session_goal_bundle(session: Optional[Session]) -> dict[str, Any]:
         base["trainingPlan"] = plan
     if isinstance(raw.get("suggestedNext"), list):
         base["suggestedNext"] = [str(x) for x in raw["suggestedNext"] if x is not None][:12]
+    if isinstance(raw.get("integrations"), dict):
+        base["integrations"] = raw.get("integrations")
     return base
 
 
@@ -658,6 +733,135 @@ def _format_goal_status(bundle: dict[str, Any]) -> str:
     if not lines:
         return "No structured goal data yet. Describe what you want to achieve, or say /goal set … in natural language."
     return "\n".join(lines)
+
+
+def _looks_like_meal_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t or t.startswith("/") or t.startswith("__"):
+        return False
+    if len(t) < 12:
+        return False
+    # Strong intents
+    if "add that to my meals" in t or "add to my meals" in t or "log this" in t:
+        return True
+    # Meal markers + likely food nouns
+    meal_words = ("breakfast", "lunch", "dinner", "snack", "ate ", "i ate", "had ", "for breakfast", "for lunch", "for dinner")
+    if any(w in t for w in meal_words):
+        return True
+    foodish = ("eggs", "toast", "oatmeal", "coffee", "banana", "apple", "salad", "chicken", "rice", "yogurt", "sandwich", "protein", "calories", "kcal")
+    return any(w in t for w in foodish)
+
+
+def _weight_scope_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
+    if not session or not isinstance(session.waiver, dict):
+        return None
+    addr = session.waiver.get("accountAddress")
+    if isinstance(addr, str) and addr.strip():
+        return {"accountAddress": addr.strip()}
+    return None
+
+
+async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """
+    Scan the Telegram chat titled "Smart Agent" for meal-like texts and import them into weight-mcp as food entries.
+    Uses GoalBundle.integrations to remember the last imported message id.
+    """
+    scope = _weight_scope_from_session(session)
+    if not scope:
+        return bundle, []
+
+    integrations = bundle.get("integrations") if isinstance(bundle.get("integrations"), dict) else {}
+    tg_state = integrations.get("telegramMeals") if isinstance(integrations.get("telegramMeals"), dict) else {}
+    last_id = tg_state.get("lastImportedMessageId")
+    last_imported = int(last_id) if isinstance(last_id, (int, float)) else 0
+
+    chats = await _telegram_call_json("telegram_list_chats", {"limit": 200}) or {}
+    chat_list = chats.get("chats") if isinstance(chats, dict) else None
+    chat_id: Optional[str] = None
+    if isinstance(chat_list, list):
+        for c in chat_list:
+            if not isinstance(c, dict):
+                continue
+            title = str(c.get("title") or "").strip()
+            if title.lower() == "smart agent":
+                chat_id = str(c.get("chatId") or "").strip() or None
+                break
+    if not chat_id:
+        return bundle, []
+
+    msgs = await _telegram_call_json(
+        "telegram_list_messages",
+        {"chatId": chat_id, "limit": 50, "includeImageUrls": False, "includeImageBytes": False},
+    ) or {}
+    items = msgs.get("messages") if isinstance(msgs, dict) else None
+    if not isinstance(items, list) or not items:
+        return bundle, []
+
+    candidates: list[dict[str, Any]] = []
+    for m in items:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("messageId")
+        if not isinstance(mid, (int, float)):
+            continue
+        mid_i = int(mid)
+        if mid_i <= last_imported:
+            continue
+        txt = m.get("text")
+        if not isinstance(txt, str) or not _looks_like_meal_text(txt):
+            continue
+        candidates.append({"messageId": mid_i, "dateUnix": m.get("dateUnix"), "text": txt})
+
+    if not candidates:
+        # Still record chat id so we don't keep scanning chats list if the title changes
+        integrations["telegramMeals"] = {**tg_state, "chatTitle": "Smart Agent", "chatId": chat_id, "lastCheckedAtISO": _now_iso()}
+        bundle["integrations"] = integrations
+        return bundle, []
+
+    candidates.sort(key=lambda x: int(x.get("messageId") or 0))
+    tz_name = (session.timezone if session else None) or "UTC"
+
+    imported: list[dict[str, Any]] = []
+    for c in candidates[:20]:
+        mid_i = int(c["messageId"])
+        du = c.get("dateUnix")
+        at_ms = int(du) * 1000 if isinstance(du, (int, float)) else int(datetime.now(timezone.utc).timestamp() * 1000)
+        text = str(c.get("text") or "").strip()
+        if not text:
+            continue
+        res = await _weight_call_json(
+            "weight_log_meal_from_text",
+            {
+                "scope": scope,
+                "text": text,
+                "atMs": at_ms,
+                "tzName": tz_name,
+                "source": "telegram_text",
+                "sourceRef": {"chatId": chat_id, "messageId": mid_i},
+            },
+        )
+        if isinstance(res, dict) and res.get("ok") is True:
+            imported.append(
+                {
+                    "messageId": mid_i,
+                    "atMs": res.get("at_ms"),
+                    "meal": res.get("meal"),
+                    "summary": res.get("summary"),
+                    "foodEntryId": res.get("foodEntryId") or res.get("foodEntryId".lower()),
+                }
+            )
+        # advance cursor even if one fails, to prevent repeated attempts on a bad message
+        last_imported = max(last_imported, mid_i)
+
+    integrations["telegramMeals"] = {
+        **tg_state,
+        "chatTitle": "Smart Agent",
+        "chatId": chat_id,
+        "lastImportedMessageId": last_imported,
+        "lastCheckedAtISO": _now_iso(),
+    }
+    bundle["integrations"] = integrations
+    return bundle, imported
 
 
 async def _handle_goal_slash_commands(msg: str, session: Optional[Session], thread_id: str) -> Optional[Output]:
@@ -1391,6 +1595,16 @@ async def run(input: Input) -> Output:
             await _memory_append(thread_id, "assistant", out.answer)
         return out
 
+    # Auto-import meal-like Telegram texts into weight-mcp (Smart Agent chat), tracked in GoalBundle.integrations.
+    had_session_goal_bundle = bool(input.session and isinstance(getattr(input.session, "goalBundle", None), dict))
+    base_goal_bundle = copy.deepcopy(_session_goal_bundle(input.session))
+    imported_meals: list[dict[str, Any]] = []
+    if not msg.startswith("__"):
+        try:
+            base_goal_bundle, imported_meals = await _auto_import_telegram_meal_texts(input.session, base_goal_bundle)
+        except Exception:
+            imported_meals = []
+
     tools, trace = make_tools()
     mcp_tools = await load_mcp_tools_from_env()
     all_tools = tools + mcp_tools
@@ -1476,11 +1690,30 @@ async def run(input: Input) -> Output:
     if goal_out and isinstance(goal_out.get("actionPlan"), list) and not goal_out.get("trainingPlan"):
         goal_out = {**goal_out, "trainingPlan": goal_out["actionPlan"]}
 
+    # Persist Telegram meal import cursor + confirmations via GoalBundle.integrations.
+    if isinstance(goal_out, dict):
+        if isinstance(base_goal_bundle.get("integrations"), dict) and base_goal_bundle.get("integrations"):
+            goal_out = {**goal_out, "integrations": base_goal_bundle["integrations"]}
+    else:
+        if imported_meals or had_session_goal_bundle:
+            goal_out = base_goal_bundle
+
     ops_freshness = None
     if trace.ops_as_of and trace.ops_endpoints:
         ops_freshness = {"asOfISO": trace.ops_as_of, "endpoints": sorted(list(trace.ops_endpoints))}
 
     weather_freshness = None
+
+    if imported_meals:
+        parts = []
+        for it in imported_meals[:5]:
+            meal = it.get("meal") if isinstance(it, dict) else None
+            summary = it.get("summary") if isinstance(it, dict) else None
+            s = " ".join([str(meal or "").strip(), str(summary or "").strip()]).strip()
+            if s:
+                parts.append(s)
+        suffix = f": {', '.join(parts)}" if parts else ""
+        answer = (answer.rstrip() + f"\n\nImported {len(imported_meals)} meal log(s) from Telegram (Smart Agent){suffix}.").strip()
 
     if thread_id:
         await _memory_append(thread_id, "user", msg)

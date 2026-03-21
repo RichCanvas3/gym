@@ -1,0 +1,11 @@
+---
+description: Enforce hosted-only agent usage (no fallbacks)
+alwaysApply: true
+---
+
+# No fallback (hosted-only)
+
+- The web chat must **always** use the hosted LangGraph agent via `apps/web/app/api/agent/run/route.ts`.
+- Do **not** add environment toggles, conditional routing, or fallback paths to a local agent (no `/api/chat` fallback).
+- If a hosted dependency is missing, fail fast with a clear error instead of silently switching modes.
+

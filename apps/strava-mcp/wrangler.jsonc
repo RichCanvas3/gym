@@ -1,0 +1,23 @@
+/**
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gym-strava-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "gym-strava",
+			"database_id": "1f9422cc-9ef6-493e-b84f-79b52a58aa2c",
+			"remote": true
+		}
+	]
+}

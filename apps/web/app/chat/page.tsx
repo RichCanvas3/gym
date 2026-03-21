@@ -20,6 +20,11 @@ type ChatApiResponse = {
   goalBundle?: Record<string, unknown>;
 };
 
+type SkillsApiResponse = {
+  ok?: boolean;
+  capabilities?: Array<{ id?: string; label?: string; tools?: string[] }>;
+};
+
 const GOAL_BUNDLE_STORAGE_KEY = "climb_gym_goal_bundle_v1";
 
 type SuggestedCartItem = {
@@ -37,6 +42,9 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false);
   const [lastSuggestions, setLastSuggestions] = useState<SuggestedCartItem[] | null>(null);
   const [goalBundle, setGoalBundle] = useState<Record<string, unknown> | null>(null);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [skills, setSkills] = useState<SkillsApiResponse | null>(null);
+  const [skillsError, setSkillsError] = useState<string | null>(null);
 
   const threadId = waiver?.accountAddress ? `thr_${waiver.accountAddress}` : "thr_demo";
   const [hydrated, setHydrated] = useState(false);
@@ -86,8 +94,7 @@ export default function ChatPage() {
         // ignore
       }
 
-      const useHosted = process.env.NEXT_PUBLIC_USE_LANGGRAPH === "1";
-      const url = useHosted ? "/api/agent/run" : "/api/chat";
+      const url = "/api/agent/run";
       try {
         const res = await fetch(url, {
           method: "POST",
@@ -172,8 +179,7 @@ export default function ChatPage() {
     setMessages((m) => [...m, { role: "user", text }]);
     setBusy(true);
     try {
-      const useHosted = process.env.NEXT_PUBLIC_USE_LANGGRAPH === "1";
-      const url = useHosted ? "/api/agent/run" : "/api/chat";
+      const url = "/api/agent/run";
       const body = {
         message: text,
         session: {
@@ -264,23 +270,70 @@ export default function ChatPage() {
     }
   }
 
+  async function toggleSkills() {
+    setSkillsOpen((v) => !v);
+    if (skills || skillsError) return;
+    try {
+      const res = await fetch("/api/a2a/skills", { method: "GET" });
+      const json = (await res.json().catch(() => ({}))) as SkillsApiResponse;
+      if (!res.ok || !json?.ok) {
+        setSkillsError("Failed to load skills.");
+        return;
+      }
+      setSkills(json);
+    } catch {
+      setSkillsError("Failed to load skills.");
+    }
+  }
+
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-black dark:text-zinc-50">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-10">
         <header className="flex flex-col gap-1">
           <div className="flex items-center justify-between gap-4">
             <h1 className="text-2xl font-semibold tracking-tight">Climb Gym Copilot</h1>
-            <Link
-              href="/cart"
-              className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
-            >
-              Cart
-            </Link>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => void toggleSkills()}
+                className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
+              >
+                Skills
+              </button>
+              <Link
+                href="/cart"
+                className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
+              >
+                Cart
+              </Link>
+            </div>
           </div>
           <p className="text-sm text-zinc-600 dark:text-zinc-400">
             RAG for policies &amp; catalog, ops for availability.
           </p>
         </header>
+
+        {skillsOpen ? (
+          <div className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm dark:border-white/10 dark:bg-zinc-950">
+            {skillsError ? (
+              <div className="text-zinc-600 dark:text-zinc-400">{skillsError}</div>
+            ) : skills?.capabilities?.length ? (
+              <div className="flex flex-col gap-3">
+                {skills.capabilities.map((c) => (
+                  <div key={String(c.id ?? c.label ?? "")}>
+                    <div className="font-semibold">{String(c.label ?? c.id ?? "Capability")}</div>
+                    {Array.isArray(c.tools) && c.tools.length ? (
+                      <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                        {c.tools.join(", ")}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-zinc-600 dark:text-zinc-400">Loading…</div>
+            )}
+          </div>
+        ) : null}
 
         <main className="flex flex-col gap-3 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
           <div className="flex flex-col gap-3">
