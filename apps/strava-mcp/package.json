@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:cf": "CF_WORKERS=1 vitest run"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.26.0",
@@ -13,8 +15,10 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.13.3",
     "@cloudflare/workers-types": "^4.20260305.0",
     "typescript": "^5.9.3",
+    "vitest": "^4.1.0",
     "wrangler": "^4.69.0"
   }
 }

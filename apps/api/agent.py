@@ -1586,6 +1586,139 @@ async def run(input: Input) -> Output:
             data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "classes": items},
         )
 
+    # Deterministic: food log summary (past week / last N days).
+    if (not msg.startswith("__")) and any(k in mlow for k in ["what have i eaten", "what did i eat", "meals past", "food past"]) and any(
+        k in mlow for k in ["past week", "last week", "past 7 days", "last 7 days", "past few days", "last few days"]
+    ):
+        scope = _weight_scope_from_session(input.session)
+        if not scope:
+            answer = "I can summarize meals, but I need your waiver accountAddress. Please fill out /waiver."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address"}])
+
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        tz = ZoneInfo(tz_name or "UTC")
+        today_local = datetime.now(tz=tz).date()
+        days = 7 if ("week" in mlow or "7" in mlow) else 3
+        start_local = (today_local - timedelta(days=days - 1)).isoformat()
+        end_local = today_local.isoformat()
+        from_iso, _ = _day_window_utc_from_local_date(start_local, tz_name)
+        _, to_iso = _day_window_utc_from_local_date(end_local, tz_name)
+
+        data = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500}) or {}
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list) or not items:
+            answer = f"No meals logged in the past {days} days."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": 0})
+
+        by_day: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            at_ms = it.get("at_ms")
+            if not isinstance(at_ms, (int, float)):
+                continue
+            dt_local = datetime.fromtimestamp(float(at_ms) / 1000.0, tz=timezone.utc).astimezone(tz)
+            day = dt_local.date().isoformat()
+            meal = str(it.get("meal") or "unknown").strip() or "unknown"
+            by_day.setdefault(day, {}).setdefault(meal, []).append(it)
+
+        lines = [f"Meals for the past {days} days ({tz_name}):"]
+        for day in sorted(by_day.keys(), reverse=True):
+            lines.append(f"\n{day}")
+            meals = by_day[day]
+            for meal in sorted(meals.keys()):
+                rows = meals[meal]
+                for r in rows[:5]:
+                    text = str(r.get("text") or "").strip()
+                    kcal = r.get("calories")
+                    kcal_s = f" (~{int(round(float(kcal)))} kcal)" if isinstance(kcal, (int, float)) else ""
+                    if text:
+                        lines.append(f"- {meal}: {text}{kcal_s}")
+                if len(rows) > 5:
+                    lines.append(f"- {meal}: (+{len(rows) - 5} more)")
+
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": len(items)})
+
+    # Deterministic: workouts summary (past few days / last week).
+    if (not msg.startswith("__")) and any(k in mlow for k in ["what exercises have i done", "what workouts have i done", "workouts past", "exercise past"]) and any(
+        k in mlow for k in ["past few days", "last few days", "past week", "last week", "past 7 days", "last 7 days"]
+    ):
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        tz = ZoneInfo(tz_name or "UTC")
+        days = 7 if ("week" in mlow or "7" in mlow) else 3
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+
+        data = await _strava_call_json("strava_list_workouts", {"limit": 100}) or {}
+        workouts = data.get("workouts") if isinstance(data, dict) else None
+        if not isinstance(workouts, list) or not workouts:
+            answer = f"No workouts found in the past {days} days."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "count": 0})
+
+        def _parse_iso(s: Any) -> Optional[datetime]:
+            if not isinstance(s, str) or not s.strip():
+                return None
+            try:
+                return datetime.fromisoformat(s.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        recent: list[dict[str, Any]] = []
+        for w in workouts:
+            if not isinstance(w, dict):
+                continue
+            dt = _parse_iso(w.get("ended_at_iso")) or _parse_iso(w.get("started_at_iso"))
+            if dt and dt >= cutoff:
+                recent.append(w)
+
+        if not recent:
+            answer = f"No workouts found in the past {days} days."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "count": 0})
+
+        def _fmt_duration(sec: Any) -> str:
+            try:
+                s = int(sec)
+            except Exception:
+                return ""
+            m = s // 60
+            if m < 60:
+                return f"{m}m"
+            return f"{m//60}h{m%60:02d}m"
+
+        lines = [f"Workouts (last {days} days):"]
+        for w in recent[:10]:
+            typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
+            started = _parse_iso(w.get("started_at_iso"))
+            started_local = started.astimezone(tz).strftime("%Y-%m-%d %H:%M") if started else ""
+            dist_m = w.get("distance_meters")
+            dist_s = ""
+            if isinstance(dist_m, (int, float)) and dist_m > 0:
+                dist_s = f"{dist_m/1609.34:.1f} mi"
+            dur_s = _fmt_duration(w.get("duration_seconds"))
+            bits = " • ".join([b for b in [started_local, dist_s, dur_s] if b])
+            lines.append(f"- {typ}" + (f" ({bits})" if bits else ""))
+
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "count": len(recent)})
+
     if msg.startswith("__WEATHER_HOURLY__:"):
         try:
             payload = json.loads(msg.split(":", 1)[1].strip())

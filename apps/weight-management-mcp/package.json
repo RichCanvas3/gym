@@ -7,11 +7,15 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "db:migrate": "wrangler d1 migrations apply gym-weight --remote"
+    "db:migrate": "wrangler d1 migrations apply gym-weight --remote",
+    "test": "vitest run",
+    "test:cf": "CF_WORKERS=1 vitest run"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.13.3",
     "@cloudflare/workers-types": "^4.20260305.0",
     "typescript": "^5.9.3",
+    "vitest": "^4.1.0",
     "wrangler": "^4.69.0"
   }
 }
