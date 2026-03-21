@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnableLambda
 from .agent import Input, Output, run
 
 
-app = FastAPI(title="Climb Gym Copilot API", version="0.1.0")
+app = FastAPI(title="Erie Rec Center Fitness API", version="0.1.0")
 
 allow_origins = os.environ.get("CORS_ALLOW_ORIGINS", "*")
 origins = ["*"] if allow_origins.strip() == "*" else [o.strip() for o in allow_origins.split(",") if o.strip()]

@@ -1,4 +1,4 @@
-# Climb Gym Copilot
+# Erie Rec Center Copilot
 
 Monorepo with:
 

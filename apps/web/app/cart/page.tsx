@@ -63,7 +63,7 @@ export default function CartPage() {
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Cart</h1>
-            <p className="text-sm text-zinc-600 dark:text-zinc-400">Local-only demo cart.</p>
+            <p className="text-sm text-zinc-600 dark:text-zinc-400">Review items and checkout.</p>
           </div>
           <div className="flex items-center gap-2">
             <Link
@@ -141,7 +141,7 @@ export default function CartPage() {
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify({
                       session: {
-                        gymName: "Front Range Climbing (Boulder)",
+                        gymName: "Erie Community Center",
                         timezone: "America/Denver",
                         cartLines: lines,
                         waiver: {

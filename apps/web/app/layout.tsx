@@ -17,8 +17,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Climb Gym Copilot",
-  description: "Next.js + LangChain starter for a climbing gym assistant",
+  title: "Erie Rec Center Copilot",
+  description: "Next.js + LangChain hosted agent for a fitness + recreation assistant",
 };
 
 export default function RootLayout({

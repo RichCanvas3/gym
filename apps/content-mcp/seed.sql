@@ -7,16 +7,24 @@ INSERT INTO content_docs (doc_id, entity_type, entity_id, locale, title, slug, b
 VALUES (
   'doc_gym_overview_en',
   'gym',
-  'gym_front_range_boulder',
+  'gym_erie_community_center',
   'en',
-  'Front Range Climbing — Boulder',
-  'front-range-climbing-boulder',
-  '# Welcome\n\nFront Range Climbing is a modern bouldering + ropes facility with coaching, youth programs, and an **outdoor training wall** that operates **weather-dependently**.\n\n## What we do well\n- Beginner-friendly onboarding\n- Skill-building classes (belay, lead, movement)\n- Private coaching and performance training\n- Camps and youth progression tracks\n\n## What to bring\n- Comfortable athletic clothes\n- Socks if renting shoes\n- Water bottle\n\n## Outdoor wall operations\nOutdoor sessions may be adjusted or cancelled for:\n- lightning\n- high winds/gusts\n- heavy rain/snow\n- unsafe temperatures/ice\n\nWhen you ask about an outdoor class/access, we include a forecast snapshot.\n',
-  '["gym","overview","boulder"]',
+  'Erie Community Center',
+  'erie-community-center',
+  '# Welcome\n\nThe **Erie Community Center (ECC)** is a recreation facility with individual and group fitness, a full-court gymnasium, an indoor pool (lazy river + hot tub), racquetball, meeting rooms, and a **climbing wall**.\n\n## Amenities\n- Group fitness (drop-in + registration-based)\n- Gymnasium drop-ins (open gym, court sports)\n- Aquatics (lap swim, open swim, lessons, water aerobics)\n- Indoor pickleball (seasonal schedule)\n- Climbing wall (bouldering + roped pinnacle)\n\n## Location + hours\n- 450 Powers Street, Erie, CO 80516\n- Typical hours: Mon–Thu 5am–9pm; Fri 5am–7pm; Sat 7am–7pm; Sun 8am–5pm\n\nAsk for schedules and we’ll show times and help you reserve when reservations are available.\n',
+  '["gym","overview","erie"]',
   '2026-02-01T00:00:00Z',
   '2026-02-01T00:00:00Z'
 )
-ON CONFLICT(entity_type, entity_id, locale) DO UPDATE SET body_markdown=excluded.body_markdown, updated_at_iso=excluded.updated_at_iso;
+ON CONFLICT(doc_id) DO UPDATE SET
+  entity_type=excluded.entity_type,
+  entity_id=excluded.entity_id,
+  locale=excluded.locale,
+  title=excluded.title,
+  slug=excluded.slug,
+  body_markdown=excluded.body_markdown,
+  tags_json=excluded.tags_json,
+  updated_at_iso=excluded.updated_at_iso;
 
 -- Policies (waiver + cancellations)
 INSERT INTO content_docs (doc_id, entity_type, entity_id, locale, title, slug, body_markdown, tags_json, created_at_iso, updated_at_iso)
@@ -27,7 +35,7 @@ VALUES (
   'en',
   'Waiver + Minors',
   'waiver-minors',
-  '# Waiver\n\nA waiver is required for anyone entering the climbing areas.\n\n## Minors\nIf the participant is under 18, a **parent/guardian** must complete and sign the waiver.\n\n## Photos and emergency contact\nOptional fields may be collected for safety and lost-and-found.\n',
+  '# Waiver\n\nA waiver may be required for certain activities.\n\n## Minors\nIf the participant is under 18, a **parent/guardian** must complete and sign the waiver.\n\n## Climbing wall\nThe ECC climbing wall requires a climbing waiver before accessing the wall.\n\n## Notes\nOptional fields may be collected for safety and lost-and-found.\n',
   '["policy","waiver","minors"]',
   '2026-02-01T00:00:00Z',
   '2026-02-01T00:00:00Z'
@@ -86,60 +94,72 @@ ON CONFLICT(entity_type, entity_id, locale) DO UPDATE SET body_markdown=excluded
 -- Class definition descriptions (entity_id uses core class_definitions.class_def_id)
 INSERT INTO content_docs (doc_id, entity_type, entity_id, locale, title, slug, body_markdown, tags_json, created_at_iso, updated_at_iso) VALUES
 (
-  'doc_cdef_intro_belay_en','class_definition','cdef_intro_belay','en','Intro to Belay (Top Rope)','intro-to-belay',
-  '# Intro to Belay (Top Rope)\n\nLearn the essential belay checks and safe habits to climb on top rope.\n\n## What you''ll learn\n- Harness + knot checks\n- Belay device setup\n- Communication commands\n- Lowering safely\n\n## Prereqs\nNone.\n\n## What to bring\nComfortable clothing and socks if renting shoes.\n',
-  '["class","belay","beginner"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_group_fitness_dropin_en','class_definition','cdef_group_fitness_dropin','en','Drop-in Group Fitness','dropin-group-fitness',
+  '# Drop-in Group Fitness\n\nA general-purpose class definition used for group fitness sessions (strength, HIIT, mobility, etc.).\n\nSchedules vary by season.\n',
+  '["class","fitness","group"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 ),
 (
-  'doc_cdef_anchor_clinic_en','class_definition','cdef_anchor_clinic','en','Anchor Clinic','anchor-clinic',
-  '# Anchor Clinic\n\nA systems-focused clinic for gym anchors and efficient transitions.\n\n## Topics\n- clipping plans\n- redundancy + direction\n- cleaning at the anchor (gym context)\n\n## Prereqs\nComfort on top rope and basic belay competency.\n',
-  '["class","anchors","intermediate"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_private_training_60_en','class_definition','cdef_private_training_60','en','Personal Training (60 min)','personal-training-60',
+  '# Personal Training (60 min)\n\nA 1:1 training session tailored to your goals.\n\n## Common goals\n- strength plan\n- weight loss support\n- mobility and injury prevention\n',
+  '["class","training","private"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 ),
 (
-  'doc_cdef_lead_101_en','class_definition','cdef_lead_101','en','Lead Climbing 101','lead-101',
-  '# Lead Climbing 101\n\nLearn lead belay and lead climbing fundamentals in a controlled setting.\n\n## Includes\n- lead belay technique\n- clipping positions\n- fall factors basics\n- gym lead safety norms\n\n## Prereqs\nTop rope belay competency.\n',
-  '["class","lead","intermediate"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_open_gym_en','class_definition','cdef_open_gym','en','Open Gym (Drop-in)','open-gym',
+  '# Open Gym (Drop-in)\n\nShared gymnasium time for drop-in activities.\n\nSchedules vary by season.\n',
+  '["class","open_gym"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 ),
 (
-  'doc_cdef_fall_practice_en','class_definition','cdef_fall_practice','en','Falling Practice Workshop','falling-practice',
-  '# Falling Practice\n\nA practical workshop to build safe falling confidence.\n\n## Focus\n- soft catches\n- progressive fall drills\n- mindset tools\n\n## Notes\nWe only do drills appropriate for your experience.\n',
-  '["class","lead","confidence"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_open_gym_caregiver_child_en','class_definition','cdef_open_gym_caregiver_child','en','Open Gym Drop-in: Caregiver and Child (Ages 2–5)','open-gym-caregiver-child',
+  '# Open Gym: Caregiver and Child\n\nAges 2–5 with caregiver. Low-key play and exploration.\n\nNo registration needed.\n',
+  '["class","open_gym","youth"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 ),
 (
-  'doc_cdef_movement_lab_en','class_definition','cdef_movement_lab','en','Movement Lab','movement-lab',
-  '# Movement Lab\n\nFootwork, balance, and efficient body positions.\n\n## You''ll practice\n- quiet feet\n- hip positioning\n- basic flagging\n- pacing and resting\n',
-  '["class","movement","beginner"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_pickleball_indoor_en','class_definition','cdef_pickleball_indoor','en','Indoor Pickleball (Drop-in)','indoor-pickleball',
+  '# Indoor Pickleball (Drop-in)\n\nIndoor pickleball is available seasonally.\n\nBring your own paddle/balls; nets are provided.\n',
+  '["class","pickleball","sports"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 ),
 (
-  'doc_cdef_outdoor_access_en','class_definition','cdef_outdoor_access','en','Outdoor Wall Access (Weather-Dependent)','outdoor-wall-access',
-  '# Outdoor Wall Access\n\nA supervised session on our outdoor wall.\n\n## Weather dependence\nWe may modify or cancel for lightning, high winds, precipitation, or icy surfaces.\n\n## Recommended\nBring layers and a wind shell.\n',
-  '["class","outdoor","weather"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_pool_lap_swim_en','class_definition','cdef_pool_lap_swim','en','Lap Swim','lap-swim',
+  '# Lap Swim\n\nLap lanes are available during designated times.\n\nLane availability can vary with lessons and events.\n',
+  '["class","aquatics","lap_swim"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 ),
 (
-  'doc_cdef_private_coaching_en','class_definition','cdef_private_coaching_60','en','Private Coaching (60 min)','private-coaching-60',
-  '# Private Coaching (60 min)\n\nA 1:1 session tailored to your goals.\n\n## Common goals\n- first lead\n- bouldering tactics\n- footwork + efficiency\n- strength plan and drills\n\n## Outcome\nYou leave with a short plan you can repeat.\n',
-  '["class","private","coaching"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_pool_open_swim_en','class_definition','cdef_pool_open_swim','en','Open Swim','open-swim',
+  '# Open Swim\n\nFamily-friendly open swim with features varying by schedule (slide, rope swing, etc.).\n',
+  '["class","aquatics","open_swim"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 ),
 (
-  'doc_cdef_private_lead_en','class_definition','cdef_private_lead_60','en','Private Lead Tune-Up (60 min)','private-lead-tuneup',
-  '# Private Lead Tune-Up\n\nA focused 1:1 for sharper clipping, pacing, and head game.\n\n## Good for\n- first outdoor sport trip prep\n- breaking through “pump panic”\n- dialing lead belay habits\n',
-  '["class","private","lead"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+  'doc_cdef_climbing_supervised_open_climb_en','class_definition','cdef_climbing_supervised_open_climb','en','Climbing Wall: Supervised Open Climb','climbing-supervised-open-climb',
+  '# Supervised Open Climb\n\nStaff-supervised climbing time at the ECC climbing wall.\n\nThe ECC climbing wall includes a 15-foot bouldering wall and a 32-foot pinnacle.\n',
+  '["class","climbing"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+),
+(
+  'doc_cdef_climbing_belay_skills_training_en','class_definition','cdef_climbing_belay_skills_training','en','Climbing Wall: Belay Skills Training Course','belay-skills-training',
+  '# Belay Skills Training Course\n\nEarn belay certification for unsupervised roped climbing access.\n\nBelay certifications must be renewed periodically.\n',
+  '["class","climbing","belay"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
+),
+(
+  'doc_cdef_climbing_teen_bouldering_orientation_en','class_definition','cdef_climbing_teen_bouldering_orientation','en','Climbing Wall: Teen Bouldering Orientation (Ages 12–17)','teen-bouldering-orientation',
+  '# Teen Bouldering Orientation\n\nOrientation for ages 12–17 to access bouldering without adult supervision.\n',
+  '["class","climbing","youth"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'
 )
 ON CONFLICT(entity_type, entity_id, locale) DO UPDATE SET body_markdown=excluded.body_markdown, updated_at_iso=excluded.updated_at_iso;
 
 -- Product descriptions (entity_id uses core products.sku)
 INSERT INTO content_docs (doc_id, entity_type, entity_id, locale, title, slug, body_markdown, tags_json, created_at_iso, updated_at_iso) VALUES
-('doc_prod_access_day_pass_en','product','access_day_pass','en','Day Pass (All Day)','day-pass',
-'# Day Pass\n\nAll-day access to bouldering + ropes areas during staffed hours.\n\n## Includes\n- facility access\n\n## Does not include\n- rentals\n- instruction\n','["product","access"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
+('doc_prod_access_day_pass_en','product','access_day_pass','en','Daily Drop-in (All Day)','daily-dropin',
+'# Daily Drop-in\n\nAll-day access during staffed hours.\n\nSpecific amenities and features vary by schedule.\n','["product","access"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
 ('doc_prod_access_5_visit_en','product','access_5_visit_punch','en','5-Visit Punch Pass','5-visit-pass',
 '# 5-Visit Punch Pass\n\nFlexible visits for people who climb a couple times a month.\n\n## Notes\nPunch passes are not transferable.\n','["product","access"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
 ('doc_prod_memb_individual_en','product','memb_monthly_individual','en','Monthly Membership (Individual)','membership-individual',
 '# Monthly Membership\n\nUnlimited access + member perks.\n\n## Perks\n- discounts on classes\n- priority booking windows (when available)\n- guest day-pass discount\n','["product","membership"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
-('doc_prod_rental_shoes_en','product','rental_shoes_day','en','Shoe Rental (Day)','shoe-rental',
-'# Shoe Rental\n\nAll-day shoe rental.\n\n## Fit help\nAsk staff for sizing—snug but not painful.\n','["product","rental"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
-('doc_prod_class_intro_belay_en','product','class_intro_belay','en','Class: Intro to Belay','class-intro-belay',
-'# Intro to Belay (Purchase)\n\nThis SKU represents purchasing a spot in the Intro to Belay class.\n\nYou will still need to select a scheduled session time.\n','["product","class","belay"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
-('doc_prod_private_60_en','product','coaching_private_60','en','Private Coaching: 60 minutes','private-coaching',
-'# Private Coaching (60)\n\n1:1 coaching session.\n\n## Scheduling\nWe match you with an instructor based on goals and availability.\n','["product","coaching","private"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z')
+('doc_prod_rental_harness_en','product','rental_harness_day','en','Climbing Harness Loan (Day)','harness-loan',
+'# Climbing Harness Loan\n\nHarness loan availability is handled at the front desk.\n','["product","rental","climbing"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
+('doc_prod_belay_device_en','product','rental_belay_device','en','Belay Device Loan (Day)','belay-device-loan',
+'# Belay Device Loan\n\nBelay device loan availability is handled at the front desk.\n','["product","rental","climbing"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
+('doc_prod_personal_training_60_en','product','coaching_personal_training_60','en','Personal Training: 60 minutes','personal-training',
+'# Personal Training (60)\n\nBook a 1:1 training session.\n','["product","coaching","private"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z'),
+('doc_prod_party_climbing_wall_en','product','party_climbing_wall','en','Climbing Wall Party (Facility Booking)','climbing-party',
+'# Climbing Wall Parties\n\nClimbing wall parties are facility bookings.\n','["product","party","climbing"]','2026-02-01T00:00:00Z','2026-02-01T00:00:00Z')
 ON CONFLICT(entity_type, entity_id, locale) DO UPDATE SET body_markdown=excluded.body_markdown, updated_at_iso=excluded.updated_at_iso;
 

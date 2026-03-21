@@ -1,7 +1,7 @@
 import type { GymAssistantSession } from "../types/domain";
 
 export function buildSessionPrompt(session?: GymAssistantSession) {
-  const gymName = session?.gymName ?? "Front Range Climbing (Boulder)";
+  const gymName = session?.gymName ?? "Erie Community Center";
   const timezone = session?.timezone ?? "America/Denver";
   const userName = session?.userName;
   const userGoals = session?.userGoals;

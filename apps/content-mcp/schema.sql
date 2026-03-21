@@ -18,3 +18,19 @@ CREATE TABLE IF NOT EXISTS content_docs (
 CREATE INDEX IF NOT EXISTS idx_content_docs_entity ON content_docs(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_content_docs_updated ON content_docs(updated_at_iso);
 
+-- Crawl metadata for public web pages (change detection)
+CREATE TABLE IF NOT EXISTS web_crawl_pages (
+  url TEXT PRIMARY KEY,
+  etag TEXT,
+  last_modified TEXT,
+  content_hash TEXT,
+  title TEXT,
+  status_code INTEGER,
+  last_fetched_at_iso TEXT,
+  last_changed_at_iso TEXT,
+  error TEXT,
+  updated_at_iso TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_crawl_pages_updated ON web_crawl_pages(updated_at_iso);
+

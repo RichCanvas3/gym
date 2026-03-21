@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "seed:erie": "node scripts/seed-erie-schedule.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.26.0",

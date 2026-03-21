@@ -20,8 +20,8 @@ from .mcp_tools import load_mcp_tools_from_env
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-_GYM_LAT = 40.015
-_GYM_LON = -105.2705
+_GYM_LAT = 40.03781
+_GYM_LON = -105.05228
 
 
 def _format_usd(cents: int) -> str:
@@ -381,7 +381,7 @@ async def _handle_checkout(session: Optional["Session"]) -> "Output":
     if email:
         emailed, email_err = await _send_email_via_sendgrid(
             to_email=email,
-            subject="Your Climb Gym Copilot receipt",
+            subject="Your Erie Rec Center Copilot receipt",
             text=receipt,
         )
 
@@ -547,7 +547,7 @@ class _Trace:
 def build_system_prompt() -> str:
     return "\n".join(
         [
-            "You are a helpful climbing gym assistant for a climbing gym.",
+            "You are a helpful fitness + recreation assistant for the Erie Community Center (Erie, CO).",
             "",
             "Rules:",
             "- Be accurate. If you don't know, say so.",
@@ -562,7 +562,7 @@ def build_system_prompt() -> str:
             "- For class reservations, reserve seats via the scheduling MCP using canonical account addresses, record a reservation ledger entry in gym-core, then send a confirmation email when possible.",
             "- For checkout, provide a concise receipt and send an email receipt when possible.",
             "- If discussing a specific outdoor class that is scheduled in the future, include forecast context for that class time when possible.",
-            "- If the user needs to sign a waiver (first visit, waiver questions), direct them to the online waiver page at /waiver. If they are under 18, a parent/guardian must sign.",
+            "- If the user needs to sign a waiver (first visit, waiver questions), direct them to the online waiver page at /waiver. If they are under 18, a parent/guardian must sign. For climbing-wall-specific access, remind them a climbing waiver may be required.",
             "- When asked about policies, class descriptions, coach bios, or general FAQs, use the knowledge search tool (RAG).",
             "- If you use knowledge search, include a short 'Sources' list at the end with the sourceIds you relied on.",
             "- If you use ops, mention the as-of timestamp returned by the tool.",
@@ -596,11 +596,11 @@ def build_system_prompt() -> str:
 
 
 def build_session_prompt(session: Optional[Session]) -> str:
-    gym_name = (session.gymName if session else None) or "Front Range Climbing (Boulder)"
+    gym_name = (session.gymName if session else None) or "Erie Community Center"
     tz = (session.timezone if session else None) or "America/Denver"
     lines = [f"Gym: {gym_name}", f"Timezone: {tz}"]
     # Default gym coordinates (Boulder, CO) for weather MCP calls.
-    lines.append("GymLatLon: 40.015, -105.2705")
+    lines.append("GymLatLon: 40.03781, -105.05228")
     if session and session.userName:
         lines.append(f"UserName: {session.userName}")
     if session and session.userGoals:
@@ -752,6 +752,58 @@ def _looks_like_meal_text(text: str) -> bool:
     return any(w in t for w in foodish)
 
 
+def _looks_like_weight_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t or t.startswith("/") or t.startswith("__"):
+        return False
+    # Explicit units are strongest.
+    if " lb" in t or " lbs" in t or "kg" in t or "pounds" in t:
+        return True
+    # "weight 182.4" style
+    if "weight" in t:
+        # require a plausible numeric token
+        import re
+
+        return re.search(r"\b\d{2,3}(\.\d)?\b", t) is not None
+    return False
+
+
+def _parse_weight_from_text(text: str) -> tuple[Optional[float], Optional[float]]:
+    """
+    Return (weightKg, weightLb). If ambiguous, prefer pounds for US-localized casual logs.
+    """
+    import re
+
+    t = (text or "").strip().lower()
+    if not t:
+        return None, None
+
+    m = re.search(r"\b(\d{2,3}(?:\.\d)?)\s*(kg|kgs|kilograms?)\b", t)
+    if m:
+        try:
+            return float(m.group(1)), None
+        except Exception:
+            return None, None
+
+    m = re.search(r"\b(\d{2,3}(?:\.\d)?)\s*(lb|lbs|pounds?)\b", t)
+    if m:
+        try:
+            return None, float(m.group(1))
+        except Exception:
+            return None, None
+
+    # If the user says "weight 182.4" without units, assume lb.
+    if "weight" in t:
+        m = re.search(r"\b(\d{2,3}(?:\.\d)?)\b", t)
+        if m:
+            try:
+                return None, float(m.group(1))
+            except Exception:
+                return None, None
+
+    return None, None
+
+
 def _weight_scope_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
     if not session or not isinstance(session.waiver, dict):
         return None
@@ -854,6 +906,100 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
         last_imported = max(last_imported, mid_i)
 
     integrations["telegramMeals"] = {
+        **tg_state,
+        "chatTitle": "Smart Agent",
+        "chatId": chat_id,
+        "lastImportedMessageId": last_imported,
+        "lastCheckedAtISO": _now_iso(),
+    }
+    bundle["integrations"] = integrations
+    return bundle, imported
+
+
+async def _auto_import_telegram_weight_texts(session: Optional["Session"], bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """
+    Scan the Telegram chat titled "Smart Agent" for weigh-in-like texts and import them into weight-mcp.
+    Uses GoalBundle.integrations to remember the last imported message id.
+    """
+    scope = _weight_scope_from_session(session)
+    if not scope:
+        return bundle, []
+
+    integrations = bundle.get("integrations") if isinstance(bundle.get("integrations"), dict) else {}
+    tg_state = integrations.get("telegramWeights") if isinstance(integrations.get("telegramWeights"), dict) else {}
+    last_id = tg_state.get("lastImportedMessageId")
+    last_imported = int(last_id) if isinstance(last_id, (int, float)) else 0
+
+    chats = await _telegram_call_json("telegram_list_chats", {"limit": 200}) or {}
+    chat_list = chats.get("chats") if isinstance(chats, dict) else None
+    chat_id: Optional[str] = None
+    if isinstance(chat_list, list):
+        for c in chat_list:
+            if not isinstance(c, dict):
+                continue
+            title = str(c.get("title") or "").strip()
+            if title.lower() == "smart agent":
+                chat_id = str(c.get("chatId") or "").strip() or None
+                break
+    if not chat_id:
+        return bundle, []
+
+    msgs = await _telegram_call_json(
+        "telegram_list_messages",
+        {"chatId": chat_id, "limit": 50, "includeImageUrls": False, "includeImageBytes": False},
+    ) or {}
+    items = msgs.get("messages") if isinstance(msgs, dict) else None
+    if not isinstance(items, list) or not items:
+        return bundle, []
+
+    candidates: list[dict[str, Any]] = []
+    for m in items:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("messageId")
+        if not isinstance(mid, (int, float)):
+            continue
+        mid_i = int(mid)
+        if mid_i <= last_imported:
+            continue
+        txt = m.get("text")
+        if not isinstance(txt, str) or not _looks_like_weight_text(txt):
+            continue
+        kg, lb = _parse_weight_from_text(txt)
+        if kg is None and lb is None:
+            continue
+        candidates.append({"messageId": mid_i, "dateUnix": m.get("dateUnix"), "text": txt, "kg": kg, "lb": lb})
+
+    if not candidates:
+        integrations["telegramWeights"] = {**tg_state, "chatTitle": "Smart Agent", "chatId": chat_id, "lastCheckedAtISO": _now_iso()}
+        bundle["integrations"] = integrations
+        return bundle, []
+
+    candidates.sort(key=lambda x: int(x.get("messageId") or 0))
+
+    imported: list[dict[str, Any]] = []
+    for c in candidates[:20]:
+        mid_i = int(c["messageId"])
+        du = c.get("dateUnix")
+        at_ms = int(du) * 1000 if isinstance(du, (int, float)) else int(datetime.now(timezone.utc).timestamp() * 1000)
+        kg = c.get("kg")
+        lb = c.get("lb")
+        args: dict[str, Any] = {
+            "scope": scope,
+            "atMs": at_ms,
+            "source": "telegram_text",
+            "sourceRef": {"chatId": chat_id, "messageId": mid_i},
+        }
+        if isinstance(kg, float) or isinstance(kg, int):
+            args["weightKg"] = float(kg)
+        if isinstance(lb, float) or isinstance(lb, int):
+            args["weightLb"] = float(lb)
+        res = await _weight_call_json("weight_log_weight", args)
+        if isinstance(res, dict) and res.get("ok") is True:
+            imported.append({"messageId": mid_i, "atMs": res.get("at_ms"), "weightKg": res.get("weight_kg")})
+        last_imported = max(last_imported, mid_i)
+
+    integrations["telegramWeights"] = {
         **tg_state,
         "chatTitle": "Smart Agent",
         "chatId": chat_id,
@@ -1165,11 +1311,41 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         args_schema=OpsReserveClassArgs,
     )
 
+    class FitnessSnapshotArgs(BaseModel):
+        accountAddress: str = Field(min_length=3, description="Canonical account address (used as weight-management scope id).")
+        dateISO: Optional[str] = Field(default=None, description="Local date (YYYY-MM-DD). Defaults to today in tzName.")
+        tzName: Optional[str] = Field(default="America/Denver", description="IANA timezone name for date defaulting.")
+
+    async def fitness_snapshot(accountAddress: str, dateISO: Optional[str] = None, tzName: str = "America/Denver") -> str:
+        tz = ZoneInfo(tzName or "UTC")
+        if not dateISO or not isinstance(dateISO, str) or not dateISO.strip():
+            dateISO = datetime.now(tz=tz).date().isoformat()
+        scope = {"accountAddress": accountAddress.strip()}
+        day = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": dateISO}) or {}
+        workout = await _strava_call_json("strava_latest_workout", {}) or {}
+        return json.dumps(
+            {
+                "asOfISO": _now_iso(),
+                "dateISO": dateISO,
+                "weightDaySummary": day,
+                "latestWorkout": workout,
+            },
+            indent=2,
+        )
+
+    fitness_snapshot_tool = StructuredTool.from_function(
+        name="fitness_snapshot",
+        description="Return a combined snapshot: today's weight-management day summary + latest Strava workout for an accountAddress.",
+        coroutine=fitness_snapshot,
+        args_schema=FitnessSnapshotArgs,
+    )
+
     tools = [
         knowledge_tool,
         ops_class_search_tool,
         ops_class_tool,
         ops_reserve_class_tool,
+        fitness_snapshot_tool,
     ]
     return tools, trace
 
@@ -1599,11 +1775,16 @@ async def run(input: Input) -> Output:
     had_session_goal_bundle = bool(input.session and isinstance(getattr(input.session, "goalBundle", None), dict))
     base_goal_bundle = copy.deepcopy(_session_goal_bundle(input.session))
     imported_meals: list[dict[str, Any]] = []
+    imported_weights: list[dict[str, Any]] = []
     if not msg.startswith("__"):
         try:
             base_goal_bundle, imported_meals = await _auto_import_telegram_meal_texts(input.session, base_goal_bundle)
         except Exception:
             imported_meals = []
+        try:
+            base_goal_bundle, imported_weights = await _auto_import_telegram_weight_texts(input.session, base_goal_bundle)
+        except Exception:
+            imported_weights = []
 
     tools, trace = make_tools()
     mcp_tools = await load_mcp_tools_from_env()
@@ -1703,6 +1884,17 @@ async def run(input: Input) -> Output:
         ops_freshness = {"asOfISO": trace.ops_as_of, "endpoints": sorted(list(trace.ops_endpoints))}
 
     weather_freshness = None
+
+    if imported_weights:
+        wparts = []
+        for it in imported_weights[:5]:
+            if not isinstance(it, dict):
+                continue
+            wk = it.get("weightKg")
+            if isinstance(wk, (int, float)):
+                wparts.append(f"{float(wk):.1f} kg")
+        wsuffix = f": {', '.join(wparts)}" if wparts else ""
+        answer = (answer.rstrip() + f"\n\nImported {len(imported_weights)} weigh-in(s) from Telegram (Smart Agent){wsuffix}.").strip()
 
     if imported_meals:
         parts = []

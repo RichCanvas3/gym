@@ -77,7 +77,7 @@ export default function ShopPage() {
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Shop</h1>
             <p className="text-sm text-zinc-600 dark:text-zinc-400">
-              Memberships, access packs, coaching, camps, and gear.
+              Memberships, drop-in access, programs, lessons, and rentals.
             </p>
           </div>
           <div className="flex items-center gap-2">

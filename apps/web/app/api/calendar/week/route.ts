@@ -20,7 +20,7 @@ export async function GET(req: Request) {
     headers: { "content-type": "application/json", "x-api-key": apiKey },
     body: JSON.stringify({
       assistant_id: assistantId,
-      input: { message: msg, session: { gymName: "Front Range Climbing (Boulder)", timezone: "America/Denver" } },
+      input: { message: msg, session: { gymName: "Erie Community Center", timezone: "America/Denver" } },
     }),
   });
 

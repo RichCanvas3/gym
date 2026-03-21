@@ -102,7 +102,7 @@ export default function ChatPage() {
           body: JSON.stringify({
             message: "__CHAT_HISTORY__",
             session: {
-              gymName: "Front Range Climbing (Boulder)",
+              gymName: "Erie Community Center",
               timezone: "America/Denver",
               threadId: tid,
               goalBundle: goalBundle ?? undefined,
@@ -183,7 +183,7 @@ export default function ChatPage() {
       const body = {
         message: text,
         session: {
-          gymName: "Front Range Climbing (Boulder)",
+          gymName: "Erie Community Center",
           timezone: "America/Denver",
           cartLines: lines,
           threadId: threadId || "thr_demo",
@@ -291,7 +291,7 @@ export default function ChatPage() {
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-10">
         <header className="flex flex-col gap-1">
           <div className="flex items-center justify-between gap-4">
-            <h1 className="text-2xl font-semibold tracking-tight">Climb Gym Copilot</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">Erie Rec Center Copilot</h1>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => void toggleSkills()}

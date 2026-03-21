@@ -478,7 +478,7 @@ function CalendarInner() {
                                           body: JSON.stringify({
                                             message: `__RESERVE_CLASS__:${c.id}`,
                                             session: {
-                                              gymName: "Front Range Climbing (Boulder)",
+                                              gymName: "Erie Community Center",
                                               timezone: "America/Denver",
                                               threadId: waiver?.accountAddress ? `thr_${waiver.accountAddress}` : undefined,
                                               waiver: {

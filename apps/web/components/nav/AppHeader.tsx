@@ -20,7 +20,7 @@ export function AppHeader() {
       <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-3 px-4 py-3">
         <Link href="/" className="flex items-center gap-2 text-sm font-semibold tracking-tight">
           <CalendarDays className="h-4 w-4 text-zinc-700 dark:text-zinc-200" aria-hidden="true" />
-          Climb Gym Copilot
+          Erie Rec Center Copilot
         </Link>
 
         <div className="flex items-center gap-2">
