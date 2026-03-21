@@ -7,6 +7,8 @@ export default defineConfig({
     globals: true,
     restoreMocks: true,
     clearMocks: true,
+    include: ["**/*.test.{ts,tsx}"],
+    exclude: ["e2e/**", "**/node_modules/**", "**/.next/**"],
   },
 });
 
