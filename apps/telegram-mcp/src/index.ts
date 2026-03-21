@@ -9,9 +9,16 @@ const TELEGRAM_URI_SUFFIX = "/messages";
 export type Env = {
   MCP_API_KEY?: string;
   DB: D1Database;
+  MEDIA_TOKEN_RESOLVER: DurableObjectNamespace;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   MCP_SESSION_ID?: string; // set from mcp-session-id header for subscribe + pending flush
+  /** Base URL of this worker (no trailing slash), e.g. https://gym-telegram-mcp.xxx.workers.dev — required for public image URLs in message JSON */
+  PUBLIC_BASE_URL?: string;
+  /** Alias for PUBLIC_BASE_URL */
+  TELEGRAM_MCP_PUBLIC_URL?: string;
+  /** Set to `1` with a wrangler `triggers.crons` entry to run Smart Agent image backfill on schedule */
+  TELEGRAM_CRON_BACKFILL?: string;
 };
 
 function nowISO() {
@@ -46,6 +53,289 @@ async function tgCall(env: Env, method: string, payload: unknown) {
     throw new Error(`Telegram ${method} failed: ${JSON.stringify(json)}`);
   }
   return json;
+}
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGES_PER_RESPONSE = 20;
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.byteLength; i++) s += String.fromCharCode(bytes[i]!);
+  return btoa(s);
+}
+
+function mimeFromFilePath(filePath: string): string {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  return "image/jpeg";
+}
+
+/** Largest Telegram photo variant (last in array). */
+function largestPhotoFileId(raw: any): string | null {
+  const photos = raw?.photo;
+  if (!Array.isArray(photos) || photos.length === 0) return null;
+  const last = photos[photos.length - 1];
+  const fid = last?.file_id;
+  return typeof fid === "string" && fid.length > 0 ? fid : null;
+}
+
+/** Image document (e.g. sent as file). */
+function imageDocumentFileId(raw: any): string | null {
+  const doc = raw?.document;
+  if (!doc || typeof doc !== "object") return null;
+  const mt = String(doc.mime_type ?? "");
+  if (!mt.startsWith("image/")) return null;
+  const fid = doc.file_id;
+  return typeof fid === "string" ? fid : null;
+}
+
+function publicBaseUrl(env: Env): string {
+  return (env.PUBLIC_BASE_URL ?? env.TELEGRAM_MCP_PUBLIC_URL ?? "").trim().replace(/\/$/, "");
+}
+
+const MEDIA_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function registerMediaToken(env: Env, fileId: string): Promise<{ url: string } | { error: string }> {
+  const base = publicBaseUrl(env);
+  if (!base) {
+    console.warn(
+      "[telegram-mcp] media: skip register — PUBLIC_BASE_URL / TELEGRAM_MCP_PUBLIC_URL not set (no public image URL)",
+    );
+    return { error: "Set PUBLIC_BASE_URL or TELEGRAM_MCP_PUBLIC_URL on the worker (e.g. https://gym-telegram-mcp.xxx.workers.dev) for image URLs" };
+  }
+  const token = crypto.randomUUID();
+  const now = nowISO();
+  const exp = new Date(Date.now() + MEDIA_TOKEN_TTL_MS).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO telegram_media_tokens (token, file_id, created_at_iso, expires_at_iso) VALUES (?, ?, ?, ?)`,
+  )
+    .bind(token, fileId, now, exp)
+    .run();
+  // Write-through to a single DO (strongly consistent) so other colos can resolve immediately.
+  try {
+    const id = env.MEDIA_TOKEN_RESOLVER.idFromName("global");
+    const stub = env.MEDIA_TOKEN_RESOLVER.get(id);
+    const u = new URL("https://media-token-resolver/put");
+    await stub.fetch(u.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token, file_id: fileId, expires_at_iso: exp }),
+    });
+  } catch (e) {
+    console.warn(`[telegram-mcp] media: DO write-through failed: ${String((e as Error)?.message ?? e)}`);
+  }
+  const url = `${base}/telegram/media/${token}`;
+  console.log(
+    `[telegram-mcp] media: DB insert token ok → public url=${url} file_id=${fileId.slice(0, 24)}${fileId.length > 24 ? "…" : ""}`,
+  );
+  return { url };
+}
+
+/** Stream file body from Telegram (for public GET). */
+async function streamTelegramFileFromTelegram(
+  env: Env,
+  fileId: string,
+): Promise<{ body: ReadableStream<Uint8Array>; mimeType: string } | { error: string }> {
+  try {
+    const json = (await tgCall(env, "getFile", { file_id: fileId })) as any;
+    const fp = json?.result?.file_path;
+    if (typeof fp !== "string" || !fp.trim()) return { error: "getFile: missing file_path" };
+    const bot = (env.TELEGRAM_BOT_TOKEN ?? "").trim();
+    const fileUrl = `https://api.telegram.org/file/bot${bot}/${fp}`;
+    const res = await fetch(fileUrl);
+    if (!res.ok) return { error: `Telegram file fetch failed: ${res.status}` };
+    if (!res.body) return { error: "Empty body" };
+    const mimeType = mimeFromFilePath(fp);
+    return { body: res.body as ReadableStream<Uint8Array>, mimeType };
+  } catch (e) {
+    return { error: String((e as Error)?.message ?? e) };
+  }
+}
+
+async function downloadTelegramFile(
+  env: Env,
+  fileId: string,
+): Promise<{ base64: string; mimeType: string; byteLength: number } | { error: string }> {
+  try {
+    const json = (await tgCall(env, "getFile", { file_id: fileId })) as any;
+    const fp = json?.result?.file_path;
+    if (typeof fp !== "string" || !fp.trim()) return { error: "getFile: missing file_path" };
+    const token = (env.TELEGRAM_BOT_TOKEN ?? "").trim();
+    const fileUrl = `https://api.telegram.org/file/bot${token}/${fp}`;
+    const res = await fetch(fileUrl);
+    if (!res.ok) return { error: `file download failed: ${res.status}` };
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (buf.byteLength > MAX_IMAGE_BYTES) {
+      return { error: `file too large (${buf.byteLength} bytes, max ${MAX_IMAGE_BYTES})` };
+    }
+    const mimeType = mimeFromFilePath(fp);
+    return { base64: bytesToBase64(buf), mimeType, byteLength: buf.byteLength };
+  } catch (e) {
+    return { error: String((e as Error)?.message ?? e) };
+  }
+}
+
+const MEDIA_404_HEADERS = { "cache-control": "no-store", "CDN-Cache-Control": "no-store" };
+const MEDIA_410_HEADERS = { "cache-control": "no-store", "CDN-Cache-Control": "no-store" };
+
+async function handleTelegramMediaGet(env: Env, request: Request, token: string): Promise<Response> {
+  let row = await env.DB.prepare(`SELECT file_id, expires_at_iso FROM telegram_media_tokens WHERE token = ? LIMIT 1`)
+    .bind(token)
+    .first<{ file_id: string; expires_at_iso: string }>();
+  // D1 reads can be inconsistent across colos shortly after writes. If this edge misses,
+  // consult a single durable object which does the lookup from its pinned colo.
+  if (!row) {
+    try {
+      const id = env.MEDIA_TOKEN_RESOLVER.idFromName("global");
+      const stub = env.MEDIA_TOKEN_RESOLVER.get(id);
+      const u = new URL("https://media-token-resolver/resolve");
+      u.searchParams.set("token", token);
+      const rr = await stub.fetch(u.toString(), { method: "GET" });
+      if (rr.ok) {
+        const j = (await rr.json().catch(() => null)) as null | { file_id?: string; expires_at_iso?: string };
+        if (j?.file_id) {
+          row = { file_id: String(j.file_id), expires_at_iso: String(j.expires_at_iso ?? "") };
+          console.log(`[telegram-mcp] media: DO resolver hit token=${token.slice(0, 8)}…`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[telegram-mcp] media: DO resolver failed: ${String((e as Error)?.message ?? e)}`);
+    }
+  }
+  if (!row) {
+    console.warn(
+      `[telegram-mcp] media: GET unknown token len=${token.length} id=${token} url=${request.url.slice(0, 160)}`,
+    );
+    return new Response("Not found", { status: 404, headers: MEDIA_404_HEADERS });
+  }
+  if (row.expires_at_iso && new Date(row.expires_at_iso) < new Date()) {
+    await env.DB.prepare(`DELETE FROM telegram_media_tokens WHERE token = ?`).bind(token).run();
+    console.warn(`[telegram-mcp] media: GET expired token prefix=${token.slice(0, 8)}…`);
+    return new Response("Expired", { status: 410, headers: MEDIA_410_HEADERS });
+  }
+  console.log(
+    `[telegram-mcp] media: GET proxy Telegram file token=${token.slice(0, 8)}… file_id=${row.file_id.slice(0, 20)}…`,
+  );
+  const streamed = await streamTelegramFileFromTelegram(env, row.file_id);
+  if ("error" in streamed) {
+    console.warn(`[telegram-mcp] media: GET stream failed: ${streamed.error}`);
+    return new Response(streamed.error, {
+      status: 502,
+      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
+  return new Response(streamed.body, {
+    headers: {
+      "content-type": streamed.mimeType,
+      "cache-control": "public, max-age=3600",
+      "access-control-allow-origin": "*",
+    },
+  });
+}
+
+export class MediaTokenResolver {
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Env,
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/put") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      const body = (await request.json().catch(() => null)) as null | { token?: string; file_id?: string; expires_at_iso?: string };
+      const token = (body?.token ?? "").trim();
+      const fileId = (body?.file_id ?? "").trim();
+      const exp = (body?.expires_at_iso ?? "").trim();
+      if (!token || !fileId) return new Response("Missing token/file_id", { status: 400 });
+      await this.state.storage.put(`t:${token}`, { file_id: fileId, expires_at_iso: exp });
+      return new Response("ok", { status: 200 });
+    }
+    if (url.pathname === "/resolve") {
+      if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const token = (url.searchParams.get("token") ?? "").trim();
+      if (!token) return new Response("Missing token", { status: 400 });
+
+      const cached = (await this.state.storage.get<{ file_id?: string; expires_at_iso?: string }>(`t:${token}`)) ?? null;
+      if (cached?.file_id) {
+        return new Response(JSON.stringify(cached), { headers: { "content-type": "application/json; charset=utf-8" } });
+      }
+
+      const row = await this.env.DB.prepare(
+        `SELECT file_id, expires_at_iso FROM telegram_media_tokens WHERE token = ? LIMIT 1`,
+      )
+        .bind(token)
+        .first<{ file_id: string; expires_at_iso: string }>();
+      if (!row) return new Response("Not found", { status: 404 });
+      await this.state.storage.put(`t:${token}`, row);
+      return new Response(JSON.stringify(row), { headers: { "content-type": "application/json; charset=utf-8" } });
+    }
+    return new Response("Not found", { status: 404 });
+  }
+}
+
+type MessageRow = {
+  message_id: unknown;
+  message_thread_id?: unknown;
+  from_user_id?: unknown;
+  date_unix?: unknown;
+  text?: unknown;
+  raw_json?: unknown;
+};
+
+async function mapMessageRowToPayload(
+  env: Env,
+  r: MessageRow,
+  opts: { includeImageUrls: boolean; includeImageBytes: boolean },
+  imageBudget: { remaining: number },
+): Promise<Record<string, unknown>> {
+  let raw: Record<string, unknown> = {};
+  try {
+    if (typeof r.raw_json === "string") raw = JSON.parse(r.raw_json) as Record<string, unknown>;
+    else if (r.raw_json && typeof r.raw_json === "object") raw = r.raw_json as Record<string, unknown>;
+  } catch {
+    raw = {};
+  }
+  const out: Record<string, unknown> = {
+    messageId: Number(r.message_id ?? 0),
+    messageThreadId:
+      r.message_thread_id !== null && r.message_thread_id !== undefined ? Number(r.message_thread_id) : null,
+    fromUserId: r.from_user_id !== null && r.from_user_id !== undefined ? Number(r.from_user_id) : null,
+    dateUnix: r.date_unix !== null && r.date_unix !== undefined ? Number(r.date_unix) : null,
+    text: r.text != null ? String(r.text) : null,
+  };
+  if ((!opts.includeImageUrls && !opts.includeImageBytes) || imageBudget.remaining <= 0) return out;
+
+  const fileId = largestPhotoFileId(raw) ?? imageDocumentFileId(raw);
+  if (!fileId) return out;
+
+  imageBudget.remaining -= 1;
+  const image: Record<string, unknown> = { fileId };
+
+  if (opts.includeImageUrls) {
+    const reg = await registerMediaToken(env, fileId);
+    if ("error" in reg) image.urlError = reg.error;
+    else {
+      image.url = reg.url;
+      image.imageUrl = reg.url;
+      out.imageUrl = reg.url;
+    }
+  }
+
+  if (opts.includeImageBytes) {
+    const dl = await downloadTelegramFile(env, fileId);
+    if ("error" in dl) image.bytesError = dl.error;
+    else {
+      image.mimeType = dl.mimeType;
+      image.byteLength = dl.byteLength;
+      image.bytesBase64 = dl.base64;
+    }
+  }
+
+  out.image = image;
+  return out;
 }
 
 async function upsertChat(env: Env, chat: any) {
@@ -87,7 +377,12 @@ async function insertMessage(env: Env, msg: any) {
   const id = `${chat_id}:${messageId}${message_thread_id != null ? `:${message_thread_id}` : ""}`;
   const from_user_id = numOrNull(msg?.from?.id);
   const date_unix = numOrNull(msg?.date);
-  const text = typeof msg?.text === "string" ? msg.text : null;
+  const text =
+    typeof msg?.text === "string"
+      ? msg.text
+      : typeof msg?.caption === "string"
+        ? msg.caption
+        : null;
   const ts = nowISO();
   await env.DB.prepare(
     `INSERT OR IGNORE INTO telegram_messages (
@@ -167,6 +462,16 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
     await insertMessage(env, msg);
     chatId = String(msg.chat?.id ?? "");
     title = msg.chat?.title ? String(msg.chat.title) : null;
+    const hasPhoto = Array.isArray(msg?.photo) && msg.photo.length > 0;
+    const hasImageDoc =
+      msg?.document &&
+      typeof msg.document === "object" &&
+      String((msg.document as { mime_type?: string }).mime_type ?? "").startsWith("image/");
+    if (hasPhoto || hasImageDoc) {
+      console.log(
+        `[telegram-mcp] webhook: stored message with image chat_id=${chatId} message_id=${msg?.message_id} kind=${hasPhoto ? "photo" : "image_document"} (raw in D1; URLs created when tools/resources request images)`,
+      );
+    }
   } else if (chatFromMember) {
     await upsertChat(env, chatFromMember);
     chatId = String(chatFromMember?.id ?? "");
@@ -191,6 +496,72 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
   }
 
   return new Response("ok", { status: 200 });
+}
+
+const SMART_AGENT_CHAT_TITLE = "Smart Agent";
+const MAX_BACKFILL_IMAGES = 120;
+
+/** Register media tokens for unique image file_ids in "Smart Agent" chat (for testing + tail). Dedupes by file_id. */
+async function backfillSmartAgentImages(env: Env): Promise<{
+  ok: boolean;
+  chatId: string | null;
+  error?: string;
+  imageCount: number;
+  urls: string[];
+  publicBaseUrl: string | null;
+}> {
+  const base = publicBaseUrl(env) || null;
+  if (!base) {
+    const err = "Set PUBLIC_BASE_URL or TELEGRAM_MCP_PUBLIC_URL before backfill";
+    console.warn(`[telegram-mcp] backfill: ${err}`);
+    return { ok: false, chatId: null, error: err, imageCount: 0, urls: [], publicBaseUrl: null };
+  }
+  const chatRow = await env.DB.prepare(`SELECT chat_id FROM telegram_chats WHERE title = ? LIMIT 1`)
+    .bind(SMART_AGENT_CHAT_TITLE)
+    .first<{ chat_id: string }>();
+  if (!chatRow) {
+    console.warn(`[telegram-mcp] backfill: no chat titled "${SMART_AGENT_CHAT_TITLE}" in telegram_chats (receive messages first)`);
+    return {
+      ok: false,
+      chatId: null,
+      error: `Chat "${SMART_AGENT_CHAT_TITLE}" not found in DB`,
+      imageCount: 0,
+      urls: [],
+      publicBaseUrl: base,
+    };
+  }
+  console.log(`[telegram-mcp] backfill: start chat_id=${chatRow.chat_id} title="${SMART_AGENT_CHAT_TITLE}"`);
+  const res = await env.DB.prepare(
+    `SELECT message_id, raw_json FROM telegram_messages WHERE chat_id = ? ORDER BY date_unix DESC LIMIT 500`,
+  )
+    .bind(chatRow.chat_id)
+    .all();
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const r of (res.results ?? []) as { message_id: unknown; raw_json: unknown }[]) {
+    if (urls.length >= MAX_BACKFILL_IMAGES) break;
+    let raw: Record<string, unknown> = {};
+    try {
+      if (typeof r.raw_json === "string") raw = JSON.parse(r.raw_json) as Record<string, unknown>;
+      else if (r.raw_json && typeof r.raw_json === "object") raw = r.raw_json as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const fileId = largestPhotoFileId(raw) ?? imageDocumentFileId(raw);
+    if (!fileId || seen.has(fileId)) continue;
+    seen.add(fileId);
+    const reg = await registerMediaToken(env, fileId);
+    if ("error" in reg) {
+      console.warn(`[telegram-mcp] backfill: skip message_id=${r.message_id}: ${reg.error}`);
+      continue;
+    }
+    urls.push(reg.url);
+    console.log(`[telegram-mcp] backfill: sample url (message_id=${r.message_id}) ${reg.url}`);
+  }
+  console.log(
+    `[telegram-mcp] backfill: complete unique_images=${urls.length} publicBaseUrl=${base} firstUrl=${urls[0] ?? "(none)"}`,
+  );
+  return { ok: true, chatId: chatRow.chat_id, imageCount: urls.length, urls, publicBaseUrl: base };
 }
 
 function createServer(env: Env) {
@@ -228,16 +599,16 @@ function createServer(env: Env) {
     const chatId = await uriToChatId(uri.toString(), env);
     if (!chatId) return { contents: [{ uri: uri.toString(), mimeType: "text/plain", text: "Chat not found" }] };
     const res = await env.DB.prepare(
-      `SELECT message_id, from_user_id, date_unix, text FROM telegram_messages WHERE chat_id = ? ORDER BY date_unix DESC LIMIT 50`,
+      `SELECT message_id, message_thread_id, from_user_id, date_unix, text, raw_json FROM telegram_messages WHERE chat_id = ? ORDER BY date_unix DESC LIMIT 50`,
     )
       .bind(chatId)
       .all();
-    const messages = (res.results ?? []).map((r: any) => ({
-      messageId: r.message_id,
-      fromUserId: r.from_user_id,
-      dateUnix: r.date_unix,
-      text: r.text,
-    }));
+    const budget = { remaining: MAX_IMAGES_PER_RESPONSE };
+    const rows = (res.results ?? []) as MessageRow[];
+    const messages: Record<string, unknown>[] = [];
+    for (const r of rows) {
+      messages.push(await mapMessageRowToPayload(env, r, { includeImageUrls: true, includeImageBytes: false }, budget));
+    }
     return {
       contents: [{ uri: uri.toString(), mimeType: "application/json", text: jsonText({ chatId, messages }) }],
     };
@@ -420,39 +791,51 @@ function createServer(env: Env) {
 
   server.tool(
     "telegram_list_messages",
-    "List stored messages for a chat (from D1).",
+    "List stored messages for a chat (from D1). Photo/image messages include image.url and image.imageUrl (public worker URL) when PUBLIC_BASE_URL is set. Optional includeImageBytes for base64.",
     {
       chatId: z.union([z.string().min(1), z.number().int()]),
       limit: z.number().int().positive().max(200).optional(),
+      includeImageUrls: z.boolean().optional(),
+      includeImageBytes: z.boolean().optional(),
     },
     async (args) => {
       const p = z
-        .object({ chatId: z.union([z.string().min(1), z.number().int()]), limit: z.number().int().positive().max(200).optional() })
+        .object({
+          chatId: z.union([z.string().min(1), z.number().int()]),
+          limit: z.number().int().positive().max(200).optional(),
+          includeImageUrls: z.boolean().optional(),
+          includeImageBytes: z.boolean().optional(),
+        })
         .parse(args);
       const chatId = String(p.chatId);
+      const includeUrls = p.includeImageUrls !== false;
+      const includeBytes = p.includeImageBytes === true;
       const res = await env.DB.prepare(
         `SELECT message_id, message_thread_id, from_user_id, date_unix, text, raw_json FROM telegram_messages WHERE chat_id = ? ORDER BY date_unix DESC LIMIT ?`,
       )
         .bind(chatId, p.limit ?? 50)
         .all();
-      const messages = (res.results ?? []).map((r: any) => ({
-        messageId: Number(r.message_id ?? 0),
-        messageThreadId: r.message_thread_id !== null && r.message_thread_id !== undefined ? Number(r.message_thread_id) : null,
-        fromUserId: r.from_user_id !== null && r.from_user_id !== undefined ? Number(r.from_user_id) : null,
-        dateUnix: r.date_unix !== null && r.date_unix !== undefined ? Number(r.date_unix) : null,
-        text: r.text ? String(r.text) : null,
-      }));
+      const budget = { remaining: MAX_IMAGES_PER_RESPONSE };
+      const rows = (res.results ?? []) as MessageRow[];
+      const messages: Record<string, unknown>[] = [];
+      for (const r of rows) {
+        messages.push(
+          await mapMessageRowToPayload(env, r, { includeImageUrls: includeUrls, includeImageBytes: includeBytes }, budget),
+        );
+      }
       return { content: [{ type: "text", text: jsonText({ chatId, messages }) }] };
     },
   );
 
   server.tool(
     "telegram_search_messages",
-    "Search stored messages by substring (from D1).",
+    "Search stored messages by substring (from D1). Same image url / optional bytes behavior as telegram_list_messages.",
     {
       query: z.string().min(1),
       chatId: z.union([z.string().min(1), z.number().int()]).optional(),
       limit: z.number().int().positive().max(100).optional(),
+      includeImageUrls: z.boolean().optional(),
+      includeImageBytes: z.boolean().optional(),
     },
     async (args) => {
       const p = z
@@ -460,11 +843,15 @@ function createServer(env: Env) {
           query: z.string().min(1),
           chatId: z.union([z.string().min(1), z.number().int()]).optional(),
           limit: z.number().int().positive().max(100).optional(),
+          includeImageUrls: z.boolean().optional(),
+          includeImageBytes: z.boolean().optional(),
         })
         .parse(args);
       const q = `%${p.query}%`;
+      const includeUrls = p.includeImageUrls !== false;
+      const includeBytes = p.includeImageBytes === true;
       const res = await env.DB.prepare(
-        `SELECT chat_id, message_id, message_thread_id, date_unix, text
+        `SELECT chat_id, message_id, message_thread_id, from_user_id, date_unix, text, raw_json
          FROM telegram_messages
          WHERE (? IS NULL OR chat_id = ?)
            AND text LIKE ?
@@ -473,13 +860,17 @@ function createServer(env: Env) {
       )
         .bind(p.chatId ? String(p.chatId) : null, p.chatId ? String(p.chatId) : null, q, p.limit ?? 25)
         .all();
-      const hits = (res.results ?? []).map((r: any) => ({
-        chatId: String(r.chat_id ?? ""),
-        messageId: Number(r.message_id ?? 0),
-        messageThreadId: r.message_thread_id !== null && r.message_thread_id !== undefined ? Number(r.message_thread_id) : null,
-        dateUnix: r.date_unix !== null && r.date_unix !== undefined ? Number(r.date_unix) : null,
-        text: r.text ? String(r.text) : null,
-      }));
+      const budget = { remaining: MAX_IMAGES_PER_RESPONSE };
+      const hits: Record<string, unknown>[] = [];
+      for (const r of (res.results ?? []) as any[]) {
+        const payload = await mapMessageRowToPayload(
+          env,
+          r as MessageRow,
+          { includeImageUrls: includeUrls, includeImageBytes: includeBytes },
+          budget,
+        );
+        hits.push({ chatId: String(r.chat_id ?? ""), ...payload });
+      }
       return { content: [{ type: "text", text: jsonText({ hits }) }] };
     },
   );
@@ -564,12 +955,45 @@ async function prependNotificationEvents(
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
+    // Public image proxy (no API key) — JSON messages reference image.url / image.imageUrl
+    if (request.method === "GET" && url.pathname.startsWith("/telegram/media/")) {
+      const token = url.pathname.replace(/^\/telegram\/media\//, "").split("/")[0]?.trim() ?? "";
+      if (token) {
+        try {
+          return await handleTelegramMediaGet(env, request, token);
+        } catch (e) {
+          return new Response(String((e as Error)?.message ?? e), { status: 500 });
+        }
+      }
+    }
     if (url.pathname === "/telegram/webhook" && request.method === "POST") {
       try {
         return await handleWebhook(request, env);
       } catch (e) {
         return new Response(jsonText({ error: String((e as any)?.message ?? e ?? "webhook error") }), {
           status: 500,
+          headers: { "content-type": "application/json" },
+        });
+      }
+    }
+
+    // Backfill image tokens for "Smart Agent" — requires x-api-key (same as MCP). Workers have no true "startup"; call after deploy or add a cron (see scheduled).
+    if (
+      url.pathname === "/telegram/internal/backfill-smart-agent" &&
+      (request.method === "POST" || request.method === "GET")
+    ) {
+      try {
+        await requireApiKey(request, env);
+        const result = await backfillSmartAgentImages(env);
+        return new Response(jsonText(result), {
+          status: result.ok ? 200 : 422,
+          headers: { "content-type": "application/json" },
+        });
+      } catch (e) {
+        const msg = String((e as Error)?.message ?? e);
+        const status = msg.includes("Unauthorized") ? 401 : 500;
+        return new Response(jsonText({ error: msg }), {
+          status,
           headers: { "content-type": "application/json" },
         });
       }
@@ -617,6 +1041,20 @@ export default {
         headers: { "content-type": "application/json" },
       });
     }
+  },
+
+  /** Optional: add `"triggers": { "crons": ["0 4 * * *"] }` to wrangler to run backfill on a schedule (set TELEGRAM_CRON_BACKFILL=1). */
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    if (env.TELEGRAM_CRON_BACKFILL !== "1") {
+      console.log("[telegram-mcp] scheduled: skip backfill (set TELEGRAM_CRON_BACKFILL=1 to enable)");
+      return;
+    }
+    console.log(`[telegram-mcp] scheduled: cron ${event.cron} backfill Smart Agent`);
+    ctx.waitUntil(
+      backfillSmartAgentImages(env).catch((e) =>
+        console.error("[telegram-mcp] scheduled: backfill failed", e),
+      ),
+    );
   },
 };
 

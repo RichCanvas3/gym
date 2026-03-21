@@ -10,10 +10,45 @@ export type Env = {
   OAUTH_REDIRECT_URL?: string; // e.g. https://<worker>.workers.dev/oauth/callback
   WEB_SUCCESS_REDIRECT_URL?: string; // e.g. https://<web>/chat?connected=google
   TOKEN_ENCRYPTION_KEY_B64?: string; // base64(32 bytes)
+  /** If set, create/update/list use this calendar (e.g. myclaw calendar id); else "primary". */
+  TARGET_CALENDAR_ID?: string;
 };
 
 function nowISO() {
   return new Date().toISOString();
+}
+
+/** Calendar to use for create/list/update when TARGET_CALENDAR_ID is set (e.g. "myclaw" calendar). */
+function getTargetCalendarId(env: Env): string {
+  const id = (env.TARGET_CALENDAR_ID ?? "").trim();
+  return id || "primary";
+}
+
+/**
+ * Path segment for Calendar API: encode once. If TARGET_CALENDAR_ID was pasted URL-encoded
+ * (foo%40group.calendar.google.com), decode once first to avoid double-encoding → 404.
+ */
+function calendarIdForApiPath(raw: string): string {
+  let id = raw.trim();
+  if (!id) return encodeURIComponent("primary");
+  try {
+    if (id.includes("%")) {
+      const once = decodeURIComponent(id);
+      if (once !== id) id = once;
+    }
+  } catch {
+    // use raw
+  }
+  return encodeURIComponent(id);
+}
+
+function googleApiErrorHint(status: number, json: unknown, op: string): string {
+  const j = json as { error?: { message?: string } };
+  const msg = j?.error?.message ?? JSON.stringify(json);
+  if (status === 404) {
+    return `${op} failed (404 Not Found): ${msg}. If using TARGET_CALENDAR_ID: use the calendar **id** from googlecalendar_list_calendars (e.g. xxxxx@group.calendar.google.com), not the display name "myclaw". For updates: eventId must be on that same calendar (events from primary won’t exist on another calendar).`;
+  }
+  return `${op} failed (${status}): ${msg}`;
 }
 
 function jsonText(obj: unknown) {
@@ -222,8 +257,25 @@ function createServer(env: Env) {
   );
 
   server.tool(
+    "googlecalendar_list_calendars",
+    "List the user's calendars (id, summary). Use this to find the calendar id for a named calendar like 'myclaw' so you can set TARGET_CALENDAR_ID.",
+    { accountAddress: z.string().min(3) },
+    async (args) => {
+      const p = z.object({ accountAddress: z.string().min(3) }).parse(args);
+      const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
+      const res = await fetch("https://www.googleapis.com/calendar/v3/users/me/calendarList", {
+        headers: { authorization: `Bearer ${accessToken}` },
+      });
+      const json = (await res.json().catch(() => ({}))) as any;
+      if (!res.ok) throw new Error(`calendarList.list failed: ${JSON.stringify(json)}`);
+      const items = (json.items ?? []).map((c: any) => ({ id: c.id, summary: c.summary ?? c.id }));
+      return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), calendars: items }) }] };
+    },
+  );
+
+  server.tool(
     "googlecalendar_list_events",
-    "List events on the user's primary calendar in a time window.",
+    "List events on the target calendar (primary, or TARGET_CALENDAR_ID if set, e.g. myclaw) in a time window.",
     {
       accountAddress: z.string().min(3),
       timeMinISO: z.string().min(10),
@@ -242,7 +294,8 @@ function createServer(env: Env) {
         })
         .parse(args);
       const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
-      const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+      const calendarId = calendarIdForApiPath(getTargetCalendarId(env));
+      const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`);
       url.searchParams.set("timeMin", p.timeMinISO);
       url.searchParams.set("timeMax", p.timeMaxISO);
       url.searchParams.set("singleEvents", "true");
@@ -251,14 +304,14 @@ function createServer(env: Env) {
       if (p.q && p.q.trim()) url.searchParams.set("q", p.q.trim());
       const res = await fetch(url.toString(), { headers: { authorization: `Bearer ${accessToken}` } });
       const json = (await res.json().catch(() => ({}))) as any;
-      if (!res.ok) throw new Error(`events.list failed: ${JSON.stringify(json)}`);
+      if (!res.ok) throw new Error(googleApiErrorHint(res.status, json, "events.list"));
       return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), events: json.items ?? [] }) }] };
     },
   );
 
   server.tool(
     "googlecalendar_create_event",
-    "Create an event on the user's primary calendar.",
+    "Create an event on the target calendar (primary, or TARGET_CALENDAR_ID if set, e.g. myclaw).",
     {
       accountAddress: z.string().min(3),
       summary: z.string().min(1),
@@ -277,7 +330,8 @@ function createServer(env: Env) {
         })
         .parse(args);
       const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
-      const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
+      const calendarId = calendarIdForApiPath(getTargetCalendarId(env));
+      const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`, {
         method: "POST",
         headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
         body: JSON.stringify({
@@ -288,8 +342,88 @@ function createServer(env: Env) {
         }),
       });
       const json = (await res.json().catch(() => ({}))) as any;
-      if (!res.ok) throw new Error(`events.insert failed: ${JSON.stringify(json)}`);
+      if (!res.ok) throw new Error(googleApiErrorHint(res.status, json, "events.insert"));
       return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), event: json }) }] };
+    },
+  );
+
+  server.tool(
+    "googlecalendar_update_event",
+    "Update an existing event (summary, description, start, end) on the target calendar (primary or TARGET_CALENDAR_ID). Partial update: only provided fields are changed.",
+    {
+      accountAddress: z.string().min(3),
+      eventId: z.string().min(1),
+      summary: z.string().min(1).optional(),
+      description: z.string().optional(),
+      startISO: z.string().min(10).optional(),
+      endISO: z.string().min(10).optional(),
+    },
+    async (args) => {
+      const p = z
+        .object({
+          accountAddress: z.string().min(3),
+          eventId: z.string().min(1),
+          summary: z.string().min(1).optional(),
+          description: z.string().optional(),
+          startISO: z.string().min(10).optional(),
+          endISO: z.string().min(10).optional(),
+        })
+        .parse(args);
+      const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
+      const calendarId = calendarIdForApiPath(getTargetCalendarId(env));
+      const eventId = encodeURIComponent(p.eventId);
+      const body: Record<string, unknown> = {};
+      if (p.summary != null) body.summary = p.summary;
+      if (p.description != null) body.description = p.description;
+      if (p.startISO != null) body.start = { dateTime: p.startISO };
+      if (p.endISO != null) body.end = { dateTime: p.endISO };
+      if (Object.keys(body).length === 0) {
+        return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), error: "Provide at least one of summary, description, startISO, endISO" }) }] };
+      }
+      const res = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${eventId}`,
+        {
+          method: "PATCH",
+          headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      const json = (await res.json().catch(() => ({}))) as any;
+      if (!res.ok) throw new Error(googleApiErrorHint(res.status, json, "events.patch"));
+      return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), event: json }) }] };
+    },
+  );
+
+  server.tool(
+    "googlecalendar_delete_event",
+    "Delete an event on the target calendar (primary or TARGET_CALENDAR_ID, e.g. myclaw). Use eventId from create_event or list_events for that same calendar.",
+    {
+      accountAddress: z.string().min(3),
+      eventId: z.string().min(1),
+      sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
+    },
+    async (args) => {
+      const p = z
+        .object({
+          accountAddress: z.string().min(3),
+          eventId: z.string().min(1),
+          sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
+        })
+        .parse(args);
+      const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
+      const calendarId = calendarIdForApiPath(getTargetCalendarId(env));
+      const eventId = encodeURIComponent(p.eventId);
+      const q = new URLSearchParams();
+      q.set("sendUpdates", p.sendUpdates ?? "all");
+      const res = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${eventId}?${q.toString()}`,
+        { method: "DELETE", headers: { authorization: `Bearer ${accessToken}` } },
+      );
+      if (res.status === 204 || res.status === 200) {
+        return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), deleted: true, eventId: p.eventId }) }] };
+      }
+      const json = (await res.json().catch(() => ({}))) as any;
+      throw new Error(googleApiErrorHint(res.status, json, "events.delete"));
     },
   );
 

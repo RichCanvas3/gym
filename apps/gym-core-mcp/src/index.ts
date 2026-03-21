@@ -4,7 +4,13 @@ import { z } from "zod";
 
 export type Env = {
   MCP_API_KEY?: string;
+  /** Optional: separate key for POST /ingest/workout (e.g. from iPhone app). If unset, ingest uses MCP_API_KEY. */
+  INGEST_API_KEY?: string;
   DB: D1Database;
+  /** Strava sync: set all three to enable POST /internal/sync-strava. Get refresh_token via OAuth (activity:read_all). */
+  STRAVA_CLIENT_ID?: string;
+  STRAVA_CLIENT_SECRET?: string;
+  STRAVA_REFRESH_TOKEN?: string;
 };
 
 const AccountAddress = z.string().min(3);
@@ -24,8 +30,256 @@ async function requireApiKey(request: Request, env: Env) {
   if (got !== want) throw new Error("Unauthorized (bad x-api-key)");
 }
 
+/** Ingest auth: INGEST_API_KEY if set, else MCP_API_KEY */
+function requireIngestAuth(request: Request, env: Env) {
+  const ingestKey = (env.INGEST_API_KEY ?? "").trim();
+  const mcpKey = (env.MCP_API_KEY ?? "").trim();
+  const want = ingestKey || mcpKey;
+  if (!want) throw new Error("Configure INGEST_API_KEY or MCP_API_KEY for ingest");
+  const got = (request.headers.get("x-api-key") ?? "").trim();
+  if (got !== want) throw new Error("Unauthorized (bad x-api-key)");
+}
+
 function canonicalizeAddress(address: string) {
   return (address || "").trim();
+}
+
+const IngestWorkoutPayload = z.object({
+  source: z.string().min(1),
+  device: z.string().optional(),
+  eventType: z.string().min(1),
+  workoutId: z.string().uuid(),
+  activityType: z.string().min(1),
+  startedAt: z.string().min(1),
+  endedAt: z.string().min(1),
+  durationSeconds: z.number().int().nonnegative(),
+  distanceMeters: z.number().nonnegative().optional(),
+  activeEnergyKcal: z.number().nonnegative().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+
+async function handleIngestWorkout(request: Request, env: Env): Promise<Response> {
+  requireIngestAuth(request, env);
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(jsonText({ error: "Invalid JSON body" }), { status: 400, headers: { "content-type": "application/json" } });
+  }
+  const parsed = IngestWorkoutPayload.safeParse(body);
+  if (!parsed.success) {
+    return new Response(
+      jsonText({ error: "Validation failed", details: parsed.error.flatten() }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    );
+  }
+  const p = parsed.data;
+  const ts = nowISO();
+  const existing = await env.DB.prepare(`SELECT 1 FROM workouts WHERE workout_id = ?`).bind(p.workoutId).first();
+  if (existing) {
+    return new Response(jsonText({ ok: true, workoutId: p.workoutId, inserted: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const metadataJson = p.metadata ? JSON.stringify(p.metadata) : null;
+  await env.DB.prepare(
+    `INSERT INTO workouts (
+      workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
+      duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      p.workoutId,
+      p.source,
+      p.device ?? null,
+      p.eventType,
+      p.activityType,
+      p.startedAt,
+      p.endedAt,
+      p.durationSeconds,
+      p.distanceMeters ?? null,
+      p.activeEnergyKcal ?? null,
+      metadataJson,
+      ts,
+    )
+    .run();
+  return new Response(
+    jsonText({ ok: true, workoutId: p.workoutId, inserted: true }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+// --- Strava sync (writes to same workouts table with source=strava, workout_id=strava-{id}) ---
+type StravaActivity = {
+  id: number;
+  type: string;
+  sport_type?: string;
+  start_date: string;
+  start_date_local?: string;
+  elapsed_time: number;
+  moving_time?: number;
+  distance?: number;
+  kilojoules?: number | null;
+  name?: string;
+};
+
+async function getStravaAccessToken(env: Env): Promise<string> {
+  const clientId = (env.STRAVA_CLIENT_ID ?? "").trim();
+  const clientSecret = (env.STRAVA_CLIENT_SECRET ?? "").trim();
+  const refreshToken = (env.STRAVA_REFRESH_TOKEN ?? "").trim();
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error("Strava sync requires STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN");
+  }
+  const res = await fetch("https://www.strava.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data = (await res.json().catch(() => ({}))) as { access_token?: string; message?: string };
+  if (!res.ok || !data.access_token) {
+    throw new Error(data.message ?? `Strava token failed: ${res.status}`);
+  }
+  return data.access_token;
+}
+
+async function fetchStravaActivities(accessToken: string, afterUnix: number): Promise<StravaActivity[]> {
+  const url = `https://www.strava.com/api/v3/athlete/activities?after=${afterUnix}&per_page=100`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const data = (await res.json().catch(() => null)) as StravaActivity[] | { message?: string; errors?: unknown };
+  if (!Array.isArray(data)) {
+    const msg =
+      typeof data === "object" && data !== null && "message" in data
+        ? String((data as { message?: string }).message)
+        : res.statusText;
+    const detail =
+      typeof data === "object" && data !== null && "errors" in data
+        ? ` ${JSON.stringify((data as { errors?: unknown }).errors)}`
+        : "";
+    throw new Error(
+      `Strava activities: ${msg}${detail}. If you see activity:read_permission, re-authorize with scope activity:read_all and put the new refresh token in STRAVA_REFRESH_TOKEN.`,
+    );
+  }
+  if (!res.ok) {
+    throw new Error(`Strava activities HTTP ${res.status}`);
+  }
+  return data;
+}
+
+function stravaActivityToWorkoutRow(a: StravaActivity): {
+  workout_id: string;
+  source: string;
+  device: string | null;
+  event_type: string;
+  activity_type: string;
+  started_at_iso: string;
+  ended_at_iso: string;
+  duration_seconds: number;
+  distance_meters: number | null;
+  active_energy_kcal: number | null;
+  metadata_json: string | null;
+} {
+  const startedAt = a.start_date ?? "";
+  const elapsed = typeof a.elapsed_time === "number" ? a.elapsed_time : 0;
+  const endDate = startedAt ? new Date(new Date(startedAt).getTime() + elapsed * 1000).toISOString() : startedAt;
+  const kcal = a.kilojoules != null ? Math.round(a.kilojoules * 0.239) : null;
+  return {
+    workout_id: `strava-${a.id}`,
+    source: "strava",
+    device: "strava",
+    event_type: "workout.completed",
+    activity_type: (a.type || a.sport_type || "Workout").trim() || "Workout",
+    started_at_iso: startedAt,
+    ended_at_iso: endDate,
+    duration_seconds: elapsed,
+    distance_meters: a.distance != null ? Number(a.distance) : null,
+    active_energy_kcal: kcal,
+    metadata_json: a.name ? JSON.stringify({ name: a.name, sport_type: a.sport_type }) : null,
+  };
+}
+
+const STRAVA_SYNC_THROTTLE_MINUTES = 15;
+
+async function getLastStravaSync(env: Env): Promise<Date | null> {
+  const row = await env.DB.prepare(`SELECT last_sync_at_iso FROM strava_sync_state WHERE id = 1`).first<{ last_sync_at_iso: string }>();
+  if (!row?.last_sync_at_iso) return null;
+  const d = new Date(row.last_sync_at_iso);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+async function setLastStravaSync(env: Env): Promise<void> {
+  await env.DB.prepare(`INSERT OR REPLACE INTO strava_sync_state (id, last_sync_at_iso) VALUES (1, ?)`).bind(nowISO()).run();
+}
+
+/** Run Strava sync in background if last sync was > STRAVA_SYNC_THROTTLE_MINUTES ago. Safe for waitUntil. */
+async function syncStravaIfStale(env: Env): Promise<void> {
+  if (!(env.STRAVA_CLIENT_ID && env.STRAVA_CLIENT_SECRET && env.STRAVA_REFRESH_TOKEN)) return;
+  const last = await getLastStravaSync(env);
+  const cutoff = Date.now() - STRAVA_SYNC_THROTTLE_MINUTES * 60 * 1000;
+  if (last && last.getTime() > cutoff) return;
+  try {
+    await syncStravaToWorkouts(env);
+    await setLastStravaSync(env);
+  } catch (e) {
+    console.warn("[gym-core-mcp] Strava sync-on-read failed:", (e as Error)?.message ?? e);
+  }
+}
+
+async function syncStravaToWorkouts(env: Env): Promise<{ ok: boolean; synced: number; inserted: number; error?: string }> {
+  const afterUnix = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60; // 30 days
+  const accessToken = await getStravaAccessToken(env);
+  const activities = await fetchStravaActivities(accessToken, afterUnix);
+  let inserted = 0;
+  const ts = nowISO();
+  for (const a of activities) {
+    const row = stravaActivityToWorkoutRow(a);
+    const existing = await env.DB.prepare(`SELECT 1 FROM workouts WHERE workout_id = ?`).bind(row.workout_id).first();
+    if (existing) continue;
+    await env.DB.prepare(
+      `INSERT INTO workouts (
+        workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
+        duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        row.workout_id,
+        row.source,
+        row.device,
+        row.event_type,
+        row.activity_type,
+        row.started_at_iso,
+        row.ended_at_iso,
+        row.duration_seconds,
+        row.distance_meters,
+        row.active_energy_kcal,
+        row.metadata_json,
+        ts,
+      )
+      .run();
+    inserted += 1;
+  }
+  return { ok: true, synced: activities.length, inserted };
+}
+
+async function handleSyncStrava(request: Request, env: Env): Promise<Response> {
+  await requireApiKey(request, env);
+  try {
+    const result = await syncStravaToWorkouts(env);
+    return new Response(jsonText(result), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (e) {
+    const msg = String((e as Error)?.message ?? e);
+    return new Response(
+      jsonText({ ok: false, error: msg }),
+      { status: 500, headers: { "content-type": "application/json" } },
+    );
+  }
 }
 
 async function ensureAccount(
@@ -659,17 +913,161 @@ function createServer(env: Env) {
     },
   );
 
+  // Workout ingestion (Apple HealthKit → POST /ingest/workout) — query via MCP
+  server.tool(
+    "core_list_workouts",
+    "List workouts (post-workout data from Apple HealthKit ingest). Most recent first.",
+    { limit: z.number().int().positive().max(100).optional(), activityType: z.string().min(1).optional() },
+    async (args) => {
+      const parsed = z
+        .object({ limit: z.number().int().positive().max(100).optional(), activityType: z.string().min(1).optional() })
+        .parse(args);
+      const limit = parsed.limit ?? 20;
+      const stmt =
+        parsed.activityType != null
+          ? env.DB.prepare(
+              `SELECT workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
+               duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
+               FROM workouts WHERE activity_type = ? ORDER BY ended_at_iso DESC LIMIT ?`,
+            ).bind(parsed.activityType, limit)
+          : env.DB.prepare(
+              `SELECT workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
+               duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
+               FROM workouts ORDER BY ended_at_iso DESC LIMIT ?`,
+            ).bind(limit);
+      const res = await stmt.all();
+      const workouts = (res.results ?? []).map((r: any) => ({
+        workoutId: String(r.workout_id ?? ""),
+        source: String(r.source ?? ""),
+        device: r.device ? String(r.device) : null,
+        eventType: String(r.event_type ?? ""),
+        activityType: String(r.activity_type ?? ""),
+        startedAt: String(r.started_at_iso ?? ""),
+        endedAt: String(r.ended_at_iso ?? ""),
+        durationSeconds: Number(r.duration_seconds ?? 0),
+        distanceMeters: r.distance_meters != null ? Number(r.distance_meters) : null,
+        activeEnergyKcal: r.active_energy_kcal != null ? Number(r.active_energy_kcal) : null,
+        metadata: (() => {
+          try {
+            return r.metadata_json ? JSON.parse(String(r.metadata_json)) : null;
+          } catch {
+            return null;
+          }
+        })(),
+        createdAtISO: String(r.created_at_iso ?? ""),
+      }));
+      return { content: [{ type: "text", text: jsonText({ workouts }) }] };
+    },
+  );
+
+  server.tool(
+    "core_get_workout",
+    "Get a single workout by workoutId (UUID from Apple ingest, or strava-<id> from Strava sync).",
+    { workoutId: z.string().min(1) },
+    async (args) => {
+      const parsed = z.object({ workoutId: z.string().min(1) }).parse(args);
+      const row = await env.DB.prepare(
+        `SELECT workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
+         duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
+         FROM workouts WHERE workout_id = ? LIMIT 1`,
+      )
+        .bind(parsed.workoutId)
+        .first();
+      if (!row) {
+        return { content: [{ type: "text", text: jsonText({ workout: null, error: "Not found" }) }] };
+      }
+      const r = row as any;
+      const workout = {
+        workoutId: String(r.workout_id ?? ""),
+        source: String(r.source ?? ""),
+        device: r.device ? String(r.device) : null,
+        eventType: String(r.event_type ?? ""),
+        activityType: String(r.activity_type ?? ""),
+        startedAt: String(r.started_at_iso ?? ""),
+        endedAt: String(r.ended_at_iso ?? ""),
+        durationSeconds: Number(r.duration_seconds ?? 0),
+        distanceMeters: r.distance_meters != null ? Number(r.distance_meters) : null,
+        activeEnergyKcal: r.active_energy_kcal != null ? Number(r.active_energy_kcal) : null,
+        metadata: (() => {
+          try {
+            return r.metadata_json ? JSON.parse(String(r.metadata_json)) : null;
+          } catch {
+            return null;
+          }
+        })(),
+        createdAtISO: String(r.created_at_iso ?? ""),
+      };
+      return { content: [{ type: "text", text: jsonText({ workout }) }] };
+    },
+  );
+
+  server.tool("core_latest_workout", "Get the most recent workout (by ended_at).", {}, async () => {
+    const row = await env.DB.prepare(
+      `SELECT workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
+       duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
+       FROM workouts ORDER BY ended_at_iso DESC LIMIT 1`,
+    ).first();
+    if (!row) {
+      return { content: [{ type: "text", text: jsonText({ workout: null, message: "No workouts yet" }) }] };
+    }
+    const r = row as any;
+    const workout = {
+      workoutId: String(r.workout_id ?? ""),
+      source: String(r.source ?? ""),
+      device: r.device ? String(r.device) : null,
+      eventType: String(r.event_type ?? ""),
+      activityType: String(r.activity_type ?? ""),
+      startedAt: String(r.started_at_iso ?? ""),
+      endedAt: String(r.ended_at_iso ?? ""),
+      durationSeconds: Number(r.duration_seconds ?? 0),
+      distanceMeters: r.distance_meters != null ? Number(r.distance_meters) : null,
+      activeEnergyKcal: r.active_energy_kcal != null ? Number(r.active_energy_kcal) : null,
+      metadata: (() => {
+        try {
+          return r.metadata_json ? JSON.parse(String(r.metadata_json)) : null;
+        } catch {
+          return null;
+        }
+      })(),
+      createdAtISO: String(r.created_at_iso ?? ""),
+    };
+    return { content: [{ type: "text", text: jsonText({ workout }) }] };
+  });
+
   return server;
 }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
+    if (url.pathname === "/ingest/workout" && request.method === "POST") {
+      try {
+        return await handleIngestWorkout(request, env);
+      } catch (e) {
+        const msg = String((e as Error)?.message ?? e);
+        const status = msg.includes("Unauthorized") ? 401 : 500;
+        return new Response(jsonText({ error: msg }), { status, headers: { "content-type": "application/json" } });
+      }
+    }
+    if (
+      url.pathname === "/internal/sync-strava" &&
+      (request.method === "POST" || request.method === "GET")
+    ) {
+      try {
+        return await handleSyncStrava(request, env);
+      } catch (e) {
+        const msg = String((e as Error)?.message ?? e);
+        const status = msg.includes("Unauthorized") ? 401 : 500;
+        return new Response(jsonText({ error: msg }), { status, headers: { "content-type": "application/json" } });
+      }
+    }
     try {
       await requireApiKey(request, env);
     } catch {
       return new Response("Unauthorized", { status: 401 });
     }
     const server = createServer(env);
+    ctx.waitUntil(syncStravaIfStale(env));
     return createMcpHandler(server, { route: "/mcp" })(request, env, ctx);
   },
 };

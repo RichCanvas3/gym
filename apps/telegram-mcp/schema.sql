@@ -53,3 +53,13 @@ CREATE TABLE IF NOT EXISTS telegram_pending_notifications (
 
 CREATE INDEX IF NOT EXISTS idx_telegram_pending_notifications_session ON telegram_pending_notifications(session_id);
 
+-- Opaque tokens for public image URLs (/telegram/media/:token → proxy Telegram file by file_id)
+CREATE TABLE IF NOT EXISTS telegram_media_tokens (
+  token TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL,
+  expires_at_iso TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_media_expires ON telegram_media_tokens(expires_at_iso);
+

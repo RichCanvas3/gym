@@ -1,9 +1,10 @@
 /**
  * https://developers.cloudflare.com/workers/wrangler/configuration/
+ * D1: gym-weight (migrations in ./migrations)
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "gym-telegram-mcp",
+	"name": "gym-weight-management-mcp",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-03-10",
 	"compatibility_flags": [
@@ -12,27 +13,21 @@
 	"observability": {
 		"enabled": true
 	},
+	"vars": {
+		"WEIGHT_MCP_LOG": "1"
+	},
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "gym-telegram",
-			"database_id": "d9d24798-cbe3-466c-8cd2-0bcd7eea4f99"
+			"database_name": "gym-weight",
+			"database_id": "b9aeec78-9f1f-4de3-b476-9aa5ba04ab19",
+			"remote": true
 		}
 	],
-	"durable_objects": {
-		"bindings": [
-			{
-				"name": "MEDIA_TOKEN_RESOLVER",
-				"class_name": "MediaTokenResolver"
-			}
-		]
-	},
-	"migrations": [
+	"services": [
 		{
-			"tag": "v1",
-			"new_classes": [
-				"MediaTokenResolver"
-			]
+			"binding": "MEDIA_PROXY",
+			"service": "gym-telegram-mcp"
 		}
 	]
 }

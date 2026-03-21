@@ -77,6 +77,15 @@ Recommended MCP tool categories for a climbing gym:
 - **Personal calendar**: connect a user's Google Calendar for conflict checks + creating events.
 - **Telegram**: bot-based chat + webhook ingestion + searchable message store (OpenClaw-style).
 
+### Google Calendar MCP server (Cloudflare Workers + D1, OAuth)
+
+- App: `apps/googlecalendar-mcp`
+- Endpoint: `https://<your-worker>.workers.dev/mcp`
+- Tools: `googlecalendar_ping`, `googlecalendar_get_connection_status`, `googlecalendar_freebusy`, `googlecalendar_list_calendars`, `googlecalendar_list_events`, `googlecalendar_create_event`, `googlecalendar_update_event`, `googlecalendar_delete_event`
+- **Detailed client directions** (LangSmith, myclaw, allowlist, “myclaw” calendar, OAuth): see **[apps/googlecalendar-mcp/CLIENT_SETUP.md](apps/googlecalendar-mcp/CLIENT_SETUP.md)**.
+
+Quick add to LangSmith env: include `"googlecalendar": { "transport": "streamable_http", "url": "https://gym-googlecalendar-mcp.<subdomain>.workers.dev/mcp", "headers": { "x-api-key": "gym" } }` in `MCP_SERVERS_JSON`, and add the `googlecalendar_googlecalendar_*` tool names to `MCP_TOOL_ALLOWLIST` (see CLIENT_SETUP.md for the full list). Optional: set worker secret `TARGET_CALENDAR_ID` to your “myclaw” calendar id so all events go there.
+
 ### SendGrid MCP server (Cloudflare Workers)
 
 This repo includes a deployable MCP server you can run on Cloudflare Workers:

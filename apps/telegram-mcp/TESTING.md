@@ -282,7 +282,68 @@ After fixing, send a message in the chat and confirm `telegram_get_webhook_info`
   - **Bot privacy is still on** → In @BotFather run `/setprivacy` → your bot → **Disable**, so the bot receives all group messages, or
   - Only non-message events are being sent (e.g. bot added to group); send a normal **text message** in the group and check again.
 
-## 8. Notify MCP client when Telegram adds a message (by chatId or title)
+## 8. Images in retrieved messages (public URLs)
+
+Set a worker variable **`PUBLIC_BASE_URL`** (or **`TELEGRAM_MCP_PUBLIC_URL`**) to your worker’s public origin **with no trailing slash**, e.g. `https://gym-telegram-mcp.<subdomain>.workers.dev` (Workers dashboard → Settings → Variables, or `wrangler.toml` / dashboard).
+
+`telegram_list_messages`, `telegram_search_messages`, and **resources/read** (chat messages JSON) then include **public URLs** for photo / image-document messages:
+
+- Each image gets an opaque token stored in D1; the JSON includes:
+  - **`imageUrl`** (top-level on the message object) and **`image.url`** / **`image.imageUrl`** — same HTTPS URL.
+  - Example: `https://gym-telegram-mcp....workers.dev/telegram/media/<uuid>`
+- **`GET /telegram/media/<token>`** is served **without** `x-api-key`; it proxies the file from Telegram (bot token never appears in the URL).
+- Tokens expire after **7 days** (re-list messages to get new URLs if needed).
+- Largest **`photo`** size is used (last in the `photo` array); image **`document`** with `image/*` mime is also supported.
+- Optional **`includeImageBytes`: true** on list/search adds **`bytesBase64`** (heavy); default is URL-only.
+- Set **`includeImageUrls`: false** to omit URLs/tokens (text-only).
+- Caps: **20** image registrations per response; Telegram file size limit still applies on GET.
+
+Apply the **`telegram_media_tokens`** table to remote D1 if upgrading:
+
+```bash
+pnpm exec wrangler d1 execute gym-telegram --remote --file schema.sql
+```
+
+Photo **captions** are stored in the `text` column (same as message text).
+
+### How clients use this
+
+1. **Get messages** — Call **telegram_list_messages** (or **telegram_search_messages**) with `chatId`, or **resources/read** with URI `telegram://chat/{chatId}/messages` (or by-title). Response is JSON with a `messages` array (or `contents[].text` for resources/read).
+2. **Read image URL from each message** — For messages that have a photo/image, the object has **`imageUrl`** (top-level) and **`image.url`** (same value). Example: `"imageUrl": "https://gym-telegram-mcp....workers.dev/telegram/media/a1b2c3d4-..."`.
+3. **Fetch the image** — `GET <imageUrl>` with no headers (public). The worker streams the image bytes with the correct `Content-Type`. Use it to display in UI, pass to a vision model, or save.
+4. **Optional** — Pass **`includeImageBytes: true`** to list/search to also get **`image.bytesBase64`** in the same response (heavier). Pass **`includeImageUrls: false`** for text-only (no URLs, no token creation).
+
+### Observability (`wrangler tail`)
+
+Logs are prefixed with **`[telegram-mcp]`**:
+
+| Event | Log |
+|--------|-----|
+| Webhook stores a photo / image document | `webhook: stored message with image …` |
+| A public URL token is written to D1 | `media: DB insert token ok → public url=…` |
+| Someone opens `GET /telegram/media/:token` | `media: GET proxy Telegram file …` |
+| Missing `PUBLIC_BASE_URL` when registering | `media: skip register — … not set` |
+
+### Backfill existing images (“Smart Agent”)
+
+Workers **do not** run code on cold start. To register tokens for images already in D1 for the chat titled **`Smart Agent`**, call (same **`x-api-key`** as MCP):
+
+```bash
+curl -sS "https://<your-worker>.workers.dev/telegram/internal/backfill-smart-agent" \
+  -H "x-api-key: $MCP_API_KEY"
+```
+
+The JSON includes **`urls`** (open in a browser to test). Cap: **120** unique `file_id`s per run; duplicate images in chat are deduped.
+
+Optional **scheduled** backfill: set **`TELEGRAM_CRON_BACKFILL=1`**, add to `wrangler.jsonc`:
+
+```jsonc
+"triggers": { "crons": ["0 4 * * *"] }
+```
+
+(daily 04:00 UTC — adjust or remove). Without the var, the scheduled handler only logs a skip line.
+
+## 9. Notify MCP client when Telegram adds a message (by chatId or title)
 
 The server exposes **MCP Resources** for chat messages and supports **subscribe**. When new messages arrive in a chat, subscribed clients receive `notifications/resources/updated` (on their next MCP request) or can poll with a tool.
 
