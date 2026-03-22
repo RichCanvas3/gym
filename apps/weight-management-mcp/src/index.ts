@@ -356,6 +356,47 @@ function localDateISO(atMs: number, tzName: string | null | undefined): string {
   }
 }
 
+function getTzOffsetMs(date: Date, tzName: string): number {
+  // Returns offset = (formatted-in-tz-as-UTC - actual-utc) in ms.
+  // Inspired by date-fns-tz approach; works with DST transitions.
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: tzName,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = dtf.formatToParts(date);
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? "0");
+  const asUTC = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"));
+  return asUTC - date.getTime();
+}
+
+function zonedMidnightUtcMs(dateISO: string, tzNameRaw: string | null | undefined): number {
+  const tzName = safeTzName(tzNameRaw);
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((dateISO || "").trim());
+  if (!m) return Date.parse(`${dateISO}T00:00:00.000Z`);
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  // Start with naive UTC midnight for the same date, then adjust by the timezone offset at that instant.
+  const guess = new Date(Date.UTC(y, mo - 1, d, 0, 0, 0));
+  const offset = getTzOffsetMs(guess, tzName);
+  return guess.getTime() - offset;
+}
+
+function dayWindowUtcMsFromLocalDate(dateISO: string, tzName: string | null | undefined): { startMs: number; endMs: number } {
+  const startMs = zonedMidnightUtcMs(dateISO, tzName);
+  const nextISO = new Date(Date.UTC(Number(dateISO.slice(0, 4)), Number(dateISO.slice(5, 7)) - 1, Number(dateISO.slice(8, 10)) + 1))
+    .toISOString()
+    .slice(0, 10);
+  const endMs = zonedMidnightUtcMs(nextISO, tzName);
+  return { startMs, endMs };
+}
+
 function coerceMealLabel(v: unknown): MealLabel | null {
   if (typeof v !== "string") return null;
   const t = v.trim().toLowerCase();
@@ -893,7 +934,7 @@ function toolList() {
         "Summarize a day: weights, food calories/macros totals, water, daily targets (if set), photo count, meal analyses count.",
       inputSchema: {
         type: "object",
-        properties: { scope: scopeSchema, dateISO: { type: "string" } },
+        properties: { scope: scopeSchema, dateISO: { type: "string" }, tzName: { type: "string", description: "IANA tz name for local-day boundaries." } },
         required: ["scope"],
       },
     },
@@ -1738,8 +1779,10 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
 
   if (name === "weight_day_summary") {
     const dateISO = normStr(args.dateISO) ?? new Date().toISOString().slice(0, 10);
-    const dayStart = Date.parse(`${dateISO}T00:00:00.000Z`);
-    const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+    const tzName = normStr(args.tzName);
+    const win = dayWindowUtcMsFromLocalDate(dateISO, tzName);
+    const dayStart = win.startMs;
+    const dayEnd = win.endMs;
 
     const weights = await env.DB.prepare(
       `SELECT id, at_ms, weight_kg, bodyfat_pct, notes FROM wm_weights

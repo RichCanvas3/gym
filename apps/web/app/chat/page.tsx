@@ -47,9 +47,28 @@ export default function ChatPage() {
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [skills, setSkills] = useState<SkillsApiResponse | null>(null);
   const [skillsError, setSkillsError] = useState<string | null>(null);
+  const [clientTz, setClientTz] = useState<string>("America/Denver");
+  const [profileMissing, setProfileMissing] = useState(false);
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileAge, setProfileAge] = useState("");
+  const [profileSex, setProfileSex] = useState<"male" | "female" | "other" | "">("");
+  const [profileHeightIn, setProfileHeightIn] = useState("");
+  const [profileBodyShape, setProfileBodyShape] = useState<"lean" | "average" | "stocky" | "athletic" | "">("");
+  const [profileActivityLevel, setProfileActivityLevel] = useState<
+    "sedentary" | "light" | "moderate" | "very_active" | ""
+  >("");
 
   const threadId = waiver?.accountAddress ? `thr_${waiver.accountAddress}` : "thr_demo";
   const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (tz && typeof tz === "string") setClientTz(tz);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,7 +125,7 @@ export default function ChatPage() {
             message: "__CHAT_HISTORY__",
             session: {
               gymName: "Erie Community Center",
-              timezone: "America/Denver",
+              timezone: clientTz || "America/Denver",
               threadId: tid,
               goalBundle: goalBundle ?? undefined,
               waiver: waiver
@@ -157,7 +176,68 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [threadId, waiver]);
+  }, [threadId, waiver, clientTz]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadProfile() {
+      if (!hydrated) return;
+      if (!waiver?.accountAddress) return;
+      try {
+        setProfileBusy(true);
+        const res = await fetch("/api/agent/run", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            message: "__WEIGHT_PROFILE_GET__",
+            session: {
+              gymName: "Erie Community Center",
+              timezone: clientTz || "America/Denver",
+              threadId: threadId || "thr_demo",
+              waiver: waiver
+                ? {
+                    id: waiver.id,
+                    accountAddress: waiver.accountAddress,
+                    participantName: waiver.participantName,
+                    participantEmail: waiver.participantEmail,
+                    isMinor: waiver.isMinor,
+                  }
+                : undefined,
+            },
+          }),
+        });
+        const json = (await res.json().catch(() => ({}))) as any;
+        const prof = json?.data?.profile;
+        const age = typeof prof?.age === "number" ? String(prof.age) : typeof prof?.age === "string" ? prof.age : "";
+        const sex = prof?.sex === "male" || prof?.sex === "female" || prof?.sex === "other" ? prof.sex : "";
+        const heightIn = typeof prof?.height_in === "number" ? String(prof.height_in) : typeof prof?.height_in === "string" ? prof.height_in : "";
+        const bodyShape = prof?.body_shape === "lean" || prof?.body_shape === "average" || prof?.body_shape === "stocky" || prof?.body_shape === "athletic" ? prof.body_shape : "";
+        const activityLevel =
+          prof?.activity_level === "sedentary" ||
+          prof?.activity_level === "light" ||
+          prof?.activity_level === "moderate" ||
+          prof?.activity_level === "very_active"
+            ? prof.activity_level
+            : "";
+        if (!cancelled) {
+          setProfileAge(age);
+          setProfileSex(sex);
+          setProfileHeightIn(heightIn);
+          setProfileBodyShape(bodyShape);
+          setProfileActivityLevel(activityLevel);
+          setProfileMissing(!(age && sex && heightIn && activityLevel));
+        }
+      } catch {
+        // ignore
+      } finally {
+        if (!cancelled) setProfileBusy(false);
+      }
+    }
+    void loadProfile();
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrated, waiver?.accountAddress, clientTz, threadId]);
 
   useEffect(() => {
     const tid = threadId || "thr_demo";
@@ -187,7 +267,7 @@ export default function ChatPage() {
         message: text,
         session: {
           gymName: "Erie Community Center",
-          timezone: "America/Denver",
+          timezone: clientTz || "America/Denver",
           cartLines: lines,
           threadId: threadId || "thr_demo",
           goalBundle: goalBundle ?? undefined,
@@ -373,6 +453,104 @@ export default function ChatPage() {
             ))}
           </div>
         </main>
+
+        {hydrated && waiver?.accountAddress && profileMissing ? (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-50">
+            <div className="font-semibold">Complete your profile (for TDEE + calorie burn estimates)</div>
+            <div className="mt-2 grid gap-2 sm:grid-cols-5">
+              <input
+                value={profileAge}
+                onChange={(e) => setProfileAge(e.target.value)}
+                placeholder="Age"
+                className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
+              />
+              <select
+                value={profileSex}
+                onChange={(e) => setProfileSex(e.target.value as any)}
+                className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
+              >
+                <option value="">Sex</option>
+                <option value="male">Male</option>
+                <option value="female">Female</option>
+                <option value="other">Other</option>
+              </select>
+              <input
+                value={profileHeightIn}
+                onChange={(e) => setProfileHeightIn(e.target.value)}
+                placeholder="Height (in)"
+                className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
+              />
+              <select
+                value={profileActivityLevel}
+                onChange={(e) => setProfileActivityLevel(e.target.value as any)}
+                className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
+              >
+                <option value="">Activity level</option>
+                <option value="sedentary">Sedentary</option>
+                <option value="light">Light</option>
+                <option value="moderate">Moderate</option>
+                <option value="very_active">Very active</option>
+              </select>
+              <select
+                value={profileBodyShape}
+                onChange={(e) => setProfileBodyShape(e.target.value as any)}
+                className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
+              >
+                <option value="">Body shape (optional)</option>
+                <option value="lean">Lean</option>
+                <option value="average">Average</option>
+                <option value="athletic">Athletic</option>
+                <option value="stocky">Stocky</option>
+              </select>
+            </div>
+            <div className="mt-3 flex items-center justify-end">
+              <button
+                disabled={profileBusy}
+                onClick={async () => {
+                  if (!waiver?.accountAddress) return;
+                  setProfileBusy(true);
+                  try {
+                    const ageN = Number.parseInt(profileAge.trim(), 10);
+                    const heightN = Number.parseFloat(profileHeightIn.trim());
+                    const profile: Record<string, unknown> = {};
+                    if (Number.isFinite(ageN)) profile.age = ageN;
+                    if (profileSex) profile.sex = profileSex;
+                    if (Number.isFinite(heightN)) profile.height_in = heightN;
+                    if (profileBodyShape) profile.body_shape = profileBodyShape;
+                    if (profileActivityLevel) profile.activity_level = profileActivityLevel;
+                    await fetch("/api/agent/run", {
+                      method: "POST",
+                      headers: { "content-type": "application/json" },
+                      body: JSON.stringify({
+                        message: `__WEIGHT_PROFILE_UPSERT__:${JSON.stringify({ profile })}`,
+                        session: {
+                          gymName: "Erie Community Center",
+                          timezone: clientTz || "America/Denver",
+                          threadId: threadId || "thr_demo",
+                          waiver: waiver
+                            ? {
+                                id: waiver.id,
+                                accountAddress: waiver.accountAddress,
+                                participantName: waiver.participantName,
+                                participantEmail: waiver.participantEmail,
+                                isMinor: waiver.isMinor,
+                              }
+                            : undefined,
+                        },
+                      }),
+                    });
+                    setProfileMissing(!(profile.age && profile.sex && profile.height_in && profile.activity_level));
+                  } finally {
+                    setProfileBusy(false);
+                  }
+                }}
+                className="h-9 rounded-xl bg-amber-900 px-3 text-xs font-medium text-white disabled:opacity-50 dark:bg-amber-400 dark:text-black"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         {lastSuggestions?.length ? (
           <div className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
