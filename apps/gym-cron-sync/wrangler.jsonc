@@ -1,0 +1,29 @@
+/**
+ * Scheduled sync worker:
+ * - Pull Telegram “Smart Agent” chat messages (text + images)
+ * - Ingest into weight-management-mcp
+ * - Sync Strava workouts and ingest calories burned into weight-management-mcp
+ * - Post summaries back into Telegram
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gym-cron-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "vars": {
+    "SYNC_CHAT_TITLE": "Smart Agent",
+    "SYNC_TZ_NAME": "America/Denver",
+    "SYNC_LOOKBACK_DAYS": "7"
+  },
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  },
+  "services": [
+    { "binding": "TELEGRAM_MCP", "service": "gym-telegram-mcp" },
+    { "binding": "WEIGHT_MCP", "service": "gym-weight-management-mcp" },
+    { "binding": "STRAVA_MCP", "service": "gym-strava-mcp" }
+  ]
+}
+

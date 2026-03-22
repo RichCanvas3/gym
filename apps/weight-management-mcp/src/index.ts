@@ -837,6 +837,27 @@ function toolList() {
       },
     },
     {
+      name: "weight_ingest_workout",
+      description:
+        "Ingest a workout (e.g. from Strava) as an exercise calorie-burn entry. Idempotent by (scope, source, workoutId).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: scopeSchema,
+          source: { type: "string", description: "e.g. strava" },
+          workoutId: { type: "string", description: "Stable workout id (e.g. strava-123)" },
+          startedAtISO: { type: "string" },
+          atMs: { type: "number" },
+          activityType: { type: "string" },
+          durationSeconds: { type: "number" },
+          distanceMeters: { type: "number" },
+          activeEnergyKcal: { type: "number" },
+          raw: { type: "object", description: "Optional raw workout JSON for traceability." },
+        },
+        required: ["scope", "source", "workoutId"],
+      },
+    },
+    {
       name: "weight_log_photo",
       description: "Log a photo reference (HTTPS URL) with optional opaque sourceRef for correlation.",
       inputSchema: {
@@ -1129,7 +1150,28 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         meal: mealOverride ?? undefined,
         sourceRef,
       });
-      return { ok: true, deduped: false, kind: "meal_photo", scope_id: sid, result: res };
+      const logged = await env.DB.prepare(
+        `SELECT id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, analysis_id, image_url
+         FROM wm_food_entries
+         WHERE scope_id=?1 AND telegram_chat_id=?2 AND telegram_message_id=?3
+         ORDER BY at_ms DESC
+         LIMIT 1`,
+      )
+        .bind(sid, chatId, messageId)
+        .first<{
+          id: string;
+          at_ms: number;
+          meal: string | null;
+          text: string | null;
+          calories: number | null;
+          protein_g: number | null;
+          carbs_g: number | null;
+          fat_g: number | null;
+          fiber_g: number | null;
+          analysis_id: string | null;
+          image_url: string | null;
+        }>();
+      return { ok: true, deduped: false, kind: "meal_photo", scope_id: sid, result: res, foodEntry: logged ?? null };
     }
 
     if (text && looksLikeWeightText(text)) {
@@ -1442,7 +1484,10 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
 
     type Tot = { calories: number; protein_g: number; carbs_g: number; fat_g: number };
     const zero = (): Tot => ({ calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
-    const dayMap = new Map<string, { dateISO: string; totals: Tot; meals: Record<string, Tot> }>();
+    const dayMap = new Map<
+      string,
+      { dateISO: string; totals: Tot; meals: Record<string, Tot>; exercise_kcal: number }
+    >();
 
     for (const r of foods.results ?? []) {
       const at_ms = typeof (r as any).at_ms === "number" ? (r as any).at_ms : null;
@@ -1456,7 +1501,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
 
       let day = dayMap.get(dateISO);
       if (!day) {
-        day = { dateISO, totals: zero(), meals: {} };
+        day = { dateISO, totals: zero(), meals: {}, exercise_kcal: 0 };
         dayMap.set(dateISO, day);
       }
       day.totals.calories += calories;
@@ -1469,6 +1514,28 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       day.meals[meal]!.protein_g += protein_g;
       day.meals[meal]!.carbs_g += carbs_g;
       day.meals[meal]!.fat_g += fat_g;
+    }
+
+    const ex = await env.DB.prepare(
+      `SELECT at_ms, active_energy_kcal
+       FROM wm_exercise_entries
+       WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<=?3
+       ORDER BY at_ms ASC
+       LIMIT 15000`,
+    )
+      .bind(sid, from, to)
+      .all<{ at_ms: number; active_energy_kcal: number | null }>();
+    for (const r of ex.results ?? []) {
+      const at_ms = typeof (r as any).at_ms === "number" ? (r as any).at_ms : null;
+      if (at_ms == null) continue;
+      const dateISO = localDateISO(at_ms, tzName);
+      const kcal = typeof (r as any).active_energy_kcal === "number" ? (r as any).active_energy_kcal : 0;
+      let day = dayMap.get(dateISO);
+      if (!day) {
+        day = { dateISO, totals: zero(), meals: {}, exercise_kcal: 0 };
+        dayMap.set(dateISO, day);
+      }
+      day.exercise_kcal += kcal;
     }
 
     const items = await env.DB.prepare(
@@ -1507,7 +1574,9 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       byMeal[m] = byMeal[m]!.slice(0, topN);
     }
 
-    const days = Array.from(dayMap.values()).sort((a, b) => (a.dateISO < b.dateISO ? -1 : a.dateISO > b.dateISO ? 1 : 0));
+    const days = Array.from(dayMap.values())
+      .sort((a, b) => (a.dateISO < b.dateISO ? -1 : a.dateISO > b.dateISO ? 1 : 0))
+      .map((d) => ({ ...d, net_calories: d.totals.calories - d.exercise_kcal }));
     const totalsAll = days.reduce(
       (acc, d) => {
         acc.calories += d.totals.calories;
@@ -1518,6 +1587,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       },
       zero(),
     );
+    const exercise_kcal = days.reduce((s, d) => s + (typeof (d as any).exercise_kcal === "number" ? (d as any).exercise_kcal : 0), 0);
 
     return {
       ok: true,
@@ -1525,10 +1595,99 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       tzName,
       fromISO: new Date(from).toISOString(),
       toISO: new Date(to).toISOString(),
-      totals: totalsAll,
+      totals: { ...totalsAll, exercise_kcal, net_calories: totalsAll.calories - exercise_kcal },
       days,
       topFoods: byMeal,
     };
+  }
+
+  if (name === "weight_ingest_workout") {
+    const source = normStr(args.source) ?? "";
+    const workoutId = normStr(args.workoutId) ?? "";
+    if (!source || !workoutId) throw new Error("source and workoutId required");
+    const at_ms = "atMs" in args ? parseAtMs(args.atMs) : parseAtMs((args as any).startedAtISO);
+    const ts = nowMs();
+
+    const eventKey = `${sid}|workout|${source}|${workoutId}`;
+    const eventId = `wk_${await sha256Hex(eventKey)}`;
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO wm_events (id, scope_id, type, at_ms, payload_json, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6)`,
+    )
+      .bind(
+        eventId,
+        sid,
+        "workout",
+        at_ms,
+        JSON.stringify({
+          source,
+          workoutId,
+          startedAtISO: normStr((args as any).startedAtISO),
+          activityType: normStr((args as any).activityType),
+          durationSeconds:
+            typeof (args as any).durationSeconds === "number" && Number.isFinite((args as any).durationSeconds)
+              ? Math.trunc((args as any).durationSeconds)
+              : null,
+          distanceMeters:
+            typeof (args as any).distanceMeters === "number" && Number.isFinite((args as any).distanceMeters)
+              ? Number((args as any).distanceMeters)
+              : null,
+          activeEnergyKcal:
+            typeof (args as any).activeEnergyKcal === "number" && Number.isFinite((args as any).activeEnergyKcal)
+              ? Number((args as any).activeEnergyKcal)
+              : null,
+          raw: isRecord((args as any).raw) ? (args as any).raw : null,
+        }),
+        ts,
+      )
+      .run();
+
+    const existing = await env.DB.prepare(
+      `SELECT id, at_ms, active_energy_kcal FROM wm_exercise_entries
+       WHERE scope_id=?1 AND source=?2 AND workout_id=?3
+       LIMIT 1`,
+    )
+      .bind(sid, source, workoutId)
+      .first<{ id: string; at_ms: number; active_energy_kcal: number | null }>();
+    if (existing?.id) {
+      return {
+        ok: true,
+        deduped: true,
+        scope_id: sid,
+        exerciseEntryId: existing.id,
+        at_ms: existing.at_ms,
+        activeEnergyKcal: existing.active_energy_kcal,
+      };
+    }
+
+    const id = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO wm_exercise_entries
+       (id, scope_id, at_ms, source, workout_id, activity_type, duration_seconds, distance_meters, active_energy_kcal, raw_json, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
+    )
+      .bind(
+        id,
+        sid,
+        at_ms,
+        source,
+        workoutId,
+        normStr((args as any).activityType),
+        typeof (args as any).durationSeconds === "number" && Number.isFinite((args as any).durationSeconds)
+          ? Math.trunc((args as any).durationSeconds)
+          : null,
+        typeof (args as any).distanceMeters === "number" && Number.isFinite((args as any).distanceMeters)
+          ? Number((args as any).distanceMeters)
+          : null,
+        typeof (args as any).activeEnergyKcal === "number" && Number.isFinite((args as any).activeEnergyKcal)
+          ? Number((args as any).activeEnergyKcal)
+          : null,
+        isRecord((args as any).raw) ? JSON.stringify((args as any).raw) : null,
+        ts,
+      )
+      .run();
+
+    return { ok: true, deduped: false, scope_id: sid, exerciseEntryId: id, at_ms };
   }
 
   if (name === "weight_log_photo") {
@@ -1626,6 +1785,13 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       .bind(sid, dayStart, dayEnd)
       .first<{ c: number }>();
 
+    const exerciseRow = await env.DB.prepare(
+      `SELECT COALESCE(SUM(active_energy_kcal),0) as e FROM wm_exercise_entries WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<?3`,
+    )
+      .bind(sid, dayStart, dayEnd)
+      .first<{ e: number }>();
+    const exercise_kcal = exerciseRow?.e ?? 0;
+
     const targetsRow = await env.DB.prepare(`SELECT targets_json, updated_at FROM wm_daily_targets WHERE scope_id=?1 LIMIT 1`)
       .bind(sid)
       .first<{ targets_json: string; updated_at: number }>();
@@ -1635,7 +1801,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       scope_id: sid,
       dateISO,
       weights: weights.results ?? [],
-      totals: { calories, protein_g, carbs_g, fat_g },
+      totals: { calories, protein_g, carbs_g, fat_g, exercise_kcal, net_calories: calories - exercise_kcal },
       water_ml: waterRow?.w ?? 0,
       photoCount: photoCount?.c ?? 0,
       mealAnalysesCount: analysisCount?.c ?? 0,

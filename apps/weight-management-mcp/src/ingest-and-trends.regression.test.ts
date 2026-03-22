@@ -214,5 +214,132 @@ d("weight-management-mcp ingestion + trends", () => {
     expect(days.some((d) => d?.dateISO === "2026-03-22")).toBe(true);
     expect(out.topFoods?.breakfast?.[0]?.name).toBe("eggs");
   });
+
+  it("day summary includes exercise_kcal and net_calories", async () => {
+    const { SELF, env } = await import("cloudflare:test");
+    const sid = "acct:acct_cust_casey";
+
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_weights (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        weight_kg REAL,
+        bodyfat_pct REAL,
+        notes TEXT,
+        source TEXT,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_food_entries (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        meal TEXT,
+        text TEXT,
+        calories REAL,
+        protein_g REAL,
+        carbs_g REAL,
+        fat_g REAL,
+        fiber_g REAL,
+        sugar_g REAL,
+        sodium_mg REAL,
+        source TEXT,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        analysis_id TEXT,
+        image_url TEXT,
+        created_at INTEGER
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_photos (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        caption TEXT,
+        tags_json TEXT NOT NULL,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        telegram_file_id TEXT,
+        telegram_file_unique_id TEXT,
+        photo_url TEXT,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_water_log (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        amount_ml REAL NOT NULL,
+        source TEXT,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_meal_analyses (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        model TEXT,
+        summary TEXT,
+        raw_json TEXT NOT NULL,
+        image_ref_json TEXT,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_daily_targets (
+        scope_id TEXT PRIMARY KEY,
+        targets_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_exercise_entries (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        workout_id TEXT NOT NULL,
+        activity_type TEXT,
+        duration_seconds INTEGER,
+        distance_meters REAL,
+        active_energy_kcal REAL,
+        raw_json TEXT,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+
+    const day = "2026-03-22";
+    const dayStart = Date.parse(`${day}T00:00:00.000Z`);
+    await env.DB.prepare(
+      `INSERT INTO wm_food_entries (id, scope_id, at_ms, meal, text, calories, source, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8)`,
+    )
+      .bind("f", sid, dayStart + 1000, "lunch", "sandwich", 600, "test", dayStart + 1000)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO wm_exercise_entries (id, scope_id, at_ms, source, workout_id, active_energy_kcal, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7)`,
+    )
+      .bind("e", sid, dayStart + 2000, "strava", "strava-1", 250, dayStart + 2000)
+      .run();
+
+    const out = await toolCall(SELF.fetch, "weight_day_summary", { scope: { accountAddress: "acct_cust_casey" }, dateISO: day });
+    expect(out.ok).toBe(true);
+    expect(out.totals.calories).toBe(600);
+    expect(out.totals.exercise_kcal).toBe(250);
+    expect(out.totals.net_calories).toBe(350);
+  });
 });
 
