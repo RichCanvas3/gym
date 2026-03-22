@@ -2110,7 +2110,9 @@ async def run(input: Input) -> Output:
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         # Pull profile for TDEE inputs (age/sex/height/activity_level).
-        prof0 = await _weight_call_json("weight_profile_get", {"scope": scope}) or {}
+        prof_raw = await _weight_call_json("weight_profile_get", {"scope": scope})
+        profile_tool_ok = prof_raw is not None
+        prof0 = prof_raw or {}
         prof = prof0.get("profile") if isinstance(prof0, dict) else None
         prof = prof if isinstance(prof, dict) else {}
 
@@ -2149,6 +2151,12 @@ async def run(input: Input) -> Output:
             kg = float(kg_from_text)
         elif lb_from_text is not None:
             kg = float(lb_from_text) * 0.45359237
+        assumed_weight = False
+        if kg is None:
+            # Fall back to a default if we have distance but no weight available.
+            # We will explicitly label this as an assumption in the answer.
+            kg = 99.8  # 220 lb
+            assumed_weight = True
 
         # Exercise (today)
         str0 = await _strava_call_json("strava_list_workouts", {"limit": 200}) or {}
@@ -2200,13 +2208,17 @@ async def run(input: Input) -> Output:
         lines = [
             f"Today ({date_iso}, {tz_name}) calorie overview:",
             f"- Calories in (food): **{int(round(intake_kcal))} kcal**",
-            f"- Calories out (workouts today): **{int(round(burn_kcal))} kcal**" + (f" (using {kg:.1f} kg)" if kg is not None else ""),
+            f"- Calories out (workouts today): **{int(round(burn_kcal))} kcal**"
+            + (f" (using {kg:.1f} kg{' assumed (220 lb)' if assumed_weight else ''})" if kg is not None else ""),
             f"- Net (in − workouts): **{int(round(net_vs_exercise))} kcal**",
         ]
         if tdee is not None:
             lines.append(f"- Est. TDEE (profile): **{int(round(tdee))} kcal/day** (activity={activity})")
         else:
-            lines.append("- Est. TDEE (profile): missing age/sex/height/activity_level in profile.")
+            if not profile_tool_ok:
+                lines.append("- Est. TDEE (profile): unavailable (weight_profile_get tool not loaded in this deployment).")
+            else:
+                lines.append("- Est. TDEE (profile): missing age/sex/height/activity_level in profile.")
 
         if today_workouts:
             lines.append("\nWorkouts today:")
