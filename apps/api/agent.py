@@ -1366,7 +1366,7 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
         if not dateISO or not isinstance(dateISO, str) or not dateISO.strip():
             dateISO = datetime.now(tz=tz).date().isoformat()
         scope = {"accountAddress": accountAddress.strip()}
-        day = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": dateISO}) or {}
+        day = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": dateISO, "tzName": tzName}) or {}
         workout = await _strava_call_json("strava_latest_workout", {}) or {}
         return json.dumps(
             {
@@ -2049,6 +2049,155 @@ async def run(input: Input) -> Output:
                 "net_kcal": net,
                 "workoutsTodayCount": len(today_workouts),
             },
+        )
+
+    # Deterministic: exercise-focused "today overview" still includes intake for consistency.
+    if (
+        (not msg.startswith("__"))
+        and any(k in mlow for k in ["exercise", "workout", "workouts"])
+        and any(k in mlow for k in ["calorie", "calories", "burn", "burned", "spent", "overview"])
+        and any(k in mlow for k in ["today", "day", "daily"])
+    ):
+        scope = _weight_scope_from_session(input.session)
+        if not scope:
+            answer = "I can summarize meals + exercise, but I need your waiver accountAddress. Please fill out /waiver."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address"}])
+
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        tz = ZoneInfo(tz_name or "UTC")
+        date_iso = datetime.now(tz=tz).date().isoformat()
+        from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
+
+        # Pull profile for TDEE inputs (age/sex/height/activity_level).
+        prof0 = await _weight_call_json("weight_profile_get", {"scope": scope}) or {}
+        prof = prof0.get("profile") if isinstance(prof0, dict) else None
+        prof = prof if isinstance(prof, dict) else {}
+
+        def _num(v: Any) -> Optional[float]:
+            if isinstance(v, (int, float)):
+                return float(v)
+            try:
+                if isinstance(v, str) and v.strip():
+                    return float(v.strip())
+            except Exception:
+                return None
+            return None
+
+        age = int(_num(prof.get("age")) or 0) if _num(prof.get("age")) is not None else None
+        sex = str(prof.get("sex") or "").strip().lower()
+        height_in = _num(prof.get("height_in"))
+        activity = str(prof.get("activity_level") or "").strip().lower()
+
+        # Intake (food)
+        food0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500}) or {}
+        items = food0.get("items") if isinstance(food0, dict) else None
+        items_list = [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
+        intake_kcal = sum(float(it.get("calories")) for it in items_list if isinstance(it.get("calories"), (int, float)))
+
+        # Body weight (kg) for workout burn estimate.
+        wt0 = await _weight_call_json("weight_list_weights", {"scope": scope, "fromISO": None, "toISO": None, "limit": 5}) or {}
+        witems = wt0.get("items") if isinstance(wt0, dict) else None
+        kg: Optional[float] = None
+        if isinstance(witems, list):
+            for r in witems:
+                if isinstance(r, dict) and isinstance(r.get("weight_kg"), (int, float)):
+                    kg = float(r.get("weight_kg"))
+                    break
+        kg_from_text, lb_from_text = _parse_weight_from_text(msg)
+        if kg_from_text is not None:
+            kg = float(kg_from_text)
+        elif lb_from_text is not None:
+            kg = float(lb_from_text) * 0.45359237
+
+        # Exercise (today)
+        str0 = await _strava_call_json("strava_list_workouts", {"limit": 200}) or {}
+        workouts = str0.get("workouts") if isinstance(str0, dict) else None
+        wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
+
+        def _parse_iso(s: Any) -> Optional[datetime]:
+            if not isinstance(s, str) or not s.strip():
+                return None
+            try:
+                return datetime.fromisoformat(s.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        today_workouts: list[dict[str, Any]] = []
+        burn_kcal = 0.0
+        for w in wlist:
+            started = _parse_iso(w.get("started_at_iso")) or _parse_iso(w.get("ended_at_iso"))
+            if not started:
+                continue
+            if started.astimezone(tz).date().isoformat() != date_iso:
+                continue
+            today_workouts.append(w)
+            kcal = w.get("active_energy_kcal")
+            if isinstance(kcal, (int, float)):
+                burn_kcal += float(kcal)
+            else:
+                dist_m = w.get("distance_meters")
+                if kg is not None and isinstance(dist_m, (int, float)) and float(dist_m) > 0:
+                    burn_kcal += kg * (float(dist_m) / 1000.0) * 1.0
+
+        # Estimate BMR/TDEE if profile present.
+        bmr = None
+        tdee = None
+        if kg is not None and height_in is not None and age is not None and sex in {"male", "female"}:
+            cm = float(height_in) * 2.54
+            s = 5 if sex == "male" else -161
+            bmr = 10.0 * float(kg) + 6.25 * cm - 5.0 * float(age) + float(s)
+            mult = {
+                "sedentary": 1.2,
+                "light": 1.375,
+                "moderate": 1.55,
+                "very_active": 1.725,
+            }.get(activity)
+            if mult:
+                tdee = bmr * mult
+
+        net_vs_exercise = intake_kcal - burn_kcal
+        lines = [
+            f"Today ({date_iso}, {tz_name}) calorie overview:",
+            f"- Calories in (food): **{int(round(intake_kcal))} kcal**",
+            f"- Calories out (workouts today): **{int(round(burn_kcal))} kcal**" + (f" (using {kg:.1f} kg)" if kg is not None else ""),
+            f"- Net (in − workouts): **{int(round(net_vs_exercise))} kcal**",
+        ]
+        if tdee is not None:
+            lines.append(f"- Est. TDEE (profile): **{int(round(tdee))} kcal/day** (activity={activity})")
+        else:
+            lines.append("- Est. TDEE (profile): missing age/sex/height/activity_level in profile.")
+
+        if today_workouts:
+            lines.append("\nWorkouts today:")
+            for w in today_workouts[:6]:
+                typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
+                started = _parse_iso(w.get("started_at_iso"))
+                started_local = started.astimezone(tz).strftime("%H:%M") if started else ""
+                dist_m = w.get("distance_meters")
+                dist_s = f"{float(dist_m)/1609.34:.1f} mi" if isinstance(dist_m, (int, float)) and float(dist_m) > 0 else ""
+                dur_s = w.get("duration_seconds")
+                dur_out = ""
+                try:
+                    s = int(dur_s)
+                    m = s // 60
+                    dur_out = f"{m}m" if m < 60 else f"{m//60}h{m%60:02d}m"
+                except Exception:
+                    dur_out = ""
+                bits = " • ".join([b for b in [started_local, dist_s, dur_out] if b])
+                lines.append(f"- {typ}" + (f" ({bits})" if bits else ""))
+
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(
+            answer=answer,
+            citations=[],
+            goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+            data={"asOfISO": _now_iso(), "dateISO": date_iso, "intake_kcal": intake_kcal, "burn_kcal": burn_kcal, "tdee_kcal": tdee},
         )
 
     # Deterministic: workouts summary (past few days / last week).
