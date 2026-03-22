@@ -9,6 +9,7 @@ import { useRouter } from "next/navigation";
 type ChatMessage = {
   role: "user" | "assistant";
   text: string;
+  images?: string[];
 };
 
 type ChatApiResponse = {
@@ -18,6 +19,7 @@ type ChatApiResponse = {
   cartActions?: unknown;
   uiActions?: unknown;
   goalBundle?: Record<string, unknown>;
+  data?: unknown;
 };
 
 type SkillsApiResponse = {
@@ -81,7 +83,8 @@ export default function ChatPage() {
                 const o = x as Record<string, unknown>;
                 const role = o.role === "user" || o.role === "assistant" ? o.role : null;
                 const text = typeof o.text === "string" ? o.text : "";
-                if (role && text.trim()) cached.push({ role, text });
+                const images = Array.isArray(o.images) ? o.images.filter((u) => typeof u === "string" && u.trim()) : undefined;
+                if (role && text.trim()) cached.push({ role, text, images });
               }
               if (!cancelled && cached.length) {
                 setMessages(cached);
@@ -217,7 +220,8 @@ export default function ChatPage() {
         ]);
         return;
       }
-      setMessages((m) => [...m, { role: "assistant", text: String(payload?.answer ?? "") }]);
+      const images = extractMealImages(payload?.data);
+      setMessages((m) => [...m, { role: "assistant", text: String(payload?.answer ?? ""), images }]);
       setLastSuggestions(parseSuggestions(payload?.suggestedCartItems));
 
       if (payload?.goalBundle && typeof payload.goalBundle === "object" && !Array.isArray(payload.goalBundle)) {
@@ -347,7 +351,24 @@ export default function ChatPage() {
                     : "mr-auto bg-zinc-100 text-zinc-900 dark:bg-white/10 dark:text-zinc-50",
                 ].join(" ")}
               >
-                {m.text}
+                <div>{m.text}</div>
+                {m.role === "assistant" && Array.isArray(m.images) && m.images.length ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {m.images.slice(0, 8).map((url) => (
+                      <a
+                        key={url}
+                        href={url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block overflow-hidden rounded-xl border border-zinc-200 dark:border-white/10"
+                        title="Open image"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={url} alt="Meal" className="h-24 w-24 object-cover" />
+                      </a>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
@@ -420,6 +441,26 @@ function extractErrorMessage(j: Record<string, unknown>) {
   if (typeof j.error === "string") return j.error;
   if (typeof j.detail === "string") return j.detail;
   return "Request failed.";
+}
+
+function extractMealImages(data: unknown): string[] | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const d = data as Record<string, unknown>;
+  const items = d.foodItems;
+  if (!Array.isArray(items)) return undefined;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const x of items) {
+    if (!x || typeof x !== "object") continue;
+    const o = x as Record<string, unknown>;
+    const url = typeof o.image_url === "string" ? o.image_url.trim() : typeof (o as any).imageUrl === "string" ? String((o as any).imageUrl).trim() : "";
+    if (!url || !(url.startsWith("http://") || url.startsWith("https://"))) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+    if (out.length >= 20) break;
+  }
+  return out.length ? out : undefined;
 }
 
 function parseCartActions(value: unknown): Array<{ op: "add" | "remove" | "clear"; sku?: string; quantity?: number }> {

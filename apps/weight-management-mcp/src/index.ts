@@ -338,6 +338,24 @@ function localHour(atMs: number, tzName: string | null | undefined): number | nu
   }
 }
 
+function localDateISO(atMs: number, tzName: string | null | undefined): string {
+  const tz = safeTzName(tzName);
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date(atMs));
+    const y = parts.find((p) => p.type === "year")?.value ?? "1970";
+    const m = parts.find((p) => p.type === "month")?.value ?? "01";
+    const d = parts.find((p) => p.type === "day")?.value ?? "01";
+    return `${y}-${m}-${d}`;
+  } catch {
+    return new Date(atMs).toISOString().slice(0, 10);
+  }
+}
+
 function coerceMealLabel(v: unknown): MealLabel | null {
   if (typeof v !== "string") return null;
   const t = v.trim().toLowerCase();
@@ -358,6 +376,55 @@ function inferMealLabel(atMs: number, tzName: string | null | undefined, text?: 
   if (h >= 11 && h <= 15) return "lunch";
   if (h >= 16 && h <= 21) return "dinner";
   return "snack";
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  let out = "";
+  for (const b of hash) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
+function looksLikeWeightText(text: string): boolean {
+  const t = (text || "").trim().toLowerCase();
+  if (!t || t.startsWith("/") || t.startsWith("__")) return false;
+  if (t.includes(" lb") || t.includes(" lbs") || t.includes("kg") || t.includes("pounds")) return true;
+  if (t.includes("weight")) return /\b\d{2,3}(\.\d)?\b/.test(t);
+  return false;
+}
+
+function parseWeightFromText(text: string): { weightKg: number | null; weightLb: number | null } {
+  const t = (text || "").trim().toLowerCase();
+  if (!t) return { weightKg: null, weightLb: null };
+  const kgm = t.match(/\b(\d{2,3}(?:\.\d)?)\s*(kg|kgs|kilograms?)\b/);
+  if (kgm?.[1]) {
+    const n = Number.parseFloat(kgm[1]);
+    return { weightKg: Number.isFinite(n) ? n : null, weightLb: null };
+  }
+  const lbm = t.match(/\b(\d{2,3}(?:\.\d)?)\s*(lb|lbs|pounds?)\b/);
+  if (lbm?.[1]) {
+    const n = Number.parseFloat(lbm[1]);
+    return { weightKg: null, weightLb: Number.isFinite(n) ? n : null };
+  }
+  if (t.includes("weight")) {
+    const m = t.match(/\b(\d{2,3}(?:\.\d)?)\b/);
+    if (m?.[1]) {
+      const n = Number.parseFloat(m[1]);
+      return { weightKg: null, weightLb: Number.isFinite(n) ? n : null };
+    }
+  }
+  return { weightKg: null, weightLb: null };
+}
+
+function looksLikeMealText(text: string): boolean {
+  const t = (text || "").trim().toLowerCase();
+  if (!t || t.startsWith("/") || t.startsWith("__")) return false;
+  if (t.length < 6) return false;
+  if (t.includes("add to my meals") || t.includes("add that to my meals") || t.includes("log this")) return true;
+  if (t.includes("breakfast") || t.includes("lunch") || t.includes("dinner") || t.includes("snack")) return true;
+  const foodish = ["eggs", "toast", "oatmeal", "coffee", "banana", "apple", "salad", "chicken", "rice", "yogurt", "sandwich", "ice cream"];
+  return foodish.some((w) => t.includes(w));
 }
 
 type MealAnalysisJson = {
@@ -409,6 +476,51 @@ function mealSummaryFromAnalysis(analysis: MealAnalysisJson): string {
   const notes = typeof analysis.notes === "string" ? analysis.notes.trim() : "";
   if (notes && !looksGenericVisionNotes(notes)) return notes;
   return "Meal (from photo analysis)";
+}
+
+async function insertFoodItems(
+  env: Env,
+  sid: string,
+  foodEntryId: string,
+  at_ms: number,
+  meal: string | null,
+  items: unknown,
+  source: string | null,
+  createdAt: number,
+): Promise<number> {
+  if (!Array.isArray(items) || !items.length) return 0;
+  let n = 0;
+  for (const it of items.slice(0, 20)) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const name = typeof o.name === "string" ? o.name.trim() : "";
+    if (!name) continue;
+    const id = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO wm_food_items
+       (id, scope_id, food_entry_id, at_ms, meal, name, portion_g, calories, protein_g, carbs_g, fat_g, fiber_g, source, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)`,
+    )
+      .bind(
+        id,
+        sid,
+        foodEntryId,
+        at_ms,
+        meal,
+        name,
+        typeof o.portion_g === "number" && Number.isFinite(o.portion_g) ? o.portion_g : null,
+        typeof o.calories === "number" && Number.isFinite(o.calories) ? o.calories : null,
+        typeof o.protein_g === "number" && Number.isFinite(o.protein_g) ? o.protein_g : null,
+        typeof o.carbs_g === "number" && Number.isFinite(o.carbs_g) ? o.carbs_g : null,
+        typeof o.fat_g === "number" && Number.isFinite(o.fat_g) ? o.fat_g : null,
+        typeof o.fiber_g === "number" && Number.isFinite(o.fiber_g) ? o.fiber_g : null,
+        source,
+        createdAt,
+      )
+      .run();
+    n++;
+  }
+  return n;
 }
 
 type MealTextAnalysisJson = {
@@ -574,6 +686,27 @@ function toolList() {
   return [
     { name: "weight_ping", description: "Health check", inputSchema: { type: "object", properties: {} } },
     {
+      name: "weight_ingest_telegram_message",
+      description:
+        "Ingest a Telegram message (text and/or photo URL) into weight-management. Idempotent by (scope, chatId, messageId). Writes an audit row to wm_events.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: scopeSchema,
+          tzName: { type: "string", description: "IANA timezone name (e.g. America/Denver) for meal labeling." },
+          chatId: { type: "string" },
+          messageId: { type: "number" },
+          dateUnix: { type: "number", description: "Telegram message unix seconds." },
+          atMs: { type: "number", description: "Message time in ms since epoch." },
+          text: { type: "string" },
+          imageUrl: { type: "string", description: "Public HTTPS URL for the photo (e.g. telegram-mcp media URL)." },
+          locale: { type: "string" },
+          meal: { type: "string", description: "Optional override (breakfast/lunch/dinner/snack) for photo analysis." },
+        },
+        required: ["scope", "chatId", "messageId"],
+      },
+    },
+    {
       name: "weight_profile_get",
       description: "Get weight-management profile/settings for this scope.",
       inputSchema: { type: "object", properties: { scope: scopeSchema }, required: ["scope"] },
@@ -635,6 +768,7 @@ function toolList() {
           atMs: { type: "number" },
           meal: { type: "string" },
           text: { type: "string" },
+          imageUrl: { type: "string", description: "Optional public image URL associated with this food entry." },
           calories: { type: "number" },
           protein_g: { type: "number" },
           carbs_g: { type: "number" },
@@ -684,6 +818,22 @@ function toolList() {
         type: "object",
         properties: { scope: scopeSchema, fromISO: { type: "string" }, toISO: { type: "string" }, limit: { type: "number" } },
         required: ["scope"],
+      },
+    },
+    {
+      name: "weight_meal_trends",
+      description:
+        "Summarize meals over a date range: per-day totals, per-meal totals, and top foods per meal type (from wm_food_items).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: scopeSchema,
+          fromISO: { type: "string" },
+          toISO: { type: "string" },
+          tzName: { type: "string", description: "IANA tz name (e.g. America/Denver) for day bucketing." },
+          topN: { type: "number", description: "Max top foods per meal type (default 8)." },
+        },
+        required: ["scope", "tzName"],
       },
     },
     {
@@ -883,6 +1033,136 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
 
   if (name === "weight_ping") return { ok: true, ts: nowMs() };
 
+  if (name === "weight_ingest_telegram_message") {
+    const chatId = normStr(args.chatId);
+    const messageId =
+      typeof args.messageId === "number" && Number.isFinite(args.messageId) ? Math.trunc(args.messageId) : null;
+    if (!chatId || messageId == null) throw new Error("chatId and messageId required");
+
+    const tzName = normStr(args.tzName) ?? "UTC";
+    const text = normStr(args.text);
+    const imageUrl = normStr(args.imageUrl);
+    const locale = normStr(args.locale);
+    const mealOverride = normStr(args.meal);
+
+    const at_ms =
+      typeof args.atMs === "number" && Number.isFinite(args.atMs)
+        ? Math.trunc(args.atMs)
+        : typeof args.dateUnix === "number" && Number.isFinite(args.dateUnix)
+          ? Math.trunc(args.dateUnix) * 1000
+          : parseAtMs(args.atISO);
+
+    const ts = nowMs();
+    const eventKey = `${sid}|telegram|${chatId}|${messageId}`;
+    const eventId = `tg_${await sha256Hex(eventKey)}`;
+    const payload = {
+      chatId,
+      messageId,
+      at_ms,
+      tzName,
+      text,
+      imageUrl,
+      locale,
+      meal: mealOverride,
+    };
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO wm_events (id, scope_id, type, at_ms, payload_json, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6)`,
+    )
+      .bind(eventId, sid, "telegram_message", at_ms, JSON.stringify(payload), ts)
+      .run();
+
+    // Idempotency: if already ingested into any primary table, return quickly.
+    const existingFood = await env.DB.prepare(
+      `SELECT id, at_ms, meal, image_url, calories
+       FROM wm_food_entries
+       WHERE scope_id=?1 AND telegram_chat_id=?2 AND telegram_message_id=?3
+       LIMIT 1`,
+    )
+      .bind(sid, chatId, messageId)
+      .first<{ id: string; at_ms: number; meal: string | null; image_url?: string | null; calories?: number | null }>();
+    if (existingFood?.id) {
+      return {
+        ok: true,
+        deduped: true,
+        kind: "food",
+        scope_id: sid,
+        foodEntryId: existingFood.id,
+        at_ms: existingFood.at_ms,
+        meal: existingFood.meal ?? null,
+        calories: existingFood.calories ?? null,
+        imageUrl: (existingFood as any).image_url ?? null,
+      };
+    }
+    const existingWeight = await env.DB.prepare(
+      `SELECT id, at_ms, weight_kg
+       FROM wm_weights
+       WHERE scope_id=?1 AND telegram_chat_id=?2 AND telegram_message_id=?3
+       LIMIT 1`,
+    )
+      .bind(sid, chatId, messageId)
+      .first<{ id: string; at_ms: number; weight_kg: number | null }>();
+    if (existingWeight?.id) {
+      return { ok: true, deduped: true, kind: "weight", scope_id: sid, weightId: existingWeight.id, at_ms: existingWeight.at_ms };
+    }
+    const existingAnalysis = await env.DB.prepare(
+      `SELECT id, at_ms, summary
+       FROM wm_meal_analyses
+       WHERE scope_id=?1 AND telegram_chat_id=?2 AND telegram_message_id=?3
+       LIMIT 1`,
+    )
+      .bind(sid, chatId, messageId)
+      .first<{ id: string; at_ms: number; summary: string | null }>();
+    if (existingAnalysis?.id) {
+      return { ok: true, deduped: true, kind: "meal_analysis", scope_id: sid, analysisId: existingAnalysis.id, at_ms: existingAnalysis.at_ms };
+    }
+
+    const sourceRef = { chatId, messageId };
+
+    if (imageUrl) {
+      const res = await toolCall(env, "weight_analyze_meal_photo", {
+        scope,
+        imageUrl,
+        atMs: at_ms,
+        tzName,
+        locale: locale ?? undefined,
+        meal: mealOverride ?? undefined,
+        sourceRef,
+      });
+      return { ok: true, deduped: false, kind: "meal_photo", scope_id: sid, result: res };
+    }
+
+    if (text && looksLikeWeightText(text)) {
+      const w = parseWeightFromText(text);
+      if (w.weightKg == null && w.weightLb == null) {
+        throw new Error("weight text detected but could not parse a weight");
+      }
+      const res = await toolCall(env, "weight_log_weight", {
+        scope,
+        atMs: at_ms,
+        weightKg: w.weightKg ?? undefined,
+        weightLb: w.weightLb ?? undefined,
+        source: "telegram_text",
+        sourceRef,
+      });
+      return { ok: true, deduped: false, kind: "weight", scope_id: sid, result: res };
+    }
+
+    if (text && looksLikeMealText(text)) {
+      const res = await toolCall(env, "weight_log_meal_from_text", {
+        scope,
+        text,
+        atMs: at_ms,
+        tzName,
+        source: "telegram_text",
+        sourceRef,
+      });
+      return { ok: true, deduped: false, kind: "meal_text", scope_id: sid, result: res };
+    }
+
+    return { ok: true, deduped: false, kind: "ignored", scope_id: sid };
+  }
+
   if (name === "weight_profile_get") {
     const row = await env.DB.prepare(`SELECT profile_json, updated_at FROM wm_profiles WHERE scope_id=?1 LIMIT 1`)
       .bind(sid)
@@ -958,13 +1238,14 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     const meal = normStr(args.meal);
     const text = normStr(args.text);
     if (!text) throw new Error("Missing text");
+    const imageUrl = normStr((args as any).imageUrl);
     const ts = nowMs();
     const { chatId, messageId } = parseSourceRef(args);
     const analysisId = normStr(args.analysisId);
     await env.DB.prepare(
       `INSERT INTO wm_food_entries
-       (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, created_at)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+       (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, image_url, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)`,
     )
       .bind(
         id,
@@ -983,6 +1264,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         chatId,
         messageId,
         analysisId,
+        imageUrl,
         ts,
       )
       .run();
@@ -1067,8 +1349,8 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     const source = normStr(args.source) ?? "meal_text";
     await env.DB.prepare(
       `INSERT INTO wm_food_entries
-       (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, created_at)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+       (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, image_url, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)`,
     )
       .bind(
         foodEntryId,
@@ -1087,9 +1369,12 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         chatId,
         messageId,
         analysisId,
+        null,
         ts,
       )
       .run();
+
+    await insertFoodItems(env, sid, foodEntryId, at_ms, meal, analysis?.items, source, ts);
 
     return {
       ok: true,
@@ -1119,13 +1404,131 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       where.push(`at_ms <= ?${binds.length + 1}`);
       binds.push(to);
     }
-    const sql = `SELECT id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id
+    const sql = `SELECT id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, image_url
                  FROM wm_food_entries
                  WHERE ${where.join(" AND ")}
                  ORDER BY at_ms DESC
                  LIMIT ${limit}`;
     const res = await env.DB.prepare(sql).bind(...binds).all();
     return { ok: true, scope_id: sid, items: res.results ?? [] };
+  }
+
+  if (name === "weight_meal_trends") {
+    const tzName = normStr(args.tzName) ?? "UTC";
+    const topN =
+      typeof args.topN === "number" && Number.isFinite(args.topN) ? Math.min(25, Math.max(1, Math.trunc(args.topN))) : 8;
+    const fromMs = "fromISO" in args ? Date.parse(String(args.fromISO)) : NaN;
+    const toMs = "toISO" in args ? Date.parse(String(args.toISO)) : NaN;
+    const now = nowMs();
+    const from = Number.isFinite(fromMs) ? Math.trunc(fromMs) : now - 7 * 86400000;
+    const to = Number.isFinite(toMs) ? Math.trunc(toMs) : now;
+
+    const foods = await env.DB.prepare(
+      `SELECT at_ms, meal, calories, protein_g, carbs_g, fat_g
+       FROM wm_food_entries
+       WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<=?3
+       ORDER BY at_ms ASC
+       LIMIT 5000`,
+    )
+      .bind(sid, from, to)
+      .all<{
+        at_ms: number;
+        meal: string | null;
+        calories: number | null;
+        protein_g: number | null;
+        carbs_g: number | null;
+        fat_g: number | null;
+      }>();
+
+    type Tot = { calories: number; protein_g: number; carbs_g: number; fat_g: number };
+    const zero = (): Tot => ({ calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
+    const dayMap = new Map<string, { dateISO: string; totals: Tot; meals: Record<string, Tot> }>();
+
+    for (const r of foods.results ?? []) {
+      const at_ms = typeof (r as any).at_ms === "number" ? (r as any).at_ms : null;
+      if (at_ms == null) continue;
+      const dateISO = localDateISO(at_ms, tzName);
+      const meal = typeof (r as any).meal === "string" && (r as any).meal.trim() ? (r as any).meal.trim() : "unknown";
+      const calories = typeof (r as any).calories === "number" ? (r as any).calories : 0;
+      const protein_g = typeof (r as any).protein_g === "number" ? (r as any).protein_g : 0;
+      const carbs_g = typeof (r as any).carbs_g === "number" ? (r as any).carbs_g : 0;
+      const fat_g = typeof (r as any).fat_g === "number" ? (r as any).fat_g : 0;
+
+      let day = dayMap.get(dateISO);
+      if (!day) {
+        day = { dateISO, totals: zero(), meals: {} };
+        dayMap.set(dateISO, day);
+      }
+      day.totals.calories += calories;
+      day.totals.protein_g += protein_g;
+      day.totals.carbs_g += carbs_g;
+      day.totals.fat_g += fat_g;
+
+      if (!day.meals[meal]) day.meals[meal] = zero();
+      day.meals[meal]!.calories += calories;
+      day.meals[meal]!.protein_g += protein_g;
+      day.meals[meal]!.carbs_g += carbs_g;
+      day.meals[meal]!.fat_g += fat_g;
+    }
+
+    const items = await env.DB.prepare(
+      `SELECT at_ms, meal, name, calories
+       FROM wm_food_items
+       WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<=?3
+       ORDER BY at_ms ASC
+       LIMIT 15000`,
+    )
+      .bind(sid, from, to)
+      .all<{ at_ms: number; meal: string | null; name: string; calories: number | null }>();
+
+    const topMap = new Map<string, { meal: string; name: string; count: number; calories: number }>();
+    for (const r of items.results ?? []) {
+      const name = typeof (r as any).name === "string" ? (r as any).name.trim() : "";
+      if (!name) continue;
+      const meal = typeof (r as any).meal === "string" && (r as any).meal.trim() ? (r as any).meal.trim() : "unknown";
+      const key = `${meal}::${name.toLowerCase()}`;
+      const cals = typeof (r as any).calories === "number" ? (r as any).calories : 0;
+      const cur = topMap.get(key);
+      if (cur) {
+        cur.count += 1;
+        cur.calories += cals;
+      } else {
+        topMap.set(key, { meal, name, count: 1, calories: cals });
+      }
+    }
+
+    const byMeal: Record<string, Array<{ name: string; count: number; calories: number }>> = {};
+    for (const v of topMap.values()) {
+      if (!byMeal[v.meal]) byMeal[v.meal] = [];
+      byMeal[v.meal]!.push({ name: v.name, count: v.count, calories: v.calories });
+    }
+    for (const m of Object.keys(byMeal)) {
+      byMeal[m]!.sort((a, b) => b.count - a.count || b.calories - a.calories);
+      byMeal[m] = byMeal[m]!.slice(0, topN);
+    }
+
+    const days = Array.from(dayMap.values()).sort((a, b) => (a.dateISO < b.dateISO ? -1 : a.dateISO > b.dateISO ? 1 : 0));
+    const totalsAll = days.reduce(
+      (acc, d) => {
+        acc.calories += d.totals.calories;
+        acc.protein_g += d.totals.protein_g;
+        acc.carbs_g += d.totals.carbs_g;
+        acc.fat_g += d.totals.fat_g;
+        return acc;
+      },
+      zero(),
+    );
+
+    return {
+      ok: true,
+      scope_id: sid,
+      tzName,
+      fromISO: new Date(from).toISOString(),
+      toISO: new Date(to).toISOString(),
+      totals: totalsAll,
+      days,
+      topFoods: byMeal,
+    };
   }
 
   if (name === "weight_log_photo") {
@@ -1299,8 +1702,8 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       const fid = crypto.randomUUID();
       await env.DB.prepare(
         `INSERT INTO wm_food_entries
-         (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+         (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, image_url, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)`,
       )
         .bind(
           fid,
@@ -1319,10 +1722,12 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
           srcChatId,
           srcMessageId,
           id,
+          imageSourceHttpsUrl,
           ts,
         )
         .run();
       weightMcpLog(env, "meal_photo/auto_logged_food", { foodEntryId: fid, analysisId: id });
+      await insertFoodItems(env, sid, fid, at_ms, meal, analysis?.items, "meal_photo_auto", ts);
     }
 
     weightMcpLog(env, "meal_photo/processed", {
@@ -1359,8 +1764,8 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         `Meal (from photo analysis${parsed.confidence != null ? `, conf ${parsed.confidence}` : ""})`;
       await env.DB.prepare(
         `INSERT INTO wm_food_entries
-         (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+         (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, image_url, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)`,
       )
         .bind(
           fid,
@@ -1379,10 +1784,12 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
           chatId,
           messageId,
           analysisId,
+          null,
           ts,
         )
         .run();
       createdIds.push(fid);
+      await insertFoodItems(env, sid, fid, at_ms, meal, parsed?.items, source, ts);
     } else {
       const items = Array.isArray(parsed.items) ? parsed.items : [];
       for (const it of items) {
@@ -1392,8 +1799,8 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         const line = notes ? `${text} — ${notes}` : text;
         await env.DB.prepare(
           `INSERT INTO wm_food_entries
-           (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, created_at)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+           (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, image_url, created_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)`,
         )
           .bind(
             fid,
@@ -1412,6 +1819,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
             chatId,
             messageId,
             analysisId,
+            null,
             ts,
           )
           .run();

@@ -843,7 +843,7 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
 
     msgs = await _telegram_call_json(
         "telegram_list_messages",
-        {"chatId": chat_id, "limit": 50, "includeImageUrls": False, "includeImageBytes": False},
+        {"chatId": chat_id, "limit": 50, "includeImageUrls": True, "includeImageBytes": False},
     ) or {}
     items = msgs.get("messages") if isinstance(msgs, dict) else None
     if not isinstance(items, list) or not items:
@@ -860,9 +860,16 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
         if mid_i <= last_imported:
             continue
         txt = m.get("text")
-        if not isinstance(txt, str) or not _looks_like_meal_text(txt):
+        img_url: Optional[str] = None
+        imgs = m.get("imageUrls")
+        if isinstance(imgs, list) and imgs:
+            first = imgs[0]
+            if isinstance(first, str) and first.strip():
+                img_url = first.strip()
+        is_meal_text = isinstance(txt, str) and _looks_like_meal_text(txt)
+        if not is_meal_text and not img_url:
             continue
-        candidates.append({"messageId": mid_i, "dateUnix": m.get("dateUnix"), "text": txt})
+        candidates.append({"messageId": mid_i, "dateUnix": m.get("dateUnix"), "text": txt if isinstance(txt, str) else "", "imageUrl": img_url})
 
     if not candidates:
         # Still record chat id so we don't keep scanning chats list if the title changes
@@ -879,27 +886,33 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
         du = c.get("dateUnix")
         at_ms = int(du) * 1000 if isinstance(du, (int, float)) else int(datetime.now(timezone.utc).timestamp() * 1000)
         text = str(c.get("text") or "").strip()
-        if not text:
+        image_url = c.get("imageUrl")
+        if not text and not (isinstance(image_url, str) and image_url.strip()):
             continue
         res = await _weight_call_json(
-            "weight_log_meal_from_text",
+            "weight_ingest_telegram_message",
             {
                 "scope": scope,
-                "text": text,
-                "atMs": at_ms,
                 "tzName": tz_name,
-                "source": "telegram_text",
-                "sourceRef": {"chatId": chat_id, "messageId": mid_i},
+                "chatId": chat_id,
+                "messageId": mid_i,
+                "dateUnix": du,
+                "atMs": at_ms,
+                "text": text,
+                "imageUrl": image_url,
             },
         )
         if isinstance(res, dict) and res.get("ok") is True:
+            kind = str(res.get("kind") or "")
+            inner = res.get("result") if isinstance(res.get("result"), dict) else {}
             imported.append(
                 {
                     "messageId": mid_i,
-                    "atMs": res.get("at_ms"),
-                    "meal": res.get("meal"),
-                    "summary": res.get("summary"),
-                    "foodEntryId": res.get("foodEntryId") or res.get("foodEntryId".lower()),
+                    "atMs": inner.get("at_ms") if isinstance(inner, dict) else res.get("at_ms"),
+                    "meal": inner.get("meal") if isinstance(inner, dict) else res.get("meal"),
+                    "summary": inner.get("summary") if isinstance(inner, dict) else None,
+                    "foodEntryId": (inner.get("foodEntryId") if isinstance(inner, dict) else None) or res.get("foodEntryId"),
+                    "kind": kind,
                 }
             )
         # advance cursor even if one fails, to prevent repeated attempts on a bad message
@@ -982,21 +995,29 @@ async def _auto_import_telegram_weight_texts(session: Optional["Session"], bundl
         mid_i = int(c["messageId"])
         du = c.get("dateUnix")
         at_ms = int(du) * 1000 if isinstance(du, (int, float)) else int(datetime.now(timezone.utc).timestamp() * 1000)
-        kg = c.get("kg")
-        lb = c.get("lb")
-        args: dict[str, Any] = {
-            "scope": scope,
-            "atMs": at_ms,
-            "source": "telegram_text",
-            "sourceRef": {"chatId": chat_id, "messageId": mid_i},
-        }
-        if isinstance(kg, float) or isinstance(kg, int):
-            args["weightKg"] = float(kg)
-        if isinstance(lb, float) or isinstance(lb, int):
-            args["weightLb"] = float(lb)
-        res = await _weight_call_json("weight_log_weight", args)
+        text = str(c.get("text") or "").strip()
+        res = await _weight_call_json(
+            "weight_ingest_telegram_message",
+            {
+                "scope": scope,
+                "tzName": (session.timezone if session else None) or "UTC",
+                "chatId": chat_id,
+                "messageId": mid_i,
+                "dateUnix": du,
+                "atMs": at_ms,
+                "text": text,
+            },
+        )
         if isinstance(res, dict) and res.get("ok") is True:
-            imported.append({"messageId": mid_i, "atMs": res.get("at_ms"), "weightKg": res.get("weight_kg")})
+            inner = res.get("result") if isinstance(res.get("result"), dict) else {}
+            imported.append(
+                {
+                    "messageId": mid_i,
+                    "atMs": inner.get("at_ms") if isinstance(inner, dict) else res.get("at_ms"),
+                    "weightKg": inner.get("weight_kg") if isinstance(inner, dict) else res.get("weight_kg"),
+                    "kind": res.get("kind"),
+                }
+            )
         last_imported = max(last_imported, mid_i)
 
     integrations["telegramWeights"] = {
@@ -1693,7 +1714,30 @@ async def run(input: Input) -> Output:
                 answer=answer,
                 citations=[],
                 goalBundle=base_goal_bundle if had_session_goal_bundle else None,
-                data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": 0, "importedMeals": imported_meals},
+                data={
+                    "asOfISO": _now_iso(),
+                    "fromISO": from_iso,
+                    "toISO": to_iso,
+                    "count": 0,
+                    "importedMeals": imported_meals,
+                    "foodItems": [],
+                },
+            )
+
+        food_items: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            img = it.get("image_url") or it.get("imageUrl")
+            food_items.append(
+                {
+                    "id": it.get("id"),
+                    "at_ms": it.get("at_ms"),
+                    "meal": it.get("meal"),
+                    "text": it.get("text"),
+                    "calories": it.get("calories"),
+                    "image_url": img,
+                }
             )
 
         by_day: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -1733,7 +1777,14 @@ async def run(input: Input) -> Output:
             answer=answer,
             citations=[],
             goalBundle=base_goal_bundle if had_session_goal_bundle else None,
-            data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": len(items), "importedMeals": imported_meals},
+            data={
+                "asOfISO": _now_iso(),
+                "fromISO": from_iso,
+                "toISO": to_iso,
+                "count": len(items),
+                "importedMeals": imported_meals,
+                "foodItems": food_items,
+            },
         )
 
     # Deterministic: workouts summary (past few days / last week).

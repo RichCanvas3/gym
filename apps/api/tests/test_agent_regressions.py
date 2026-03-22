@@ -21,6 +21,7 @@ async def test_food_past_week_summary(monkeypatch):
                     "meal": "breakfast",
                     "text": "2 eggs + wheat toast",
                     "calories": 320,
+                    "image_url": "https://example.com/meal.jpg",
                 }
             ],
         }
@@ -52,6 +53,10 @@ async def test_food_past_week_summary(monkeypatch):
     assert "Meals for the past 7 days" in out.answer
     assert "2 eggs + wheat toast" in out.answer
     assert calls["weight"], "expected weight_list_food to be called"
+    assert out.data and isinstance(out.data, dict)
+    assert "foodItems" in out.data
+    assert isinstance(out.data["foodItems"], list)
+    assert out.data["foodItems"][0].get("image_url") == "https://example.com/meal.jpg"
 
 
 @pytest.mark.asyncio

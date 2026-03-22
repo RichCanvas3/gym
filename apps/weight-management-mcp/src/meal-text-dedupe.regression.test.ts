@@ -69,6 +69,7 @@ d("weight-management-mcp", () => {
         telegram_chat_id TEXT,
         telegram_message_id INTEGER,
         analysis_id TEXT,
+        image_url TEXT,
         created_at INTEGER
       )`,
     ).run();
