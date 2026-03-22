@@ -79,6 +79,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
 
+
 function requireAuth(req: Request, env: Env) {
   const expected = (env.MCP_API_KEY ?? "").trim();
   if (!expected) throw new Error("Server misconfigured: MCP_API_KEY missing");
@@ -1200,6 +1201,51 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       .bind(id, sid, at_ms, model, summary, JSON.stringify(analysis), JSON.stringify(imageRef), srcChatId, srcMessageId, ts)
       .run();
 
+    // Auto-create an aggregate food entry so day/week summaries include this meal.
+    // Dedupe by analysis_id so callers can safely re-run analysis/logging.
+    const existing = await env.DB.prepare(`SELECT 1 FROM wm_food_entries WHERE scope_id=?1 AND analysis_id=?2 LIMIT 1`)
+      .bind(sid, id)
+      .first();
+    if (!existing) {
+      const t = analysis.totals ?? {};
+      const calories = typeof t.calories === "number" ? t.calories : null;
+      const protein_g = typeof t.protein_g === "number" ? t.protein_g : null;
+      const carbs_g = typeof t.carbs_g === "number" ? t.carbs_g : null;
+      const fat_g = typeof t.fat_g === "number" ? t.fat_g : null;
+      const fiber_g = typeof t.fiber_g === "number" ? t.fiber_g : null;
+      const meal = normStr(args.meal);
+      const text =
+        analysis.notes?.trim() ||
+        `Meal (from photo analysis${analysis.confidence != null ? `, conf ${analysis.confidence}` : ""})`;
+      const fid = crypto.randomUUID();
+      await env.DB.prepare(
+        `INSERT INTO wm_food_entries
+         (id, scope_id, at_ms, meal, text, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, source, telegram_chat_id, telegram_message_id, analysis_id, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+      )
+        .bind(
+          fid,
+          sid,
+          at_ms,
+          meal,
+          text,
+          calories,
+          protein_g,
+          carbs_g,
+          fat_g,
+          fiber_g,
+          null,
+          null,
+          "meal_photo_auto",
+          srcChatId,
+          srcMessageId,
+          id,
+          ts,
+        )
+        .run();
+      weightMcpLog(env, "meal_photo/auto_logged_food", { foodEntryId: fid, analysisId: id });
+    }
+
     weightMcpLog(env, "meal_photo/processed", {
       analysisId: id,
       summary,
@@ -1525,7 +1571,25 @@ async function handleMcp(req: Request, env: Env): Promise<Response> {
 
   let resp: unknown;
   try {
-    if (method === "tools/list") {
+    // MCP Streamable HTTP handshake (required by langchain-mcp-adapters).
+    if (method === "initialize") {
+      weightMcpLog(env, "jsonrpc", { method: "initialize" });
+      resp = {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2024-11-05",
+          serverInfo: { name: "gym-weight-management-mcp", version: "0.1.0" },
+          capabilities: {
+            tools: {},
+          },
+        },
+      };
+    } else if (method === "notifications/initialized") {
+      // One-way notification; acknowledge with empty result for compatibility.
+      weightMcpLog(env, "jsonrpc", { method: "notifications/initialized" });
+      resp = { jsonrpc: "2.0", id, result: {} };
+    } else if (method === "tools/list") {
       weightMcpLog(env, "jsonrpc", { method: "tools/list" });
       const tools = toolList();
       weightMcpLog(env, "jsonrpc_ok", { method: "tools/list", toolCount: tools.length });

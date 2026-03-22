@@ -8,6 +8,7 @@ def _env(name: str) -> str:
     return (os.environ.get(name) or "").strip()
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_langgraph_runs_wait_live():
     url = _env("LANGGRAPH_DEPLOYMENT_URL")
@@ -23,13 +24,16 @@ async def test_langgraph_runs_wait_live():
             json={
                 "assistant_id": assistant_id,
                 "input": {
-                    "message": "what exercises have i done in past few days",
+                    "message": "show me my workouts over last week",
                     "session": {"timezone": "America/Denver", "waiver": {"accountAddress": "acct_cust_casey"}},
                 },
             },
         )
         assert res.status_code == 200
         j = res.json()
+        assert isinstance(j, dict), f"unexpected response: {j!r}"
+        if "__error__" in j:
+            raise AssertionError(f"LangGraph returned __error__: {j['__error__']!r}")
         out = (j.get("output") or {}) if isinstance(j, dict) else {}
         answer = out.get("answer") if isinstance(out, dict) else None
         assert isinstance(answer, str)

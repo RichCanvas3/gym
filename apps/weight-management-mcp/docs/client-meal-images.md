@@ -29,7 +29,7 @@ Then run meal analysis on those URLs (weight worker; can use same `MCP_API_KEY` 
 
 ```bash
 export WEIGHT_MCP_URL="https://gym-weight-management-mcp.<your-subdomain>.workers.dev/mcp"
-export SCOPE_JSON='{"accountAddress":"you"}'
+export ACCOUNT_ADDRESS="acct_cust_casey"
 node scripts/batch-analyze-meal-photos.mjs urls.txt
 ```
 
@@ -38,7 +38,7 @@ node scripts/batch-analyze-meal-photos.mjs urls.txt
 ```bash
 export WEIGHT_MCP_URL="https://gym-weight-management-mcp.<your-subdomain>.workers.dev/mcp"
 export MCP_API_KEY="..."
-export SCOPE_JSON='{"accountAddress":"you"}'
+export ACCOUNT_ADDRESS="acct_cust_casey"
 
 printf '%s\n' "https://example.com/meal1.jpg" | node scripts/batch-analyze-meal-photos.mjs
 ```

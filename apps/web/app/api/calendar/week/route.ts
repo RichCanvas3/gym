@@ -27,6 +27,9 @@ export async function GET(req: Request) {
   const json = (await res.json().catch(() => ({}))) as unknown;
   if (!res.ok) return NextResponse.json(json, { status: res.status });
   const j = (json && typeof json === "object" ? (json as Record<string, unknown>) : {}) as Record<string, unknown>;
+  if (j.__error__ && typeof j.__error__ === "object") {
+    return NextResponse.json({ error: "Agent error", detail: j.__error__ }, { status: 502 });
+  }
   const output =
     j.output && typeof j.output === "object" ? (j.output as Record<string, unknown>) : ({} as Record<string, unknown>);
   const schedule = output.schedule && typeof output.schedule === "object" ? output.schedule : {};

@@ -53,7 +53,13 @@ export async function POST(req: Request) {
 
   // Our graph returns { output: { answer, ... }, messages: [...] }
   const j = json as Record<string, unknown>;
+  if (j.__error__ && typeof j.__error__ === "object") {
+    return NextResponse.json({ error: "Agent error", detail: j.__error__ }, { status: 502 });
+  }
   const output = (j.output ?? {}) as Record<string, unknown>;
+  if (!output || typeof output !== "object" || Array.isArray(output) || !("answer" in output)) {
+    return NextResponse.json({ error: "Agent returned no output", detail: j }, { status: 502 });
+  }
   return NextResponse.json(output);
 }
 

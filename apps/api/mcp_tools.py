@@ -4,7 +4,7 @@ import json
 import os
 import re
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from langchain_core.tools import BaseTool
 
@@ -110,9 +110,14 @@ def _filter_tools(tools: list[BaseTool]) -> list[BaseTool]:
 
 
 async def load_mcp_tools_from_env() -> list[BaseTool]:
+    tools, _diag = await load_mcp_tools_with_diagnostics_from_env()
+    return tools
+
+
+async def load_mcp_tools_with_diagnostics_from_env() -> Tuple[list[BaseTool], dict[str, Any]]:
     servers = _parse_servers_json()
     if not servers:
-        return []
+        return [], {"okServers": [], "failedServers": []}
 
     servers = _apply_timeouts(servers)
     tool_name_prefix = _truthy_env("MCP_TOOL_NAME_PREFIX", default=True)
@@ -124,7 +129,21 @@ async def load_mcp_tools_from_env() -> list[BaseTool]:
             "MCP is configured but langchain-mcp-adapters is not installed."
         ) from e
 
-    client = MultiServerMCPClient(servers, tool_name_prefix=tool_name_prefix)
-    tools = await client.get_tools()
-    return _filter_tools(tools)
+    # Important: MultiServerMCPClient.get_tools() may use a TaskGroup and fail the entire
+    # tool load if any one server is unhealthy/misconfigured. We prefer partial
+    # availability: load what we can and skip failing servers.
+    all_tools: list[BaseTool] = []
+    ok_servers: list[dict[str, Any]] = []
+    failed_servers: list[dict[str, Any]] = []
+    for name, cfg in servers.items():
+        try:
+            client = MultiServerMCPClient({name: cfg}, tool_name_prefix=tool_name_prefix)
+            tools = await client.get_tools()
+            all_tools.extend(tools)
+            ok_servers.append({"name": name, "toolCount": len(tools)})
+        except Exception as e:
+            # Skip this server; other servers may still be usable.
+            failed_servers.append({"name": name, "error": f"{type(e).__name__}: {e}"})
+            continue
+    return _filter_tools(all_tools), {"okServers": ok_servers, "failedServers": failed_servers}
 

@@ -93,7 +93,7 @@ async def test_workouts_past_few_days_summary(monkeypatch):
 
     out = await run(
         Input(
-            message="what exercises have i done in past few days",
+            message="show me my workouts over last week",
             session=Session(
                 timezone="America/Denver",
                 waiver={"accountAddress": "acct_cust_casey"},

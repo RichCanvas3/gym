@@ -14,7 +14,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from .knowledge_index import KnowledgeHit, ensure_index_with_mcp, search_kb
-from .mcp_tools import load_mcp_tools_from_env
+from .mcp_tools import load_mcp_tools_from_env, load_mcp_tools_with_diagnostics_from_env
 
 
 def _now_iso() -> str:
@@ -1381,9 +1381,52 @@ async def run(input: Input) -> Output:
                     safe.append({"role": role, "content": content})
         return Output(answer="", citations=[], data={"messages": safe})
 
+    # MCP diagnostics (which server/tool discovery is failing).
+    if (not msg.startswith("__")) and ("mcp" in mlow) and any(k in mlow for k in ["fail", "failing", "broken", "load", "loading", "tools"]):
+        try:
+            _tools, diag = await load_mcp_tools_with_diagnostics_from_env()
+        except Exception as e:
+            return Output(
+                answer=f"MCP tool load failed: {type(e).__name__}: {e}",
+                citations=[],
+                data={"asOfISO": _now_iso()},
+            )
+        ok = diag.get("okServers") if isinstance(diag, dict) else None
+        bad = diag.get("failedServers") if isinstance(diag, dict) else None
+        lines = ["MCP tool load status:"]
+        if isinstance(ok, list) and ok:
+            lines.append("\nOK:")
+            for s in ok:
+                if isinstance(s, dict):
+                    lines.append(f"- {s.get('name')} (tools: {s.get('toolCount')})")
+        if isinstance(bad, list) and bad:
+            lines.append("\nFAILED:")
+            for s in bad:
+                if isinstance(s, dict):
+                    lines.append(f"- {s.get('name')}: {s.get('error')}")
+        if lines == ["MCP tool load status:"]:
+            lines.append("\n(no MCP servers configured)")
+        return Output(answer="\n".join(lines).strip(), citations=[], data={"asOfISO": _now_iso(), "diag": diag})
+
     goal_cmd = await _handle_goal_slash_commands(msg, input.session, thread_id)
     if goal_cmd is not None:
         return goal_cmd
+
+    # Always try to import new Telegram meal/weight texts before answering normal user questions,
+    # so asking "what have I eaten" reflects recent Telegram logs.
+    had_session_goal_bundle = bool(input.session and isinstance(getattr(input.session, "goalBundle", None), dict))
+    base_goal_bundle = copy.deepcopy(_session_goal_bundle(input.session))
+    imported_meals: list[dict[str, Any]] = []
+    imported_weights: list[dict[str, Any]] = []
+    if not msg.startswith("__"):
+        try:
+            base_goal_bundle, imported_meals = await _auto_import_telegram_meal_texts(input.session, base_goal_bundle)
+        except Exception:
+            imported_meals = []
+        try:
+            base_goal_bundle, imported_weights = await _auto_import_telegram_weight_texts(input.session, base_goal_bundle)
+        except Exception:
+            imported_weights = []
 
     # Deterministic helper: "book/reserve next available" for a class definition mentioned in-thread.
     if (not msg.startswith("__")) and any(k in mlow for k in ["next available", "next opening", "next slot"]) and any(
@@ -1587,8 +1630,10 @@ async def run(input: Input) -> Output:
         )
 
     # Deterministic: food log summary (past week / last N days).
-    if (not msg.startswith("__")) and any(k in mlow for k in ["what have i eaten", "what did i eat", "meals past", "food past"]) and any(
-        k in mlow for k in ["past week", "last week", "past 7 days", "last 7 days", "past few days", "last few days"]
+    if (
+        (not msg.startswith("__"))
+        and any(k in mlow for k in ["what have i eaten", "what did i eat", "show me what i ate", "show what i ate", "meals", "food"])
+        and any(k in mlow for k in ["past week", "last week", "over last week", "past 7 days", "last 7 days", "past few days", "last few days"])
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
@@ -1607,14 +1652,30 @@ async def run(input: Input) -> Output:
         from_iso, _ = _day_window_utc_from_local_date(start_local, tz_name)
         _, to_iso = _day_window_utc_from_local_date(end_local, tz_name)
 
-        data = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500}) or {}
+        data0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500})
+        if data0 is None:
+            answer = (
+                "Weight Management MCP isn't connected in this deployment, so I can't fetch your meal log. "
+                "Fix: add the weight worker to MCP_SERVERS_JSON and include weight_weight_list_food in MCP_TOOL_ALLOWLIST."
+            )
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso})
+
+        data = data0 or {}
         items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items:
             answer = f"No meals logged in the past {days} days."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": 0})
+            return Output(
+                answer=answer,
+                citations=[],
+                goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+                data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": 0, "importedMeals": imported_meals},
+            )
 
         by_day: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for it in items:
@@ -1644,28 +1705,65 @@ async def run(input: Input) -> Output:
                     lines.append(f"- {meal}: (+{len(rows) - 5} more)")
 
         answer = "\n".join(lines).strip()
+        if imported_meals:
+            answer = f"Imported {len(imported_meals)} new meal(s) from Telegram.\n\n" + answer
         if thread_id:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", answer)
-        return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": len(items)})
+        return Output(
+            answer=answer,
+            citations=[],
+            goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+            data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "count": len(items), "importedMeals": imported_meals},
+        )
 
     # Deterministic: workouts summary (past few days / last week).
-    if (not msg.startswith("__")) and any(k in mlow for k in ["what exercises have i done", "what workouts have i done", "workouts past", "exercise past"]) and any(
-        k in mlow for k in ["past few days", "last few days", "past week", "last week", "past 7 days", "last 7 days"]
+    if (
+        (not msg.startswith("__"))
+        and any(
+            k in mlow
+            for k in [
+                "what exercises have i done",
+                "what workouts have i done",
+                "show me my workouts",
+                "show my workouts",
+                "my workouts",
+                "workouts",
+                "exercises",
+                "exercise",
+            ]
+        )
+        and any(k in mlow for k in ["past few days", "last few days", "past week", "last week", "over last week", "past 7 days", "last 7 days"])
     ):
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
         days = 7 if ("week" in mlow or "7" in mlow) else 3
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
 
-        data = await _strava_call_json("strava_list_workouts", {"limit": 100}) or {}
+        data0 = await _strava_call_json("strava_list_workouts", {"limit": 200})
+        if data0 is None:
+            answer = (
+                "Strava MCP isn't connected in this deployment, so I can't fetch your workout list. "
+                "Fix: add the strava worker to MCP_SERVERS_JSON and include strava_strava_list_workouts in MCP_TOOL_ALLOWLIST."
+            )
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso()})
+
+        data = data0 or {}
         workouts = data.get("workouts") if isinstance(data, dict) else None
         if not isinstance(workouts, list) or not workouts:
             answer = f"No workouts found in the past {days} days."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "count": 0})
+            return Output(
+                answer=answer,
+                citations=[],
+                goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+                data={"asOfISO": _now_iso(), "count": 0},
+            )
 
         def _parse_iso(s: Any) -> Optional[datetime]:
             if not isinstance(s, str) or not s.strip():
@@ -1688,7 +1786,12 @@ async def run(input: Input) -> Output:
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "count": 0})
+            return Output(
+                answer=answer,
+                citations=[],
+                goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+                data={"asOfISO": _now_iso(), "count": 0},
+            )
 
         def _fmt_duration(sec: Any) -> str:
             try:
@@ -1717,7 +1820,12 @@ async def run(input: Input) -> Output:
         if thread_id:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", answer)
-        return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "count": len(recent)})
+        return Output(
+            answer=answer,
+            citations=[],
+            goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+            data={"asOfISO": _now_iso(), "count": len(recent)},
+        )
 
     if msg.startswith("__WEATHER_HOURLY__:"):
         try:
@@ -1903,21 +2011,6 @@ async def run(input: Input) -> Output:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", out.answer)
         return out
-
-    # Auto-import meal-like Telegram texts into weight-mcp (Smart Agent chat), tracked in GoalBundle.integrations.
-    had_session_goal_bundle = bool(input.session and isinstance(getattr(input.session, "goalBundle", None), dict))
-    base_goal_bundle = copy.deepcopy(_session_goal_bundle(input.session))
-    imported_meals: list[dict[str, Any]] = []
-    imported_weights: list[dict[str, Any]] = []
-    if not msg.startswith("__"):
-        try:
-            base_goal_bundle, imported_meals = await _auto_import_telegram_meal_texts(input.session, base_goal_bundle)
-        except Exception:
-            imported_meals = []
-        try:
-            base_goal_bundle, imported_weights = await _auto_import_telegram_weight_texts(input.session, base_goal_bundle)
-        except Exception:
-            imported_weights = []
 
     tools, trace = make_tools()
     mcp_tools = await load_mcp_tools_from_env()
