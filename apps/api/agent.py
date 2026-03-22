@@ -1432,7 +1432,26 @@ async def run(input: Input) -> Output:
         if not addr:
             return Output(answer="Missing waiver accountAddress.", citations=[], data={"error": "missing_account"})
         prof = await _weight_call_json("weight_profile_get", {"scope": {"accountAddress": addr}})
-        return Output(answer="", citations=[], data={"accountAddress": addr, "profile": prof.get("profile") if isinstance(prof, dict) else None})
+        if prof is None:
+            return Output(
+                answer="Weight Management MCP profile_get failed.",
+                citations=[],
+                data={
+                    "ok": False,
+                    "error": "weight_profile_get_failed",
+                    "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_profile_get and Weight MCP server is healthy.",
+                    "accountAddress": addr,
+                },
+            )
+        return Output(
+            answer="",
+            citations=[],
+            data={
+                "ok": True,
+                "accountAddress": addr,
+                "profile": prof.get("profile") if isinstance(prof, dict) else None,
+            },
+        )
 
     if msg.startswith("__WEIGHT_PROFILE_UPSERT__:"):
         addr = _waiver_account_address(input.session)
@@ -1446,7 +1465,26 @@ async def run(input: Input) -> Output:
         if not isinstance(profile, dict):
             profile = {}
         out = await _weight_call_json("weight_profile_upsert", {"scope": {"accountAddress": addr}, "profile": profile})
-        return Output(answer="", citations=[], data={"accountAddress": addr, "ok": True, "updated_at": out.get("updated_at") if isinstance(out, dict) else None})
+        if out is None:
+            return Output(
+                answer="Weight Management MCP profile_upsert failed.",
+                citations=[],
+                data={
+                    "ok": False,
+                    "error": "weight_profile_upsert_failed",
+                    "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_profile_upsert and Weight MCP server is healthy.",
+                    "accountAddress": addr,
+                },
+            )
+        return Output(
+            answer="",
+            citations=[],
+            data={
+                "ok": True,
+                "accountAddress": addr,
+                "updated_at": out.get("updated_at") if isinstance(out, dict) else None,
+            },
+        )
 
     # MCP diagnostics (which server/tool discovery is failing).
     if (not msg.startswith("__")) and ("mcp" in mlow) and any(k in mlow for k in ["fail", "failing", "broken", "load", "loading", "tools"]):

@@ -50,6 +50,7 @@ export default function ChatPage() {
   const [clientTz, setClientTz] = useState<string>("America/Denver");
   const [profileMissing, setProfileMissing] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
   const [profileAge, setProfileAge] = useState("");
   const [profileSex, setProfileSex] = useState<"male" | "female" | "other" | "">("");
   const [profileHeightIn, setProfileHeightIn] = useState("");
@@ -185,6 +186,7 @@ export default function ChatPage() {
       if (!waiver?.accountAddress) return;
       try {
         setProfileBusy(true);
+        setProfileError(null);
         const res = await fetch("/api/agent/run", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -207,6 +209,12 @@ export default function ChatPage() {
           }),
         });
         const json = (await res.json().catch(() => ({}))) as any;
+        const ok = json?.data?.ok;
+        if (ok === false) {
+          setProfileError(String(json?.data?.error ?? json?.data?.hint ?? "Profile load failed."));
+          setProfileMissing(true);
+          return;
+        }
         const prof = json?.data?.profile;
         const age = typeof prof?.age === "number" ? String(prof.age) : typeof prof?.age === "string" ? prof.age : "";
         const sex = prof?.sex === "male" || prof?.sex === "female" || prof?.sex === "other" ? prof.sex : "";
@@ -457,6 +465,7 @@ export default function ChatPage() {
         {hydrated && waiver?.accountAddress && profileMissing ? (
           <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-50">
             <div className="font-semibold">Complete your profile (for TDEE + calorie burn estimates)</div>
+            {profileError ? <div className="mt-2 text-xs opacity-90">{profileError}</div> : null}
             <div className="mt-2 grid gap-2 sm:grid-cols-5">
               <input
                 value={profileAge}
@@ -509,6 +518,7 @@ export default function ChatPage() {
                 onClick={async () => {
                   if (!waiver?.accountAddress) return;
                   setProfileBusy(true);
+                  setProfileError(null);
                   try {
                     const ageN = Number.parseInt(profileAge.trim(), 10);
                     const heightN = Number.parseFloat(profileHeightIn.trim());
@@ -539,7 +549,35 @@ export default function ChatPage() {
                         },
                       }),
                     });
-                    setProfileMissing(!(profile.age && profile.sex && profile.height_in && profile.activity_level));
+                    // Reload profile to confirm it persisted.
+                    const res2 = await fetch("/api/agent/run", {
+                      method: "POST",
+                      headers: { "content-type": "application/json" },
+                      body: JSON.stringify({
+                        message: "__WEIGHT_PROFILE_GET__",
+                        session: {
+                          gymName: "Erie Community Center",
+                          timezone: clientTz || "America/Denver",
+                          threadId: threadId || "thr_demo",
+                          waiver: waiver
+                            ? {
+                                id: waiver.id,
+                                accountAddress: waiver.accountAddress,
+                                participantName: waiver.participantName,
+                                participantEmail: waiver.participantEmail,
+                                isMinor: waiver.isMinor,
+                              }
+                            : undefined,
+                        },
+                      }),
+                    });
+                    const j2 = (await res2.json().catch(() => ({}))) as any;
+                    if (j2?.data?.ok === false) {
+                      setProfileError(String(j2?.data?.error ?? j2?.data?.hint ?? "Profile save failed."));
+                      setProfileMissing(true);
+                    } else {
+                      setProfileMissing(false);
+                    }
                   } finally {
                     setProfileBusy(false);
                   }
