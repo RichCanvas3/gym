@@ -861,11 +861,16 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
             continue
         txt = m.get("text")
         img_url: Optional[str] = None
-        imgs = m.get("imageUrls")
-        if isinstance(imgs, list) and imgs:
-            first = imgs[0]
-            if isinstance(first, str) and first.strip():
-                img_url = first.strip()
+        # telegram-mcp returns a single imageUrl string (plus `image.{url,imageUrl}`), not an array.
+        u = m.get("imageUrl")
+        if isinstance(u, str) and u.strip():
+            img_url = u.strip()
+        else:
+            img = m.get("image")
+            if isinstance(img, dict):
+                u2 = img.get("url") or img.get("imageUrl")
+                if isinstance(u2, str) and u2.strip():
+                    img_url = u2.strip()
         is_meal_text = isinstance(txt, str) and _looks_like_meal_text(txt)
         if not is_meal_text and not img_url:
             continue
@@ -1785,6 +1790,118 @@ async def run(input: Input) -> Output:
                 "importedMeals": imported_meals,
                 "foodItems": food_items,
             },
+        )
+
+    # Deterministic: today's (or yesterday's) food summary with consistent totals.
+    if (
+        (not msg.startswith("__"))
+        and any(k in mlow for k in ["what have i eaten", "what did i eat", "show me what i ate", "show what i ate", "meals", "food"])
+        and any(k in mlow for k in ["today", "yesterday"])
+    ):
+        scope = _weight_scope_from_session(input.session)
+        if not scope:
+            answer = "I can summarize meals, but I need your waiver accountAddress. Please fill out /waiver."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address"}])
+
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        tz = ZoneInfo(tz_name or "UTC")
+        day_local = datetime.now(tz=tz).date()
+        if "yesterday" in mlow:
+            day_local = day_local - timedelta(days=1)
+        date_iso = day_local.isoformat()
+        from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
+
+        data0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500})
+        if data0 is None:
+            answer = (
+                "Weight Management MCP isn't connected in this deployment, so I can't fetch your meal log. "
+                "Fix: add the weight worker to MCP_SERVERS_JSON and include weight_weight_list_food in MCP_TOOL_ALLOWLIST."
+            )
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso})
+
+        items = (data0 or {}).get("items") if isinstance(data0, dict) else None
+        if not isinstance(items, list) or not items:
+            answer = f"No meals logged for {date_iso}."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(
+                answer=answer,
+                citations=[],
+                goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+                data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "count": 0, "foodItems": []},
+            )
+
+        # Collect items + totals.
+        food_items: list[dict[str, Any]] = []
+        totals = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+        by_meal: dict[str, list[dict[str, Any]]] = {}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            img = it.get("image_url") or it.get("imageUrl")
+            food_items.append(
+                {
+                    "id": it.get("id"),
+                    "at_ms": it.get("at_ms"),
+                    "meal": it.get("meal"),
+                    "text": it.get("text"),
+                    "calories": it.get("calories"),
+                    "protein_g": it.get("protein_g"),
+                    "carbs_g": it.get("carbs_g"),
+                    "fat_g": it.get("fat_g"),
+                    "image_url": img,
+                }
+            )
+            meal = str(it.get("meal") or "unknown").strip() or "unknown"
+            by_meal.setdefault(meal, []).append(it)
+            for k in ["calories", "protein_g", "carbs_g", "fat_g"]:
+                v = it.get(k)
+                if isinstance(v, (int, float)):
+                    totals[k] += float(v)
+
+        def fmt_tot(label: str, d: dict[str, float]) -> str:
+            return (
+                f"**{label}:** **{int(round(d['calories']))} kcal** "
+                f"(Protein **{d['protein_g']:.1f}g** / Carbs **{d['carbs_g']:.1f}g** / Fat **{d['fat_g']:.1f}g**)"
+            )
+
+        # Build answer. Show all items (up to 30) but totals always match all items we used.
+        lines = [f"Today ({date_iso}, {tz_name}), you've logged:" if "yesterday" not in mlow else f"Yesterday ({date_iso}, {tz_name}), you've logged:"]
+        for meal in sorted(by_meal.keys()):
+            rows = by_meal[meal]
+            lines.append(f"\n- **{meal.title()}**:")
+            for r in rows[:10]:
+                text = str(r.get("text") or "").strip()
+                kcal = r.get("calories")
+                p = r.get("protein_g")
+                c = r.get("carbs_g")
+                f = r.get("fat_g")
+                kcal_s = f" **{int(round(float(kcal)))} kcal**" if isinstance(kcal, (int, float)) else ""
+                macro_s = ""
+                if isinstance(p, (int, float)) and isinstance(c, (int, float)) and isinstance(f, (int, float)):
+                    macro_s = f" (P **{float(p):.1f}g** / C **{float(c):.1f}g** / F **{float(f):.1f}g**)"
+                if text:
+                    lines.append(f"  - {text} —{kcal_s}{macro_s}")
+            if len(rows) > 10:
+                lines.append(f"  - (+{len(rows) - 10} more)")
+
+        lines.append("\n" + fmt_tot("Total so far", totals))
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(
+            answer=answer,
+            citations=[],
+            goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+            data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "count": len(food_items), "foodItems": food_items},
         )
 
     # Deterministic: workouts summary (past few days / last week).

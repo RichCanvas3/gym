@@ -46,10 +46,14 @@ function asString(v: unknown): string {
 }
 
 function firstImageUrl(m: any): string | null {
-  const arr = m?.imageUrls;
-  if (!Array.isArray(arr) || !arr.length) return null;
-  const u = arr[0];
-  return typeof u === "string" && u.trim() ? u.trim() : null;
+  const direct = typeof m?.imageUrl === "string" ? m.imageUrl.trim() : "";
+  if (direct) return direct;
+  const img = m?.image;
+  const u1 = typeof img?.url === "string" ? img.url.trim() : "";
+  if (u1) return u1;
+  const u2 = typeof img?.imageUrl === "string" ? img.imageUrl.trim() : "";
+  if (u2) return u2;
+  return null;
 }
 
 function safeInt(v: unknown): number | null {
@@ -60,10 +64,49 @@ function fmtKcal(v: unknown): string {
   return typeof v === "number" && Number.isFinite(v) ? `~${Math.round(v)} kcal` : "";
 }
 
+function normalizeAccountAddress(raw: string): string {
+  const t = (raw || "").trim();
+  if (!t) return "";
+  // Accept either "acct_cust_casey" or "acct:acct_cust_casey"
+  if (t.startsWith("acct:")) return t.slice("acct:".length);
+  return t;
+}
+
+function fallbackAccountAddressFromChatId(chatId: string): string {
+  // Stable, non-secret default if SYNC_ACCOUNT_ADDRESS not provided.
+  const clean = (chatId || "unknown").replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return `tg_${clean || "unknown"}`;
+}
+
+function fmtDistanceMeters(m: unknown): string {
+  if (typeof m !== "number" || !Number.isFinite(m) || m <= 0) return "";
+  const km = m / 1000;
+  const mi = km * 0.621371;
+  return mi >= 0.5 ? `${mi.toFixed(1)} mi` : `${km.toFixed(1)} km`;
+}
+
+function fmtDurationSeconds(s: unknown): string {
+  if (typeof s !== "number" || !Number.isFinite(s) || s <= 0) return "";
+  const sec = Math.trunc(s);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function fmtWorkoutLine(wk: any): string {
+  const activityType = asString(wk?.activity_type).trim() || "Workout";
+  const startedAtISO = asString(wk?.started_at_iso).trim();
+  const when = startedAtISO ? startedAtISO.replace(".000Z", "Z") : "";
+  const dist = fmtDistanceMeters(wk?.distance_meters);
+  const dur = fmtDurationSeconds(wk?.duration_seconds);
+  const kcal = fmtKcal(wk?.active_energy_kcal);
+  const parts = [activityType, when ? `(${when})` : "", dur ? `• ${dur}` : "", dist ? `• ${dist}` : "", kcal ? `• ${kcal}` : ""].filter(Boolean);
+  return `Workout synced: ${parts.join(" ")}`.trim();
+}
+
 async function syncTelegram(env: Env) {
   const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
-  const acct = (env.SYNC_ACCOUNT_ADDRESS ?? "").trim();
-  if (!acct) throw new Error("Missing SYNC_ACCOUNT_ADDRESS (weight scope)");
   const chatTitle = (env.SYNC_CHAT_TITLE ?? "Smart Agent").trim();
   const tzName = (env.SYNC_TZ_NAME ?? "UTC").trim() || "UTC";
 
@@ -72,6 +115,9 @@ async function syncTelegram(env: Env) {
   const chat = chatList.find((c: any) => asString(c?.title).trim().toLowerCase() === chatTitle.toLowerCase());
   const chatId = asString(chat?.chatId).trim();
   if (!chatId) return { ok: true, imported: 0, replied: 0, reason: "chat_not_found" };
+
+  const acctRaw = normalizeAccountAddress((env.SYNC_ACCOUNT_ADDRESS ?? "").trim());
+  const acct = acctRaw || fallbackAccountAddressFromChatId(chatId);
 
   const msgs = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_messages", {
     chatId,
@@ -83,6 +129,7 @@ async function syncTelegram(env: Env) {
 
   let imported = 0;
   let replied = 0;
+  const errors: Array<{ messageId: number; error: string }> = [];
   for (const m of items) {
     const mid = safeInt(m?.messageId);
     if (mid == null) continue;
@@ -104,7 +151,11 @@ async function syncTelegram(env: Env) {
       locale: "en-US",
     });
 
-    if (out?.ok !== true) continue;
+    if (out?.ok !== true) {
+      const err = typeof out?.error === "string" ? out.error : JSON.stringify(out?.error ?? out).slice(0, 300);
+      errors.push({ messageId: mid, error: err });
+      continue;
+    }
     if (out?.kind === "ignored") continue;
     if (out?.deduped === true) continue;
     imported += 1;
@@ -141,13 +192,11 @@ async function syncTelegram(env: Env) {
     }
   }
 
-  return { ok: true, imported, replied };
+  return { ok: true, imported, replied, scopeAccountAddress: acct, errors: errors.slice(0, 5) };
 }
 
 async function syncStrava(env: Env) {
   const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
-  const acct = (env.SYNC_ACCOUNT_ADDRESS ?? "").trim();
-  if (!acct) throw new Error("Missing SYNC_ACCOUNT_ADDRESS (weight scope)");
   const tzName = (env.SYNC_TZ_NAME ?? "UTC").trim() || "UTC";
   const chatTitle = (env.SYNC_CHAT_TITLE ?? "Smart Agent").trim();
 
@@ -157,6 +206,9 @@ async function syncStrava(env: Env) {
   const chatId = asString(chat?.chatId).trim();
   if (!chatId) return { ok: true, inserted: 0, messaged: 0, reason: "chat_not_found" };
 
+  const acctRaw = normalizeAccountAddress((env.SYNC_ACCOUNT_ADDRESS ?? "").trim());
+  const acct = acctRaw || fallbackAccountAddressFromChatId(chatId);
+
   const lookbackDays = Number.parseInt((env.SYNC_LOOKBACK_DAYS ?? "7").trim(), 10);
   await mcpCall(env.STRAVA_MCP, apiKey, "strava_sync", { lookbackDays: Number.isFinite(lookbackDays) ? lookbackDays : 7 });
   const w = await mcpCall(env.STRAVA_MCP, apiKey, "strava_list_workouts", { limit: 50 });
@@ -164,6 +216,7 @@ async function syncStrava(env: Env) {
 
   let inserted = 0;
   let messaged = 0;
+  const errors: Array<{ workoutId: string; error: string }> = [];
   for (const wk of workouts.slice(0, 50)) {
     const workoutId = asString(wk?.workout_id).trim();
     if (!workoutId) continue;
@@ -184,11 +237,15 @@ async function syncStrava(env: Env) {
       activeEnergyKcal: kcal,
       raw: wk,
     });
-    if (out?.ok !== true) continue;
+    if (out?.ok !== true) {
+      const err = typeof out?.error === "string" ? out.error : JSON.stringify(out?.error ?? out).slice(0, 300);
+      errors.push({ workoutId, error: err });
+      continue;
+    }
     if (out?.deduped === true) continue;
     inserted += 1;
 
-    const line = `Workout synced: ${activityType || "Workout"} ${fmtKcal(kcal)}.`;
+    const line = fmtWorkoutLine(wk);
     await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_send_message", {
       chatId,
       text: line,
@@ -197,7 +254,7 @@ async function syncStrava(env: Env) {
     messaged += 1;
   }
 
-  return { ok: true, inserted, messaged, tzName };
+  return { ok: true, inserted, messaged, tzName, scopeAccountAddress: acct, errors: errors.slice(0, 5) };
 }
 
 async function runCron(env: Env) {
