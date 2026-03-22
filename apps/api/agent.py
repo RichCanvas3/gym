@@ -1069,6 +1069,25 @@ async def _handle_goal_slash_commands(msg: str, session: Optional[Session], thre
             await _memory_append(thread_id, "assistant", answer)
         return Output(answer=answer, citations=[], goalBundle=bundle)
 
+    if sub.startswith("reset"):
+        arg = sub[len("reset") :].strip()
+        if not arg or arg == "all":
+            bundle = _empty_goal_bundle()
+            answer = "Reset goal bundle."
+        else:
+            integrations = bundle.get("integrations") if isinstance(bundle.get("integrations"), dict) else {}
+            if any(k in arg for k in ["telegram", "meals", "weights"]):
+                integrations.pop("telegramMeals", None)
+                integrations.pop("telegramWeights", None)
+                bundle["integrations"] = integrations
+                answer = "Reset Telegram import cursors."
+            else:
+                answer = "Unknown reset target. Try `/goal reset telegram` or `/goal reset all`."
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], goalBundle=bundle)
+
     return None
 
 

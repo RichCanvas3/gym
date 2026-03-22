@@ -310,6 +310,56 @@ function numOrNull(v: unknown): number | null {
   return v;
 }
 
+type MealLabel = "breakfast" | "lunch" | "dinner" | "snack";
+
+function safeTzName(tzName: string | null | undefined): string {
+  const tz = (tzName ?? "").trim();
+  return tz || "UTC";
+}
+
+function localHour(atMs: number, tzName: string | null | undefined): number | null {
+  const tz = safeTzName(tzName);
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date(atMs));
+    const hh = parts.find((p) => p.type === "hour")?.value ?? "";
+    const n = Number.parseInt(hh, 10);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    try {
+      const hh = new Date(atMs).getUTCHours();
+      return Number.isFinite(hh) ? hh : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function coerceMealLabel(v: unknown): MealLabel | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim().toLowerCase();
+  if (t === "breakfast" || t === "lunch" || t === "dinner" || t === "snack") return t;
+  return null;
+}
+
+function inferMealLabel(atMs: number, tzName: string | null | undefined, text?: string | null): MealLabel {
+  const t = (text ?? "").trim().toLowerCase();
+  if (t.includes("breakfast")) return "breakfast";
+  if (t.includes("lunch")) return "lunch";
+  if (t.includes("dinner")) return "dinner";
+  if (t.includes("snack")) return "snack";
+
+  const h = localHour(atMs, tzName);
+  if (h == null) return "snack";
+  if (h >= 4 && h <= 10) return "breakfast";
+  if (h >= 11 && h <= 15) return "lunch";
+  if (h >= 16 && h <= 21) return "dinner";
+  return "snack";
+}
+
 type MealAnalysisJson = {
   items?: Array<{
     name?: string;
@@ -331,6 +381,35 @@ type MealAnalysisJson = {
   confidence?: number;
   notes?: string;
 };
+
+function looksGenericVisionNotes(s: string): boolean {
+  const t = s.trim().toLowerCase();
+  if (!t) return true;
+  if (t.startsWith("estimat")) return true;
+  if (t.includes("typical serving") || t.includes("typical portion") || t.includes("common ingredients")) return true;
+  return false;
+}
+
+function mealSummaryFromAnalysis(analysis: MealAnalysisJson): string {
+  const rawNames = Array.isArray(analysis.items)
+    ? analysis.items
+        .map((it) => (typeof it?.name === "string" ? it.name.trim() : ""))
+        .filter((x) => x)
+    : [];
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const n of rawNames) {
+    const k = n.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    names.push(n);
+    if (names.length >= 4) break;
+  }
+  if (names.length) return `Photo meal: ${names.join(", ")}`;
+  const notes = typeof analysis.notes === "string" ? analysis.notes.trim() : "";
+  if (notes && !looksGenericVisionNotes(notes)) return notes;
+  return "Meal (from photo analysis)";
+}
 
 type MealTextAnalysisJson = {
   meal?: string | null;
@@ -657,6 +736,7 @@ function toolList() {
           scope: scopeSchema,
           meal: { type: "string" },
           locale: { type: "string" },
+          tzName: { type: "string", description: "IANA timezone name (e.g. America/Denver) used for meal classification." },
           imageUrl: {
             type: "string",
             description: "Preferred; https URL fetched in this worker (bytes not sent in tool args).",
@@ -957,9 +1037,8 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     const at_ms = Number.isFinite(at_ms_from_model) ? Math.trunc(at_ms_from_model) : baseAtMs;
 
     const overrideMeal = normStr(args.meal);
-    const meal =
-      overrideMeal ??
-      (analysis?.meal && typeof analysis.meal === "string" ? normStr(analysis.meal) : null);
+    const mealFromModel = analysis?.meal && typeof analysis.meal === "string" ? normStr(analysis.meal) : null;
+    const meal = overrideMeal ?? coerceMealLabel(mealFromModel) ?? inferMealLabel(at_ms, tzName, rawText);
 
     const totals = analysis && typeof analysis === "object" ? (analysis.totals ?? {}) : {};
     const calories = typeof totals.calories === "number" ? totals.calories : null;
@@ -1181,6 +1260,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     const analysis = await visionAnalyzeMealPhoto(env, imageDataUrl, normStr(args.meal), normStr(args.locale));
     const model = (env.VISION_MODEL ?? "gpt-4o-mini").trim();
     const at_ms = "atMs" in args ? parseAtMs(args.atMs) : parseAtMs(args.atISO);
+    const tzName = normStr(args.tzName);
     const ts = nowMs();
     const id = crypto.randomUUID();
     const totals = analysis.totals ?? {};
@@ -1213,10 +1293,9 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       const carbs_g = typeof t.carbs_g === "number" ? t.carbs_g : null;
       const fat_g = typeof t.fat_g === "number" ? t.fat_g : null;
       const fiber_g = typeof t.fiber_g === "number" ? t.fiber_g : null;
-      const meal = normStr(args.meal);
-      const text =
-        analysis.notes?.trim() ||
-        `Meal (from photo analysis${analysis.confidence != null ? `, conf ${analysis.confidence}` : ""})`;
+      const explicitMeal = normStr(args.meal);
+      const meal = coerceMealLabel(explicitMeal) ?? inferMealLabel(at_ms, tzName, null);
+      const text = mealSummaryFromAnalysis(analysis);
       const fid = crypto.randomUUID();
       await env.DB.prepare(
         `INSERT INTO wm_food_entries
