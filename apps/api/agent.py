@@ -1994,7 +1994,13 @@ async def run(input: Input) -> Output:
         for w in recent[:10]:
             typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
             started = _parse_iso(w.get("started_at_iso"))
-            started_local = started.astimezone(tz).strftime("%Y-%m-%d %H:%M") if started else ""
+            # Show local start time (timezone-aware) to avoid confusing duration for a timestamp.
+            started_local = ""
+            if started:
+                try:
+                    started_local = started.astimezone(tz).strftime("%a %H:%M")
+                except Exception:
+                    started_local = started.astimezone(tz).strftime("%Y-%m-%d %H:%M")
             dist_m = w.get("distance_meters")
             dist_s = ""
             if isinstance(dist_m, (int, float)) and dist_m > 0:
