@@ -2,13 +2,13 @@
 
 import Link from "next/link";
 import { useMemo } from "react";
-import { useWaiver } from "@/components/waiver/WaiverProvider";
+import { useAuth } from "@/components/auth/AuthProvider";
 import { useCart } from "@/components/cart/CartProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
-import { CalendarDays, FileSignature, MessageCircle, ShoppingCart, UserCircle2 } from "lucide-react";
+import { CalendarDays, MessageCircle, ShoppingCart, UserCircle2 } from "lucide-react";
 
 export function AppHeader() {
-  const { waiver, clearWaiver } = useWaiver();
+  const { authenticated, accountAddress, login, logout } = useAuth();
   const { lines, clear } = useCart();
   const { reservations, clearReservations } = useReservations();
 
@@ -50,22 +50,15 @@ export function AppHeader() {
             <MessageCircle className="h-4 w-4" aria-hidden="true" />
             Chat
           </Link>
-          <Link
-            href="/waiver"
-            className="inline-flex h-9 items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
-          >
-            <FileSignature className="h-4 w-4" aria-hidden="true" />
-            Waiver
-          </Link>
         </div>
 
         <div className="hidden items-center gap-3 md:flex">
           <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-white/10 dark:bg-zinc-950">
             <UserCircle2 className="h-4 w-4 text-zinc-600 dark:text-zinc-400" aria-hidden="true" />
-            {waiver ? (
+            {authenticated && accountAddress ? (
               <div className="min-w-0">
-                <div className="truncate font-semibold">{waiver.participantName}</div>
-                <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">{waiver.accountAddress}</div>
+                <div className="truncate font-semibold">Signed in</div>
+                <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">{accountAddress}</div>
               </div>
             ) : (
               <div className="text-zinc-600 dark:text-zinc-400">Not signed in</div>
@@ -81,11 +74,12 @@ export function AppHeader() {
             onClick={() => {
               clear();
               clearReservations();
-              clearWaiver();
+              if (authenticated) logout();
+              else login();
             }}
             className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
           >
-            Log out
+            {authenticated ? "Log out" : "Log in"}
           </button>
         </div>
       </div>

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
-import { useWaiver } from "@/components/waiver/WaiverProvider";
+import { useAuth } from "@/components/auth/AuthProvider";
 import { useRouter } from "next/navigation";
 
 type ChatMessage = {
@@ -38,7 +38,7 @@ type SuggestedCartItem = {
 export default function ChatPage() {
   const router = useRouter();
   const { lines, addLine, removeSku, clear } = useCart();
-  const { waiver } = useWaiver();
+  const { ready, authenticated, accountAddress, getAccessToken, login } = useAuth();
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -59,8 +59,10 @@ export default function ChatPage() {
     "sedentary" | "light" | "moderate" | "very_active" | ""
   >("");
 
-  const threadId = waiver?.accountAddress ? `thr_${waiver.accountAddress}` : "thr_demo";
+  const threadId = accountAddress ? `thr_${accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}` : "thr_anon";
   const [hydrated, setHydrated] = useState(false);
+  const showLoading = !ready;
+  const showLoginGate = Boolean(ready) && !authenticated;
 
   useEffect(() => {
     try {
@@ -74,6 +76,10 @@ export default function ChatPage() {
   useEffect(() => {
     let cancelled = false;
     async function loadHistory() {
+      if (!authenticated) {
+        if (!cancelled) setHydrated(true);
+        return;
+      }
       const tid = threadId || "thr_demo";
 
       // Load from browser cache first (fast, works even if server memory isn't ready).
@@ -119,9 +125,10 @@ export default function ChatPage() {
 
       const url = "/api/agent/run";
       try {
+        const tok = await getAccessToken();
         const res = await fetch(url, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
           body: JSON.stringify({
             message: "__CHAT_HISTORY__",
             session: {
@@ -129,15 +136,7 @@ export default function ChatPage() {
               timezone: clientTz || "America/Denver",
               threadId: tid,
               goalBundle: goalBundle ?? undefined,
-              waiver: waiver
-                ? {
-                    id: waiver.id,
-                    accountAddress: waiver.accountAddress,
-                    participantName: waiver.participantName,
-                    participantEmail: waiver.participantEmail,
-                    isMinor: waiver.isMinor,
-                  }
-                : undefined,
+              accountAddress: accountAddress ?? undefined,
             },
           }),
         });
@@ -177,34 +176,28 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [threadId, waiver, clientTz]);
+  }, [threadId, clientTz, accountAddress, getAccessToken]);
 
   useEffect(() => {
     let cancelled = false;
     async function loadProfile() {
+      if (!authenticated) return;
       if (!hydrated) return;
-      if (!waiver?.accountAddress) return;
+      if (!accountAddress) return;
       try {
         setProfileBusy(true);
         setProfileError(null);
+        const tok = await getAccessToken();
         const res = await fetch("/api/agent/run", {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
           body: JSON.stringify({
             message: "__WEIGHT_PROFILE_GET__",
             session: {
               gymName: "Erie Community Center",
               timezone: clientTz || "America/Denver",
               threadId: threadId || "thr_demo",
-              waiver: waiver
-                ? {
-                    id: waiver.id,
-                    accountAddress: waiver.accountAddress,
-                    participantName: waiver.participantName,
-                    participantEmail: waiver.participantEmail,
-                    isMinor: waiver.isMinor,
-                  }
-                : undefined,
+              accountAddress,
             },
           }),
         });
@@ -245,7 +238,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [hydrated, waiver?.accountAddress, clientTz, threadId]);
+  }, [hydrated, accountAddress, clientTz, threadId, getAccessToken]);
 
   useEffect(() => {
     const tid = threadId || "thr_demo";
@@ -271,6 +264,7 @@ export default function ChatPage() {
     setBusy(true);
     try {
       const url = "/api/agent/run";
+      const tok = await getAccessToken();
       const body = {
         message: text,
         session: {
@@ -279,21 +273,13 @@ export default function ChatPage() {
           cartLines: lines,
           threadId: threadId || "thr_demo",
           goalBundle: goalBundle ?? undefined,
-          waiver: waiver
-            ? {
-                id: waiver.id,
-                accountAddress: waiver.accountAddress,
-                participantName: waiver.participantName,
-                participantEmail: waiver.participantEmail,
-                isMinor: waiver.isMinor,
-              }
-            : undefined,
+          accountAddress: accountAddress ?? undefined,
         },
       };
 
       const res = await fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
         body: JSON.stringify(body),
       });
 
@@ -347,11 +333,6 @@ export default function ChatPage() {
 
       // Auto-navigate when agent signals it.
       const ui = parseUiActions(payload?.uiActions);
-      const wantsWaiver = ui.some((a) => a.type === "navigate" && a.to === "/waiver");
-      if (wantsWaiver) {
-        router.push("/waiver");
-        return;
-      }
       const wantsCalendar = ui.some((a) => a.type === "navigate" && a.to === "/calendar");
       if (wantsCalendar) {
         router.push("/calendar");
@@ -381,6 +362,25 @@ export default function ChatPage() {
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-black dark:text-zinc-50">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-10">
+        {showLoading ? (
+          <div className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-300">
+            Loading…
+          </div>
+        ) : showLoginGate ? (
+          <div className="rounded-3xl border border-zinc-200 bg-white p-8 dark:border-white/10 dark:bg-zinc-950">
+            <div className="text-xl font-semibold tracking-tight">Sign in to use the copilot</div>
+            <div className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
+              Chat, calendar, and fitness tracking require authentication.
+            </div>
+            <button
+              onClick={() => login()}
+              className="mt-6 inline-flex h-11 w-full items-center justify-center rounded-xl bg-zinc-900 px-4 text-sm font-medium text-white dark:bg-white dark:text-black"
+            >
+              Log in
+            </button>
+          </div>
+        ) : (
+          <>
         <header className="flex flex-col gap-1">
           <div className="flex items-center justify-between gap-4">
             <h1 className="text-2xl font-semibold tracking-tight">Erie Rec Center Copilot</h1>
@@ -462,7 +462,7 @@ export default function ChatPage() {
           </div>
         </main>
 
-        {hydrated && waiver?.accountAddress && profileMissing ? (
+        {hydrated && accountAddress && profileMissing ? (
           <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-50">
             <div className="font-semibold">Complete your profile (for TDEE + calorie burn estimates)</div>
             {profileError ? <div className="mt-2 text-xs opacity-90">{profileError}</div> : null}
@@ -516,10 +516,11 @@ export default function ChatPage() {
               <button
                 disabled={profileBusy}
                 onClick={async () => {
-                  if (!waiver?.accountAddress) return;
+                  if (!accountAddress) return;
                   setProfileBusy(true);
                   setProfileError(null);
                   try {
+                    const tok = await getAccessToken();
                     const ageN = Number.parseInt(profileAge.trim(), 10);
                     const heightN = Number.parseFloat(profileHeightIn.trim());
                     const profile: Record<string, unknown> = {};
@@ -530,44 +531,28 @@ export default function ChatPage() {
                     if (profileActivityLevel) profile.activity_level = profileActivityLevel;
                     await fetch("/api/agent/run", {
                       method: "POST",
-                      headers: { "content-type": "application/json" },
+                      headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
                       body: JSON.stringify({
                         message: `__WEIGHT_PROFILE_UPSERT__:${JSON.stringify({ profile })}`,
                         session: {
                           gymName: "Erie Community Center",
                           timezone: clientTz || "America/Denver",
                           threadId: threadId || "thr_demo",
-                          waiver: waiver
-                            ? {
-                                id: waiver.id,
-                                accountAddress: waiver.accountAddress,
-                                participantName: waiver.participantName,
-                                participantEmail: waiver.participantEmail,
-                                isMinor: waiver.isMinor,
-                              }
-                            : undefined,
+                          accountAddress,
                         },
                       }),
                     });
                     // Reload profile to confirm it persisted.
                     const res2 = await fetch("/api/agent/run", {
                       method: "POST",
-                      headers: { "content-type": "application/json" },
+                      headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
                       body: JSON.stringify({
                         message: "__WEIGHT_PROFILE_GET__",
                         session: {
                           gymName: "Erie Community Center",
                           timezone: clientTz || "America/Denver",
                           threadId: threadId || "thr_demo",
-                          waiver: waiver
-                            ? {
-                                id: waiver.id,
-                                accountAddress: waiver.accountAddress,
-                                participantName: waiver.participantName,
-                                participantEmail: waiver.participantEmail,
-                                isMinor: waiver.isMinor,
-                              }
-                            : undefined,
+                          accountAddress,
                         },
                       }),
                     });
@@ -633,6 +618,8 @@ export default function ChatPage() {
             Send
           </button>
         </div>
+          </>
+        )}
       </div>
     </div>
   );

@@ -46,7 +46,7 @@ async def test_food_past_week_summary(monkeypatch):
             message="what have i eaten in past week",
             session=Session(
                 timezone="America/Denver",
-                waiver={"accountAddress": "acct_cust_casey"},
+                accountAddress="acct_cust_casey",
             ),
         )
     )
@@ -101,7 +101,7 @@ async def test_workouts_past_few_days_summary(monkeypatch):
             message="show me my workouts over last week",
             session=Session(
                 timezone="America/Denver",
-                waiver={"accountAddress": "acct_cust_casey"},
+                accountAddress="acct_cust_casey",
             ),
         )
     )

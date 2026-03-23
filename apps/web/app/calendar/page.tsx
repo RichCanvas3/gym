@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { Suspense, useEffect, useMemo, useState } from "react";
-import { useWaiver } from "@/components/waiver/WaiverProvider";
+import { useAuth } from "@/components/auth/AuthProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -11,7 +11,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
-  FileSignature,
   Filter,
   MessageCircle,
   MoreHorizontal,
@@ -82,7 +81,7 @@ type Filters = {
 function CalendarInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const { waiver } = useWaiver();
+  const { ready, authenticated, accountAddress, getAccessToken, login } = useAuth();
   const { reservations, addReservation, clearReservations } = useReservations();
 
   const [classes, setClasses] = useState<GymClass[]>([]);
@@ -90,6 +89,19 @@ function CalendarInner() {
   const [weatherErr, setWeatherErr] = useState<string>("");
   const [reserveBusyId, setReserveBusyId] = useState<string>("");
   const [reserveMsg, setReserveMsg] = useState<string>("");
+  const [clientTz, setClientTz] = useState<string>("America/Denver");
+
+  const showLoading = !ready;
+  const showLoginGate = Boolean(ready) && !authenticated;
+
+  useEffect(() => {
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (tz && typeof tz === "string") setClientTz(tz);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const weekStartISO = useMemo(() => {
     const raw = String(params?.get("start") ?? "");
@@ -129,8 +141,13 @@ function CalendarInner() {
   useEffect(() => {
     let cancelled = false;
     async function load() {
+      if (!authenticated) return;
       setWeatherErr("");
-      const res = await fetch(`/api/calendar/week?start=${encodeURIComponent(weekStartISO)}`, { cache: "no-store" });
+      const tok = await getAccessToken();
+      const res = await fetch(
+        `/api/calendar/week?start=${encodeURIComponent(weekStartISO)}&tz=${encodeURIComponent(clientTz || "America/Denver")}`,
+        { cache: "no-store", headers: { authorization: `Bearer ${tok}` } },
+      );
       const json = (await res.json().catch(() => ({}))) as unknown;
       if (!res.ok) {
         const j = json as Record<string, unknown>;
@@ -180,7 +197,7 @@ function CalendarInner() {
     return () => {
       cancelled = true;
     };
-  }, [weekStartISO]);
+  }, [weekStartISO, authenticated, getAccessToken, clientTz]);
 
   const reservationsByClassId = useMemo(() => {
     const map = new Map<string, string>();
@@ -219,6 +236,25 @@ function CalendarInner() {
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-black dark:text-zinc-50">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-10">
+        {showLoading ? (
+          <div className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-300">
+            Loading…
+          </div>
+        ) : showLoginGate ? (
+          <div className="rounded-3xl border border-zinc-200 bg-white p-8 dark:border-white/10 dark:bg-zinc-950">
+            <div className="text-xl font-semibold tracking-tight">Sign in to view the calendar</div>
+            <div className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
+              The calendar requires authentication.
+            </div>
+            <button
+              onClick={() => login()}
+              className="mt-6 inline-flex h-11 w-full items-center justify-center rounded-xl bg-zinc-900 px-4 text-sm font-medium text-white dark:bg-white dark:text-black"
+            >
+              Log in
+            </button>
+          </div>
+        ) : (
+          <>
         <header className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
           <div>
             <div className="flex items-center gap-2">
@@ -269,13 +305,6 @@ function CalendarInner() {
             >
               <MessageCircle className="h-4 w-4" aria-hidden="true" />
               Chat
-            </Link>
-            <Link
-              href="/waiver"
-              className="inline-flex h-10 items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 text-sm font-medium dark:border-white/10 dark:bg-zinc-950"
-            >
-              <FileSignature className="h-4 w-4" aria-hidden="true" />
-              Waiver
             </Link>
           </div>
         </header>
@@ -466,28 +495,23 @@ function CalendarInner() {
                                     disabled={reserveBusyId === c.id}
                                     onClick={async () => {
                                       setReserveMsg("");
-                                      if (!waiver?.id || !waiver.accountAddress) {
-                                        setReserveMsg("Reserve requires a saved waiver with a canonical account address.");
+                                      if (!accountAddress) {
+                                        setReserveMsg("Sign in required to reserve.");
                                         return;
                                       }
                                       setReserveBusyId(c.id);
                                       try {
+                                        const tok = await getAccessToken();
                                         const res = await fetch("/api/agent/run", {
                                           method: "POST",
-                                          headers: { "content-type": "application/json" },
+                                          headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
                                           body: JSON.stringify({
                                             message: `__RESERVE_CLASS__:${c.id}`,
                                             session: {
                                               gymName: "Erie Community Center",
-                                              timezone: "America/Denver",
-                                              threadId: waiver?.accountAddress ? `thr_${waiver.accountAddress}` : undefined,
-                                              waiver: {
-                                                id: waiver.id,
-                                                accountAddress: waiver.accountAddress,
-                                                participantName: waiver.participantName,
-                                                participantEmail: waiver.participantEmail,
-                                                isMinor: waiver.isMinor,
-                                              },
+                                              timezone: clientTz || "America/Denver",
+                                              threadId: accountAddress ? `thr_${accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}` : undefined,
+                                              accountAddress,
                                             },
                                           }),
                                         });
@@ -510,7 +534,7 @@ function CalendarInner() {
                                               isOutdoor,
                                               reservedAtISO: new Date().toISOString(),
                                             });
-                                            setReserveMsg("Reserved. Check your email for confirmation.");
+                                            setReserveMsg("Reserved.");
                                             return;
                                           }
                                         }
@@ -551,6 +575,8 @@ function CalendarInner() {
         </footer>
 
         {reserveMsg ? <div className="text-sm text-zinc-600 dark:text-zinc-400">{reserveMsg}</div> : null}
+          </>
+        )}
       </div>
     </div>
   );

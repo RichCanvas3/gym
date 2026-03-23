@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
-import { useWaiver } from "@/components/waiver/WaiverProvider";
+import { useAuth } from "@/components/auth/AuthProvider";
 
 type CatalogItem = {
   sku: string;
@@ -23,10 +23,32 @@ function formatUSD(cents: number) {
 
 export default function CartPage() {
   const { lines, removeSku, clear } = useCart();
-  const { waiver } = useWaiver();
+  const { ready, authenticated, user, accountAddress, getAccessToken, login } = useAuth();
   const [catalogBySku, setCatalogBySku] = useState<Record<string, CatalogItem>>({});
   const [checkoutBusy, setCheckoutBusy] = useState(false);
   const [checkoutMsg, setCheckoutMsg] = useState<string>("");
+  const [clientTz, setClientTz] = useState<string>("America/Denver");
+
+  useEffect(() => {
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (tz && typeof tz === "string") setClientTz(tz);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  function extractEmail(u: unknown): string {
+    if (!u || typeof u !== "object") return "";
+    const o = u as any;
+    const e1 = typeof o?.email?.address === "string" ? o.email.address : "";
+    if (e1.trim()) return e1.trim();
+    const e2 = typeof o?.google?.email === "string" ? o.google.email : "";
+    if (e2.trim()) return e2.trim();
+    const e3 = typeof o?.apple?.email === "string" ? o.apple.email : "";
+    if (e3.trim()) return e3.trim();
+    return "";
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -130,26 +152,33 @@ export default function CartPage() {
               disabled={checkoutBusy || lines.length === 0}
               onClick={async () => {
                 setCheckoutMsg("");
-                if (!waiver?.participantEmail) {
-                  setCheckoutMsg("Checkout requires a waiver on file (for email receipt).");
+                if (!ready || !authenticated) {
+                  setCheckoutMsg("Please log in to checkout.");
+                  login();
+                  return;
+                }
+                if (!accountAddress) {
+                  setCheckoutMsg("Missing account identity.");
+                  return;
+                }
+                const email = extractEmail(user);
+                if (!email) {
+                  setCheckoutMsg("Checkout requires an email (link an email login in Privy).");
                   return;
                 }
                 setCheckoutBusy(true);
                 try {
+                  const tok = await getAccessToken();
                   const res = await fetch("/api/checkout", {
                     method: "POST",
-                    headers: { "content-type": "application/json" },
+                    headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
                     body: JSON.stringify({
                       session: {
                         gymName: "Erie Community Center",
-                        timezone: "America/Denver",
+                        timezone: clientTz || "America/Denver",
                         cartLines: lines,
-                        waiver: {
-                          id: waiver.id,
-                          participantName: waiver.participantName,
-                          participantEmail: waiver.participantEmail,
-                          isMinor: waiver.isMinor,
-                        },
+                        accountAddress,
+                        userEmail: email,
                       },
                     }),
                   });

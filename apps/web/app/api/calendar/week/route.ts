@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requirePrivyAuth } from "../../_lib/privy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,8 +12,12 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Missing LANGGRAPH_DEPLOYMENT_URL or LANGSMITH_API_KEY" }, { status: 500 });
   }
 
+  const auth = await requirePrivyAuth(req);
+  if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+
   const url = new URL(req.url);
   const start = url.searchParams.get("start") ?? "";
+  const tz = url.searchParams.get("tz") ?? "America/Denver";
   const msg = `__CALENDAR_WEEK__:${start}`;
 
   const res = await fetch(`${deploymentUrl.replace(/\/$/, "")}/runs/wait`, {
@@ -20,7 +25,15 @@ export async function GET(req: Request) {
     headers: { "content-type": "application/json", "x-api-key": apiKey },
     body: JSON.stringify({
       assistant_id: assistantId,
-      input: { message: msg, session: { gymName: "Erie Community Center", timezone: "America/Denver" } },
+      input: {
+        message: msg,
+        session: {
+          gymName: "Erie Community Center",
+          timezone: tz || "America/Denver",
+          accountAddress: auth.accountAddress,
+          threadId: `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`,
+        },
+      },
     }),
   });
 

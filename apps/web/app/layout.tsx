@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { CartProvider } from "@/components/cart/CartProvider";
-import { WaiverProvider } from "@/components/waiver/WaiverProvider";
+import { AuthProvider } from "@/components/auth/AuthProvider";
 import { ReservationsProvider } from "@/components/reservations/ReservationsProvider";
 import { AppHeader } from "@/components/nav/AppHeader";
 
@@ -32,12 +32,12 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <CartProvider>
-          <WaiverProvider>
+          <AuthProvider>
             <ReservationsProvider>
               <AppHeader />
               {children}
             </ReservationsProvider>
-          </WaiverProvider>
+          </AuthProvider>
         </CartProvider>
       </body>
     </html>

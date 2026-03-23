@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requirePrivyAuth } from "../../_lib/privy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +13,9 @@ export async function POST(req: Request) {
   const deploymentUrl = process.env.LANGGRAPH_DEPLOYMENT_URL ?? "";
   const apiKey = process.env.LANGSMITH_API_KEY ?? "";
   const assistantId = process.env.LANGGRAPH_ASSISTANT_ID ?? "gym";
+
+  const auth = await requirePrivyAuth(req);
+  if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   if (!deploymentUrl || !apiKey) {
     return NextResponse.json(
@@ -28,8 +32,16 @@ export async function POST(req: Request) {
   const session =
     body?.session && typeof body.session === "object" ? (body.session as Record<string, unknown>) : undefined;
 
+  const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
+  sessionOut.accountAddress = auth.accountAddress;
+  // Remove legacy/unsupported identity field (waiver flow removed).
+  if ("waiver" in sessionOut) delete (sessionOut as any).waiver;
+  const derivedThreadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;
   const threadId =
-    session && typeof (session as any).threadId === "string" ? String((session as any).threadId) : undefined;
+    typeof (sessionOut as any).threadId === "string" && String((sessionOut as any).threadId).trim()
+      ? String((sessionOut as any).threadId)
+      : derivedThreadId;
+  sessionOut.threadId = threadId;
 
   const url = `${deploymentUrl.replace(/\/$/, "")}/runs/wait`;
   const res = await fetch(url, {
@@ -40,7 +52,7 @@ export async function POST(req: Request) {
     },
     body: JSON.stringify({
       assistant_id: assistantId,
-      input: { message, session },
+      input: { message, session: sessionOut },
       // LangGraph uses thread_id (via config) to restore state when a checkpointer is configured.
       config: threadId ? { configurable: { thread_id: threadId } } : undefined,
     }),

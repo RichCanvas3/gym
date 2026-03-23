@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requirePrivyAuth } from "../_lib/privy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +13,9 @@ export async function POST(req: Request) {
   const apiKey = process.env.LANGSMITH_API_KEY ?? "";
   const assistantId = process.env.LANGGRAPH_ASSISTANT_ID ?? "gym";
 
+  const auth = await requirePrivyAuth(req);
+  if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+
   if (!deploymentUrl || !apiKey) {
     return NextResponse.json(
       { error: "Missing LANGGRAPH_DEPLOYMENT_URL or LANGSMITH_API_KEY" },
@@ -24,6 +28,12 @@ export async function POST(req: Request) {
     body?.session && typeof body.session === "object"
       ? (body.session as Record<string, unknown>)
       : undefined;
+  const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
+  sessionOut.accountAddress = auth.accountAddress;
+  if ("waiver" in sessionOut) delete (sessionOut as any).waiver;
+  if (typeof (sessionOut as any).threadId !== "string" || !String((sessionOut as any).threadId).trim()) {
+    sessionOut.threadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+  }
 
   const url = `${deploymentUrl.replace(/\/$/, "")}/runs/wait`;
   const res = await fetch(url, {
@@ -34,7 +44,7 @@ export async function POST(req: Request) {
     },
     body: JSON.stringify({
       assistant_id: assistantId,
-      input: { message: "__CHECKOUT__", session },
+      input: { message: "__CHECKOUT__", session: sessionOut },
     }),
   });
 

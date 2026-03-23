@@ -25,7 +25,7 @@ async def test_langgraph_runs_wait_live():
                 "assistant_id": assistant_id,
                 "input": {
                     "message": "show me my workouts over last week",
-                    "session": {"timezone": "America/Denver", "waiver": {"accountAddress": "acct_cust_casey"}},
+                    "session": {"timezone": "America/Denver", "accountAddress": "acct_cust_casey"},
                 },
             },
         )
@@ -57,7 +57,7 @@ async def test_langgraph_today_calorie_overview_live():
                 "assistant_id": assistant_id,
                 "input": {
                     "message": "what about my exercise/workouts and day calorie burn overview today",
-                    "session": {"timezone": "America/Denver", "waiver": {"accountAddress": "acct_cust_casey"}},
+                    "session": {"timezone": "America/Denver", "accountAddress": "acct_cust_casey"},
                 },
             },
         )

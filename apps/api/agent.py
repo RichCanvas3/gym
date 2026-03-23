@@ -42,6 +42,31 @@ def _waiver_account_address(session: Optional["Session"]) -> str:
     return v.strip() if isinstance(v, str) else ""
 
 
+def _session_account_address(session: Optional["Session"]) -> str:
+    if session and isinstance(getattr(session, "accountAddress", None), str):
+        v = str(getattr(session, "accountAddress") or "").strip()
+        if v:
+            return v
+    # legacy
+    return _waiver_account_address(session)
+
+
+def _session_email(session: Optional["Session"]) -> str:
+    if session and isinstance(getattr(session, "userEmail", None), str):
+        v = str(getattr(session, "userEmail") or "").strip()
+        if v:
+            return v
+    return _waiver_email(session)
+
+
+def _session_participant(session: Optional["Session"]) -> str:
+    if session and isinstance(getattr(session, "userName", None), str):
+        v = str(getattr(session, "userName") or "").strip()
+        if v:
+            return v
+    return _waiver_participant(session)
+
+
 def _waiver_participant(session: Optional["Session"]) -> str:
     if not session or not isinstance(session.waiver, dict):
         return ""
@@ -336,8 +361,8 @@ async def _handle_checkout(session: Optional["Session"]) -> "Output":
             citations=[],
         )
 
-    email = _waiver_email(session)
-    participant = _waiver_participant(session) or "Guest"
+    email = _session_email(session)
+    participant = _session_participant(session) or "Member"
 
     core_products = await _core_call_json("core_list_products", {}) or {}
     products_list = core_products.get("products") if isinstance(core_products, dict) else None
@@ -391,7 +416,7 @@ async def _handle_checkout(session: Optional["Session"]) -> "Output":
         if email_err and not emailed:
             msg += f" ({email_err})"
     else:
-        msg += " No email on file (complete a waiver to add email)."
+        msg += " No email on file."
 
     return Output(
         answer=msg,
@@ -406,15 +431,15 @@ async def _handle_reserve_class(session: Optional["Session"], class_id: str) -> 
     if not class_id:
         return Output(answer="Missing classId.", citations=[])
 
-    account_address = _waiver_account_address(session)
-    participant_email = _waiver_email(session)
-    participant_name = _waiver_participant(session)
+    account_address = _session_account_address(session)
+    participant_email = _session_email(session)
+    participant_name = _session_participant(session)
 
     if not account_address:
         return Output(
-            answer="Reservation requires a saved waiver with accountAddress (canonical).",
+            answer="Reservation requires an authenticated accountAddress.",
             citations=[],
-            uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address for reservation"}],
+            uiActions=[],
         )
 
     cls_resp = await _scheduling_call_json("schedule_get_class", {"classId": class_id})
@@ -483,7 +508,7 @@ async def _handle_reserve_class(session: Optional["Session"], class_id: str) -> 
         if email_err and not emailed:
             answer += f" ({email_err})"
     else:
-        answer += " No email on file (waiver participantEmail missing)."
+        answer += " No email on file."
 
     return Output(
         answer=answer,
@@ -504,6 +529,8 @@ class Session(BaseModel):
     gymName: Optional[str] = None
     timezone: Optional[str] = None
     userName: Optional[str] = None
+    userEmail: Optional[str] = None
+    accountAddress: Optional[str] = None
     userGoals: Optional[str] = None
     """User-defined outcomes + executable checklist; synced from the chat UI (GoalBundleJSON). Domain-agnostic."""
     goalBundle: Optional[dict[str, Any]] = None
@@ -562,7 +589,6 @@ def build_system_prompt() -> str:
             "- For class reservations, reserve seats via the scheduling MCP using canonical account addresses, record a reservation ledger entry in gym-core, then send a confirmation email when possible.",
             "- For checkout, provide a concise receipt and send an email receipt when possible.",
             "- If discussing a specific outdoor class that is scheduled in the future, include forecast context for that class time when possible.",
-            "- If the user needs to sign a waiver (first visit, waiver questions), direct them to the online waiver page at /waiver. If they are under 18, a parent/guardian must sign. For climbing-wall-specific access, remind them a climbing waiver may be required.",
             "- When asked about policies, class descriptions, coach bios, or general FAQs, use the knowledge search tool (RAG).",
             "- If you use knowledge search, include a short 'Sources' list at the end with the sourceIds you relied on.",
             "- If you use ops, mention the as-of timestamp returned by the tool.",
@@ -572,8 +598,7 @@ def build_system_prompt() -> str:
             "  - Use real SKUs (use gym-core products when possible).",
             "- For web UI automation, you MAY also include these machine-readable directives at the very end (each on its own line):",
             "  - `CartActionsJSON:` followed by a JSON array of `{ op: \"add\"|\"remove\"|\"clear\", sku?, quantity?, note? }`.",
-            "  - `UIActionsJSON:` followed by a JSON array of `{ type: \"navigate\", to: \"/waiver\"|\"/cart\"|\"/shop\"|\"/chat\"|\"/calendar\", reason? }`.",
-            "- If a waiver must be signed before proceeding, include a UI action to navigate to `/waiver`.",
+            "  - `UIActionsJSON:` followed by a JSON array of `{ type: \"navigate\", to: \"/cart\"|\"/shop\"|\"/chat\"|\"/calendar\", reason? }`.",
             "- If you add/remove items via CartActionsJSON, include a UI action to navigate to `/cart`.",
             "- Only navigate to `/calendar` if the user explicitly asks for a calendar/week view.",
             "",
@@ -586,7 +611,7 @@ def build_system_prompt() -> str:
             "- Field `trainingPlan` is a generic checklist of executable items (name is legacy); you may also use `actionPlan` with the same array shape—either is accepted.",
             "- Use dayLabel/activity for whatever fits the domain (e.g. sprint name + task, week + deliverable, date + habit). Fill startTimeISO/endTimeISO when the user’s timezone and timing are known so calendar MCP can run.",
             "- Slash commands: `/goal status` dumps the bundle; `/goal tick` completes the next incomplete checklist item; `/goal tick N` or `/goal tick <substring>` matches row or label. `/goal set …` → merge into primaryGoal / focus via GoalBundleJSON.",
-            "- Execution: when the user asks to put “this” or “the plan” on a calendar, use the checklist you or GoalBundle already defined—call Google Calendar MCP (e.g. googlecalendar_create_event) per item with waiver accountAddress; don’t demand unrelated generic “event details”.",
+            "- Execution: when the user asks to put “this” or “the plan” on a calendar, use the checklist you or GoalBundle already defined—call Google Calendar MCP (e.g. googlecalendar_create_event) per item with the user’s accountAddress; don’t demand unrelated generic “event details”.",
             "- If Calendar MCP isn’t connected, explain and point to /oauth/start?accountAddress=<their address>.",
             "- Other integrations (email, class booking, scheduling, gym catalog) are tools toward the user’s stated outcomes—pick what fits their ask, not a fixed playbook.",
             "",
@@ -805,12 +830,8 @@ def _parse_weight_from_text(text: str) -> tuple[Optional[float], Optional[float]
 
 
 def _weight_scope_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
-    if not session or not isinstance(session.waiver, dict):
-        return None
-    addr = session.waiver.get("accountAddress")
-    if isinstance(addr, str) and addr.strip():
-        return {"accountAddress": addr.strip()}
-    return None
+    addr = _session_account_address(session)
+    return {"accountAddress": addr} if addr else None
 
 
 async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1399,12 +1420,12 @@ async def run(input: Input) -> Output:
     msg = input.message.strip()
     mlow = msg.lower()
 
-    acct = _waiver_account_address(input.session)
+    acct = _session_account_address(input.session)
     thread_id = ""
     if input.session and isinstance(input.session.threadId, str) and input.session.threadId.strip():
         thread_id = input.session.threadId.strip()
     elif acct:
-        thread_id = f"thr_{acct}"
+        thread_id = f"thr_{acct.replace(':', '_')}"
 
     if acct and thread_id:
         await _core_call_json("core_memory_ensure_thread", {"canonicalAddress": acct, "threadId": thread_id, "title": "Gym chat"})
@@ -1428,9 +1449,9 @@ async def run(input: Input) -> Output:
 
     # UI helper: get current weight-management profile for this user.
     if msg == "__WEIGHT_PROFILE_GET__":
-        addr = _waiver_account_address(input.session)
+        addr = _session_account_address(input.session)
         if not addr:
-            return Output(answer="Missing waiver accountAddress.", citations=[], data={"error": "missing_account"})
+            return Output(answer="Missing accountAddress.", citations=[], data={"error": "missing_account"})
         prof = await _weight_call_json("weight_profile_get", {"scope": {"accountAddress": addr}})
         if prof is None:
             return Output(
@@ -1454,9 +1475,9 @@ async def run(input: Input) -> Output:
         )
 
     if msg.startswith("__WEIGHT_PROFILE_UPSERT__:"):
-        addr = _waiver_account_address(input.session)
+        addr = _session_account_address(input.session)
         if not addr:
-            return Output(answer="Missing waiver accountAddress.", citations=[], data={"error": "missing_account"})
+            return Output(answer="Missing accountAddress.", citations=[], data={"error": "missing_account"})
         try:
             payload = json.loads(msg.split(":", 1)[1].strip())
         except Exception:
@@ -1629,9 +1650,9 @@ async def run(input: Input) -> Output:
 
         if not acct:
             return Output(
-                answer="Booking requires a saved waiver with accountAddress (canonical).",
+                answer="Booking requires an authenticated accountAddress.",
                 citations=[],
-                uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address for booking"}],
+                uiActions=[],
             )
 
         class_id = str(picked.get("classId") or "").strip()
@@ -1742,11 +1763,11 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals, but I need your waiver accountAddress. Please fill out /waiver."
+            answer = "I can summarize meals, but I need your accountAddress (sign in)."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address"}])
+            return Output(answer=answer, citations=[], uiActions=[])
 
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
@@ -1860,11 +1881,11 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals, but I need your waiver accountAddress. Please fill out /waiver."
+            answer = "I can summarize meals, but I need your accountAddress (sign in)."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address"}])
+            return Output(answer=answer, citations=[], uiActions=[])
 
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
@@ -1973,11 +1994,11 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals + exercise, but I need your waiver accountAddress. Please fill out /waiver."
+            answer = "I can summarize meals + exercise, but I need your accountAddress (sign in)."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address"}])
+            return Output(answer=answer, citations=[], uiActions=[])
 
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
@@ -2098,11 +2119,11 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals + exercise, but I need your waiver accountAddress. Please fill out /waiver."
+            answer = "I can summarize meals + exercise, but I need your accountAddress (sign in)."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], uiActions=[{"type": "navigate", "to": "/waiver", "reason": "need canonical account address"}])
+            return Output(answer=answer, citations=[], uiActions=[])
 
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
