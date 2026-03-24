@@ -28,6 +28,38 @@ function canonicalizeAddress(address: string) {
   return (address || "").trim();
 }
 
+async function ensureSchema(db: D1Database): Promise<void> {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS account_external_identities (
+        account_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        external_user_id TEXT NOT NULL,
+        created_at_iso TEXT NOT NULL,
+        updated_at_iso TEXT NOT NULL,
+        PRIMARY KEY (account_id, provider),
+        UNIQUE (provider, external_user_id),
+        FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+      )`,
+    )
+    .run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_external_identities_provider_user ON account_external_identities(provider, external_user_id)`).run();
+
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS account_external_profiles (
+        account_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        profile_json TEXT NOT NULL,
+        created_at_iso TEXT NOT NULL,
+        updated_at_iso TEXT NOT NULL,
+        PRIMARY KEY (account_id, provider),
+        FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+      )`,
+    )
+    .run();
+}
+
 async function ensureAccount(
   db: D1Database,
   args: { canonicalAddress: string; email?: string | null; displayName?: string | null; phoneE164?: string | null },
@@ -97,6 +129,45 @@ async function ensureInstructor(db: D1Database, accountId: string, skillsJson: s
     .bind(instructorId, accountId, skillsJson, bioSourceId, ts, ts)
     .run();
   return { instructorId, created: true };
+}
+
+async function upsertExternalIdentityAndProfile(
+  db: D1Database,
+  args: {
+    canonicalAddress: string;
+    provider: string;
+    externalUserId?: string | null;
+    profile?: unknown;
+  },
+) {
+  await ensureSchema(db);
+  const acc = await ensureAccount(db, { canonicalAddress: args.canonicalAddress });
+  const ts = nowISO();
+  const provider = (args.provider || "").trim().toLowerCase();
+  if (!provider) throw new Error("Missing provider");
+
+  const externalUserId = args.externalUserId != null ? String(args.externalUserId).trim() : "";
+  if (externalUserId) {
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO account_external_identities (account_id, provider, external_user_id, created_at_iso, updated_at_iso)
+         VALUES (?, ?, ?, COALESCE((SELECT created_at_iso FROM account_external_identities WHERE account_id = ? AND provider = ?), ?), ?)`,
+      )
+      .bind(acc.accountId, provider, externalUserId, acc.accountId, provider, ts, ts)
+      .run();
+  }
+
+  if (args.profile !== undefined) {
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO account_external_profiles (account_id, provider, profile_json, created_at_iso, updated_at_iso)
+         VALUES (?, ?, ?, COALESCE((SELECT created_at_iso FROM account_external_profiles WHERE account_id = ? AND provider = ?), ?), ?)`,
+      )
+      .bind(acc.accountId, provider, JSON.stringify(args.profile ?? null), acc.accountId, provider, ts, ts)
+      .run();
+  }
+
+  return { account: acc, provider, externalUserId: externalUserId || null };
 }
 
 function createServer(env: Env) {
@@ -205,6 +276,63 @@ function createServer(env: Env) {
       const skillsJson = parsed.skills ? JSON.stringify(parsed.skills) : null;
       const inst = await ensureInstructor(env.DB, acc.accountId, skillsJson, parsed.bioSourceId ?? null);
       return { content: [{ type: "text", text: jsonText({ account: acc, instructor: inst }) }] };
+    },
+  );
+
+  server.tool(
+    "core_upsert_external_profile",
+    "Attach a third-party identity/profile (e.g. Strava athlete, Telegram user) to an account canonicalAddress.",
+    {
+      canonicalAddress: AccountAddress,
+      provider: z.string().min(1),
+      externalUserId: z.string().min(1).optional(),
+      profile: z.any().optional(),
+    },
+    async (args) => {
+      const parsed = z
+        .object({
+          canonicalAddress: AccountAddress,
+          provider: z.string().min(1),
+          externalUserId: z.string().min(1).optional(),
+          profile: z.any().optional(),
+        })
+        .parse(args);
+      const out = await upsertExternalIdentityAndProfile(env.DB, {
+        canonicalAddress: parsed.canonicalAddress,
+        provider: parsed.provider,
+        externalUserId: parsed.externalUserId ?? null,
+        profile: parsed.profile,
+      });
+      return { content: [{ type: "text", text: jsonText({ ok: true, ...out }) }] };
+    },
+  );
+
+  server.tool(
+    "core_get_account_by_external_id",
+    "Lookup an account by external provider user id (e.g. telegram user id).",
+    { provider: z.string().min(1), externalUserId: z.string().min(1) },
+    async (args) => {
+      await ensureSchema(env.DB);
+      const p = z.object({ provider: z.string().min(1), externalUserId: z.string().min(1) }).parse(args);
+      const provider = p.provider.trim().toLowerCase();
+      const externalUserId = p.externalUserId.trim();
+      const row = await env.DB.prepare(
+        `SELECT a.account_id, a.canonical_address, a.email, a.display_name, a.phone_e164
+         FROM account_external_identities x JOIN accounts a ON a.account_id = x.account_id
+         WHERE x.provider = ? AND x.external_user_id = ? LIMIT 1`,
+      )
+        .bind(provider, externalUserId)
+        .first();
+      const account = row
+        ? {
+            accountId: String((row as any).account_id ?? ""),
+            canonicalAddress: String((row as any).canonical_address ?? ""),
+            email: (row as any).email ? String((row as any).email) : null,
+            displayName: (row as any).display_name ? String((row as any).display_name) : null,
+            phoneE164: (row as any).phone_e164 ? String((row as any).phone_e164) : null,
+          }
+        : null;
+      return { content: [{ type: "text", text: jsonText({ ok: true, provider, externalUserId, account }) }] };
     },
   );
 

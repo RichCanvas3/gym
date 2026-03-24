@@ -28,6 +28,22 @@ export async function POST(req: Request) {
       : `${url.origin}/strava/connect`;
 
   const out = await mcpToolCall("strava", "strava_connect", { telegramUserId: tgUserId, code, redirectUri });
+
+  // Best-effort: also attach Strava athlete profile to gym-core for this user.
+  // Canonical user id design decision: use tg:<telegramUserId> as the core canonicalAddress.
+  try {
+    const athlete = out?.athlete;
+    const athleteId = athlete && typeof athlete === "object" && athlete !== null && "id" in athlete ? String((athlete as any).id) : "";
+    await mcpToolCall("core", "core_upsert_external_profile", {
+      canonicalAddress: `tg:${tgUserId}`,
+      provider: "strava",
+      ...(athleteId ? { externalUserId: athleteId } : {}),
+      profile: athlete ?? null,
+    });
+  } catch {
+    // ignore — Strava connect should still succeed even if core isn't configured in MCP_SERVERS_JSON
+  }
+
   return NextResponse.json(out);
 }
 

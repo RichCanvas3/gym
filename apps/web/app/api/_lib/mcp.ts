@@ -56,6 +56,12 @@ export async function mcpToolCall(serverName: string, toolName: string, args: Re
   const ct = res.headers.get("content-type") ?? "";
   const msg = ct.includes("application/json") ? await res.json() : await readSseJson(res);
   const text = (msg as any)?.result?.content?.[0]?.text;
-  return typeof text === "string" ? JSON.parse(text) : msg;
+  if (typeof text !== "string") return msg;
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Some MCP tools return plain-text errors (e.g. D1_ERROR) in `content[0].text`.
+    return { ok: false, text, raw: msg };
+  }
 }
 

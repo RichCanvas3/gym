@@ -2300,12 +2300,8 @@ async def run(input: Input) -> Output:
             data={"asOfISO": _now_iso(), "dateISO": date_iso, "intake_kcal": intake_kcal, "burn_kcal": burn_kcal, "tdee_kcal": tdee},
         )
 
-    # Deterministic: "what exercise/workouts did I do today" (list all Strava workouts for today).
-    if (
-        (not msg.startswith("__"))
-        and ("today" in mlow)
-        and any(k in mlow for k in ["what exercise", "what exercises", "what workout", "what workouts"])
-    ):
+    # Deterministic: list all Strava workouts for today.
+    if (not msg.startswith("__")) and ("today" in mlow) and any(k in mlow for k in ["workout", "workouts", "exercise", "exercises"]):
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
         date_iso = datetime.now(tz=tz).date().isoformat()

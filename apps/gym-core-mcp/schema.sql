@@ -147,3 +147,27 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_source ON kb_chunks(source_id);
+
+-- External identities + profiles (3P integrations; keyed to accounts)
+CREATE TABLE IF NOT EXISTS account_external_identities (
+  account_id TEXT NOT NULL,
+  provider TEXT NOT NULL, -- e.g. 'telegram' | 'strava' | 'google'
+  external_user_id TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL,
+  updated_at_iso TEXT NOT NULL,
+  PRIMARY KEY (account_id, provider),
+  UNIQUE (provider, external_user_id),
+  FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_identities_provider_user ON account_external_identities(provider, external_user_id);
+
+CREATE TABLE IF NOT EXISTS account_external_profiles (
+  account_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  profile_json TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL,
+  updated_at_iso TEXT NOT NULL,
+  PRIMARY KEY (account_id, provider),
+  FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useAuth } from "@/components/auth/AuthProvider";
@@ -16,6 +16,7 @@ export default function StravaConnectClient() {
   const { ready, authenticated, getAccessToken, login } = useAuth();
   const sp = useSearchParams();
   const [status, setStatus] = useState<Status>({ kind: "idle" });
+  const ranForCodeRef = useRef<string>("");
 
   const code = useMemo(() => (sp?.get("code") ?? "").trim(), [sp]);
   const redirectUri = useMemo(() => (typeof window !== "undefined" ? `${window.location.origin}/strava/connect` : ""), []);
@@ -23,10 +24,22 @@ export default function StravaConnectClient() {
   useEffect(() => {
     if (!ready) return;
     if (!authenticated) return;
+    if (status.kind === "ok") return;
+    if (status.kind === "exchanging" || status.kind === "redirecting") return;
 
     async function run() {
       try {
         if (!code) {
+          // If we already connected in this session, don't auto-redirect back to Strava.
+          try {
+            if (typeof window !== "undefined" && window.sessionStorage.getItem("strava_oauth_connected") === "1") {
+              setStatus({ kind: "ok", detail: { ok: true, note: "Strava already connected (session)." } });
+              return;
+            }
+          } catch {
+            // ignore
+          }
+
           const clientId = (process.env.NEXT_PUBLIC_STRAVA_CLIENT_ID ?? "").trim();
           if (!clientId) throw new Error("Missing NEXT_PUBLIC_STRAVA_CLIENT_ID");
           setStatus({ kind: "redirecting" });
@@ -38,6 +51,20 @@ export default function StravaConnectClient() {
           authUrl.searchParams.set("scope", "read,activity:read_all,profile:read_all");
           window.location.href = authUrl.toString();
           return;
+        }
+
+        // Dev mode can run effects twice; ensure we only exchange once per code.
+        if (ranForCodeRef.current === code) return;
+        ranForCodeRef.current = code;
+
+        // Strava OAuth codes are single-use; avoid retrying the same code on refresh.
+        const usedKey = `strava_oauth_used_code:${code}`;
+        try {
+          if (typeof window !== "undefined" && window.sessionStorage.getItem(usedKey) === "1") {
+            throw new Error("This Strava OAuth code was already used. Reopen /strava/connect to restart the flow.");
+          }
+        } catch {
+          // ignore storage failures
         }
 
         setStatus({ kind: "exchanging" });
@@ -53,14 +80,35 @@ export default function StravaConnectClient() {
           const msg = typeof json?.error === "string" ? json.error : JSON.stringify(json).slice(0, 300);
           throw new Error(msg || `HTTP ${res.status}`);
         }
+        try {
+          if (typeof window !== "undefined") window.sessionStorage.setItem(usedKey, "1");
+        } catch {
+          // ignore
+        }
+        // Strip ?code= from the URL so refreshes don't reuse it.
+        try {
+          if (typeof window !== "undefined") window.history.replaceState({}, "", "/strava/connect");
+        } catch {
+          // ignore
+        }
+        try {
+          if (typeof window !== "undefined") window.sessionStorage.setItem("strava_oauth_connected", "1");
+        } catch {
+          // ignore
+        }
         setStatus({ kind: "ok", detail: json });
       } catch (e) {
+        try {
+          if (typeof window !== "undefined") window.history.replaceState({}, "", "/strava/connect");
+        } catch {
+          // ignore
+        }
         setStatus({ kind: "error", error: String((e as any)?.message ?? e) });
       }
     }
 
     void run();
-  }, [ready, authenticated, code, redirectUri, getAccessToken]);
+  }, [ready, authenticated, code, redirectUri, getAccessToken, status.kind]);
 
   if (!ready) {
     return <div className="mx-auto w-full max-w-2xl px-4 py-10 text-sm">Loading…</div>;
@@ -87,6 +135,21 @@ export default function StravaConnectClient() {
     <div className="mx-auto w-full max-w-2xl px-4 py-10 text-sm">
       <div className="rounded-2xl border border-zinc-200 bg-white p-6 dark:border-white/10 dark:bg-zinc-950">
         <div className="text-base font-semibold">Connect Strava</div>
+        {status.kind === "ok" && code === "" ? (
+          <button
+            onClick={() => {
+              try {
+                if (typeof window !== "undefined") window.sessionStorage.removeItem("strava_oauth_connected");
+              } catch {
+                // ignore
+              }
+              window.location.href = "/strava/connect";
+            }}
+            className="mt-3 h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
+          >
+            Reconnect
+          </button>
+        ) : null}
         {status.kind === "redirecting" ? <div className="mt-2">Redirecting to Strava…</div> : null}
         {status.kind === "exchanging" ? <div className="mt-2">Finishing connection…</div> : null}
         {status.kind === "ok" ? (

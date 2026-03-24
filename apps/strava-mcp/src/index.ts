@@ -73,7 +73,6 @@ async function ensureSchema(env: Env): Promise<void> {
   ).run();
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_workouts_ended_at ON workouts(ended_at_iso DESC)`).run();
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_workouts_activity_type ON workouts(activity_type)`).run();
-  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_workouts_scope_ended_at ON workouts(scope_id, ended_at_iso DESC)`).run();
 
   // New tables are safe to create idempotently.
   await env.DB.prepare(
@@ -98,8 +97,10 @@ async function ensureSchema(env: Env): Promise<void> {
   const names = new Set((cols.results ?? []).map((r) => String(r?.name ?? "")));
   if (names.size && !names.has("scope_id")) {
     await env.DB.prepare(`ALTER TABLE workouts ADD COLUMN scope_id TEXT`).run();
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_workouts_scope_ended_at ON workouts(scope_id, ended_at_iso DESC)`).run();
   }
+
+  // Only create the scoped index after we know the column exists.
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_workouts_scope_ended_at ON workouts(scope_id, ended_at_iso DESC)`).run();
 }
 
 async function exchangeStravaAuthCode(env: Env, code: string, redirectUri: string): Promise<StravaOAuthTokenResponse> {
@@ -119,8 +120,9 @@ async function exchangeStravaAuthCode(env: Env, code: string, redirectUri: strin
   });
   const data = (await res.json().catch(() => ({}))) as StravaOAuthTokenResponse;
   if (!res.ok || !data.refresh_token || !data.access_token) {
-    const msg = data.message ?? `Strava oauth/token failed: ${res.status}`;
-    throw new Error(typeof msg === "string" ? msg : `Strava oauth/token failed: ${res.status}`);
+    const msg = typeof data.message === "string" && data.message ? data.message : `Strava oauth/token failed: ${res.status}`;
+    const detail = data && typeof data === "object" && "errors" in data && data.errors ? ` ${JSON.stringify(data.errors)}` : "";
+    throw new Error(`${msg}${detail}`);
   }
   return data;
 }
