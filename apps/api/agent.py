@@ -180,6 +180,59 @@ def _resolve_date_iso_with_context(msg: str, tz_name: str, bundle: dict[str, Any
     return base.isoformat()
 
 
+async def _router_fitness_intent(msg: str) -> str:
+    """
+    Lightweight intent router to reduce brittle keyword gates.
+    Returns exactly one label from:
+      - food_day
+      - food_trend
+      - calories_day
+      - exercise_burn_day
+      - food_exercise_day
+      - workouts_day
+      - workouts_trend
+      - exercise_overview_day
+      - none
+    """
+    llm = ChatOpenAI(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=os.environ.get("OPENAI_ROUTER_MODEL", os.environ.get("OPENAI_MODEL", "gpt-5.2")),
+        temperature=0.0,
+    )
+    sys = (
+        "You route fitness chat intents.\n"
+        "Return ONLY one label from this list:\n"
+        "food_day, food_trend, calories_day, exercise_burn_day, food_exercise_day, workouts_day, workouts_trend, exercise_overview_day, none\n"
+        "\n"
+        "Definitions:\n"
+        "- food_day: what the user ate / meals / food log for a day (today/yesterday/explicit date or implied).\n"
+        "- food_trend: meals/food log over last few days / last week / past 7 days.\n"
+        "- calories_day: daily calories intake/exercise/net for a day.\n"
+        "- exercise_burn_day: calories burned/spent/out from workouts/exercise (often references like 'these workouts').\n"
+        "- food_exercise_day: combined summary of what they ate + workouts + net.\n"
+        "- workouts_day: list workouts/exercises done for a day.\n"
+        "- workouts_trend: workouts summary over last few days / last week.\n"
+        "- exercise_overview_day: deeper calorie overview incl. optional TDEE/BMR context.\n"
+        "- none: anything else (booking/classes, profile edits, general Q&A).\n"
+        "\n"
+        "Prefer specific intents over generic ones. Never return multiple labels.\n"
+    )
+    out = await llm.ainvoke([SystemMessage(content=sys), HumanMessage(content=(msg or "").strip())])
+    txt = str(getattr(out, "content", "") or "").strip().lower()
+    allowed = {
+        "food_day",
+        "food_trend",
+        "calories_day",
+        "exercise_burn_day",
+        "food_exercise_day",
+        "workouts_day",
+        "workouts_trend",
+        "exercise_overview_day",
+        "none",
+    }
+    return txt if txt in allowed else "none"
+
+
 def _tomorrow_date_iso(tz_name: str) -> str:
     tz = ZoneInfo(tz_name or "UTC")
     now_local = datetime.now(tz=tz)
@@ -670,6 +723,7 @@ def build_system_prompt() -> str:
             "- The user defines outcomes; you help operationalize them. Do not assume fitness, racing, or any single domain unless the user’s text implies it.",
             "- Session may include UserGoals (free text) and GoalBundle (structured JSON). Treat GoalBundle as the persisted spec the UI and tools can act on.",
             "- If the user's outcomes involve training, exercise, nutrition, or weight, use Strava MCP (workouts) and Weight MCP (day summaries / food logs / weigh-ins) when available to ground updates and progress.",
+            "- For exercise calorie-burn questions, prefer Weight MCP `weight_day_summary` and use `totals.exercise_kcal` (it may be estimated/backfilled).",
             "- When you break work into milestones or a time-ordered checklist, end the reply with `GoalBundleJSON:` then compact JSON (merge with prior bundle when updating):",
             '  {"version":1,"primaryGoal":{"text":"<main outcome>","targetDateISO":"YYYY-MM-DD|null"},"weeklyFocus":["<near-term priorities>"],"trainingPlan":[{"id":"stable-id","dayLabel":"<time bucket or phase>","activity":"<concrete action>","startTimeISO":null,"endTimeISO":null,"completed":false}],"suggestedNext":["<optional next automation hints>"}',
             "- Field `trainingPlan` is a generic checklist of executable items (name is legacy); you may also use `actionPlan` with the same array shape—either is accepted.",
@@ -1815,12 +1869,41 @@ async def run(input: Input) -> Output:
             data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "classes": items},
         )
 
-    # Deterministic: food log summary (past week / last N days).
-    if (
-        (not msg.startswith("__"))
-        and any(k in mlow for k in ["what have i eaten", "what did i eat", "show me what i ate", "show what i ate", "meals", "food"])
-        and any(k in mlow for k in ["past week", "last week", "over last week", "past 7 days", "last 7 days", "past few days", "last few days"])
+    fitness_intent = "none"
+    if (not msg.startswith("__")) and any(
+        k in mlow
+        for k in [
+            "meal",
+            "meals",
+            "food",
+            "eat",
+            "eaten",
+            "calorie",
+            "calories",
+            "burn",
+            "burned",
+            "spent",
+            "net",
+            "intake",
+            "workout",
+            "workouts",
+            "exercise",
+            "exercises",
+            "strava",
+            "today",
+            "yesterday",
+            "last week",
+            "past week",
+            "last 7 days",
+            "past 7 days",
+            "last few days",
+            "past few days",
+        ]
     ):
+        fitness_intent = await _router_fitness_intent(msg)
+
+    # Deterministic: food log summary (past week / last N days).
+    if fitness_intent == "food_trend":
         scope = _weight_scope_from_session(input.session)
         if not scope:
             answer = "I can summarize meals, but I need you signed in with Telegram."
@@ -1934,11 +2017,7 @@ async def run(input: Input) -> Output:
         )
 
     # Deterministic: today's (or yesterday's) food summary with consistent totals.
-    if (
-        (not msg.startswith("__"))
-        and any(k in mlow for k in ["what have i eaten", "what did i eat", "show me what i ate", "show what i ate", "meals", "food"])
-        and any(k in mlow for k in ["today", "yesterday"])
-    ):
+    if fitness_intent == "food_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
             answer = "I can summarize meals, but I need you signed in with Telegram."
@@ -2011,7 +2090,13 @@ async def run(input: Input) -> Output:
             )
 
         # Build answer. Show all items (up to 30) but totals always match all items we used.
-        lines = [f"Today ({date_iso}, {tz_name}), you've logged:" if "yesterday" not in mlow else f"Yesterday ({date_iso}, {tz_name}), you've logged:"]
+        if "yesterday" in mlow:
+            header = f"Yesterday ({date_iso}, {tz_name}), you've logged:"
+        elif "today" in mlow:
+            header = f"Today ({date_iso}, {tz_name}), you've logged:"
+        else:
+            header = f"For {date_iso} ({tz_name}), you've logged:"
+        lines = [header]
         for meal in sorted(by_meal.keys()):
             rows = by_meal[meal]
             lines.append(f"\n- **{meal.title()}**:")
@@ -2043,9 +2128,7 @@ async def run(input: Input) -> Output:
         )
 
     # Deterministic: daily calories (intake / exercise burn / net) for "today" or an explicit date.
-    if (not msg.startswith("__")) and any(k in mlow for k in ["calorie", "calories", "net calories", "total calories"]) and any(
-        k in mlow for k in ["today", "yesterday"]
-    ):
+    if fitness_intent == "calories_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
             answer = "I can summarize calories, but I need you signed in with Telegram."
@@ -2108,13 +2191,33 @@ async def run(input: Input) -> Output:
             await _memory_append(thread_id, "assistant", answer)
         return Output(answer=answer, citations=[], goalBundle=base_goal_bundle, data={"asOfISO": _now_iso(), "dateISO": date_iso, "totals": totals})
 
+    # Exercise calories burned: compute deterministically from Weight MCP day summary.
+    if fitness_intent == "exercise_burn_day":
+        scope = _weight_scope_from_session(input.session)
+        if not scope:
+            answer = "I can estimate exercise calories, but I need you signed in with Telegram."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[])
+
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
+        _set_last_date_context(base_goal_bundle, date_iso, tz_name)
+        day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
+        totals = day0.get("totals") if isinstance(day0, dict) else None
+        totals = totals if isinstance(totals, dict) else {}
+        ex_kcal = totals.get("exercise_kcal")
+        ex_out = float(ex_kcal) if isinstance(ex_kcal, (int, float)) else 0.0
+
+        answer = f"For **{date_iso}** ({tz_name}), your **exercise burn** is **{int(round(ex_out))} kcal**."
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], goalBundle=base_goal_bundle, data={"asOfISO": _now_iso(), "dateISO": date_iso, "exercise_kcal": ex_out})
+
     # Deterministic: today's food + exercise summary (consistent intake + spent + net).
-    if (
-        (not msg.startswith("__"))
-        and ("today" in mlow)
-        and any(k in mlow for k in ["exercise", "workout", "workouts", "spent", "burn", "burned", "calories out", "calories spent"])
-        and any(k in mlow for k in ["what have i eaten", "what did i eat", "show me what i ate", "show what i ate", "meals", "food"])
-    ):
+    if fitness_intent == "food_exercise_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
             answer = "I can summarize meals + exercise, but I need you signed in with Telegram."
@@ -2242,12 +2345,7 @@ async def run(input: Input) -> Output:
         )
 
     # Deterministic: exercise-focused "today overview" still includes intake for consistency.
-    if (
-        (not msg.startswith("__"))
-        and any(k in mlow for k in ["exercise", "workout", "workouts"])
-        and any(k in mlow for k in ["calorie", "calories", "burn", "burned", "spent", "overview"])
-        and any(k in mlow for k in ["today", "day", "daily"])
-    ):
+    if fitness_intent == "exercise_overview_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
             answer = "I can summarize meals + exercise, but I need you signed in with Telegram."
@@ -2411,7 +2509,7 @@ async def run(input: Input) -> Output:
         )
 
     # Deterministic: list all Strava workouts for today.
-    if (not msg.startswith("__")) and ("today" in mlow) and any(k in mlow for k in ["workout", "workouts", "exercise", "exercises"]):
+    if fitness_intent == "workouts_day":
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
         date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
@@ -2446,14 +2544,21 @@ async def run(input: Input) -> Output:
             today_workouts.append(w)
 
         if not today_workouts:
-            answer = f"I’m not seeing any workouts for today ({date_iso}, {tz_name}) in your connected Strava data."
+            day_word = "today" if "today" in mlow else "yesterday" if "yesterday" in mlow else "that day"
+            answer = f"I’m not seeing any workouts for {day_word} ({date_iso}, {tz_name}) in your connected Strava data."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "dateISO": date_iso, "count": 0})
 
         # Most recent first (Strava MCP returns most recent first; keep that).
-        lines = [f"Today you did ({date_iso}, {tz_name}):"]
+        if "yesterday" in mlow:
+            header = f"Yesterday you did ({date_iso}, {tz_name}):"
+        elif "today" in mlow:
+            header = f"Today you did ({date_iso}, {tz_name}):"
+        else:
+            header = f"For {date_iso} ({tz_name}), you did:"
+        lines = [header]
 
         def _fmt_duration(sec: Any) -> str:
             try:
@@ -2500,23 +2605,7 @@ async def run(input: Input) -> Output:
         return Output(answer=answer, citations=[], goalBundle=base_goal_bundle, data={"asOfISO": _now_iso(), "dateISO": date_iso, "count": len(today_workouts)})
 
     # Deterministic: workouts summary (past few days / last week).
-    if (
-        (not msg.startswith("__"))
-        and any(
-            k in mlow
-            for k in [
-                "what exercises have i done",
-                "what workouts have i done",
-                "show me my workouts",
-                "show my workouts",
-                "my workouts",
-                "workouts",
-                "exercises",
-                "exercise",
-            ]
-        )
-        and any(k in mlow for k in ["past few days", "last few days", "past week", "last week", "over last week", "past 7 days", "last 7 days"])
-    ):
+    if fitness_intent == "workouts_trend":
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
         days = 7 if ("week" in mlow or "7" in mlow) else 3

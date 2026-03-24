@@ -202,6 +202,54 @@ function normStr(v: unknown): string | null {
   return t ? t : null;
 }
 
+async function latestWeightKg(env: Env, sid: string, atMsUpperBound: number | null): Promise<number | null> {
+  const row = await env.DB.prepare(
+    `SELECT weight_kg, at_ms FROM wm_weights
+     WHERE scope_id=?1 AND weight_kg IS NOT NULL ${atMsUpperBound != null ? "AND at_ms<=?2" : ""}
+     ORDER BY at_ms DESC
+     LIMIT 1`,
+  )
+    .bind(sid, ...(atMsUpperBound != null ? [atMsUpperBound] : []))
+    .first<{ weight_kg: number | null; at_ms: number | null }>();
+  const kg = row && typeof (row as any).weight_kg === "number" ? Number((row as any).weight_kg) : null;
+  return kg != null && Number.isFinite(kg) && kg > 0 ? kg : null;
+}
+
+function estimateExerciseKcal(args: {
+  activityType: unknown;
+  durationSeconds: unknown;
+  distanceMeters: unknown;
+  weightKg: number;
+}): number | null {
+  const w = args.weightKg;
+  if (!Number.isFinite(w) || w <= 0) return null;
+
+  const typ = typeof args.activityType === "string" ? args.activityType.trim().toLowerCase() : "";
+  const dur = typeof args.durationSeconds === "number" && Number.isFinite(args.durationSeconds) ? Math.max(0, Math.trunc(args.durationSeconds)) : 0;
+  const distM = typeof args.distanceMeters === "number" && Number.isFinite(args.distanceMeters) ? Number(args.distanceMeters) : 0;
+
+  // Prefer distance-based for run/walk when distance is present.
+  if (distM > 0) {
+    const km = distM / 1000.0;
+    if (typ.includes("run") || typ.includes("jog")) return Math.round(w * km * 1.0);
+    if (typ.includes("walk") || typ.includes("hike")) return Math.round(w * km * 0.6);
+  }
+
+  if (dur > 0) {
+    const hours = dur / 3600.0;
+    // Simple MET mapping (coarse). kcal ≈ MET * kg * hours
+    let met = 5.0;
+    if (typ.includes("walk")) met = 3.3;
+    else if (typ.includes("run")) met = 9.8;
+    else if (typ.includes("ride") || typ.includes("bike") || typ.includes("cycle")) met = 8.0;
+    else if (typ.includes("swim")) met = 8.0;
+    else if (typ.includes("strength") || typ.includes("weight") || typ.includes("workout")) met = 6.0;
+    return Math.round(met * w * hours);
+  }
+
+  return null;
+}
+
 /** Optional correlation IDs (e.g. chat + message from an external app); stored in DB columns, opaque to this worker. */
 function parseSourceRef(args: Record<string, unknown>): { chatId: string | null; messageId: number | null } {
   const r = isRecord(args.sourceRef) ? (args.sourceRef as Record<string, unknown>) : null;
@@ -1599,20 +1647,38 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       day.meals[meal]!.fat_g += fat_g;
     }
 
+    const wkg = (await latestWeightKg(env, sid, to)) ?? (await latestWeightKg(env, sid, null));
     const ex = await env.DB.prepare(
-      `SELECT at_ms, active_energy_kcal
+      `SELECT at_ms, activity_type, duration_seconds, distance_meters, active_energy_kcal
        FROM wm_exercise_entries
        WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<=?3
        ORDER BY at_ms ASC
        LIMIT 15000`,
     )
       .bind(sid, from, to)
-      .all<{ at_ms: number; active_energy_kcal: number | null }>();
+      .all<{
+        at_ms: number;
+        activity_type: string | null;
+        duration_seconds: number | null;
+        distance_meters: number | null;
+        active_energy_kcal: number | null;
+      }>();
     for (const r of ex.results ?? []) {
       const at_ms = typeof (r as any).at_ms === "number" ? (r as any).at_ms : null;
       if (at_ms == null) continue;
       const dateISO = localDateISO(at_ms, tzName);
-      const kcal = typeof (r as any).active_energy_kcal === "number" ? (r as any).active_energy_kcal : 0;
+      const stored = typeof (r as any).active_energy_kcal === "number" ? Number((r as any).active_energy_kcal) : null;
+      const kcal =
+        stored != null && Number.isFinite(stored)
+          ? stored
+          : wkg != null
+            ? estimateExerciseKcal({
+                activityType: (r as any).activity_type,
+                durationSeconds: (r as any).duration_seconds,
+                distanceMeters: (r as any).distance_meters,
+                weightKg: wkg,
+              }) ?? 0
+            : 0;
       let day = dayMap.get(dateISO);
       if (!day) {
         day = { dateISO, totals: zero(), meals: {}, exercise_kcal: 0 };
@@ -1690,6 +1756,19 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     if (!source || !workoutId) throw new Error("source and workoutId required");
     const at_ms = "atMs" in args ? parseAtMs(args.atMs) : parseAtMs((args as any).startedAtISO);
     const ts = nowMs();
+    const activityType = normStr((args as any).activityType);
+    const durationSeconds =
+      typeof (args as any).durationSeconds === "number" && Number.isFinite((args as any).durationSeconds)
+        ? Math.trunc((args as any).durationSeconds)
+        : null;
+    const distanceMeters =
+      typeof (args as any).distanceMeters === "number" && Number.isFinite((args as any).distanceMeters)
+        ? Number((args as any).distanceMeters)
+        : null;
+    const providedActiveEnergyKcal =
+      typeof (args as any).activeEnergyKcal === "number" && Number.isFinite((args as any).activeEnergyKcal)
+        ? Number((args as any).activeEnergyKcal)
+        : null;
 
     const eventKey = `${sid}|workout|${source}|${workoutId}`;
     const eventId = `wk_${await sha256Hex(eventKey)}`;
@@ -1706,19 +1785,13 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
           source,
           workoutId,
           startedAtISO: normStr((args as any).startedAtISO),
-          activityType: normStr((args as any).activityType),
+          activityType,
           durationSeconds:
-            typeof (args as any).durationSeconds === "number" && Number.isFinite((args as any).durationSeconds)
-              ? Math.trunc((args as any).durationSeconds)
-              : null,
+            typeof durationSeconds === "number" && Number.isFinite(durationSeconds) ? Math.trunc(durationSeconds) : null,
           distanceMeters:
-            typeof (args as any).distanceMeters === "number" && Number.isFinite((args as any).distanceMeters)
-              ? Number((args as any).distanceMeters)
-              : null,
+            typeof distanceMeters === "number" && Number.isFinite(distanceMeters) ? Number(distanceMeters) : null,
           activeEnergyKcal:
-            typeof (args as any).activeEnergyKcal === "number" && Number.isFinite((args as any).activeEnergyKcal)
-              ? Number((args as any).activeEnergyKcal)
-              : null,
+            typeof providedActiveEnergyKcal === "number" && Number.isFinite(providedActiveEnergyKcal) ? Number(providedActiveEnergyKcal) : null,
           raw: isRecord((args as any).raw) ? (args as any).raw : null,
         }),
         ts,
@@ -1733,15 +1806,40 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       .bind(sid, source, workoutId)
       .first<{ id: string; at_ms: number; active_energy_kcal: number | null }>();
     if (existing?.id) {
+      let activeEnergyKcal = existing.active_energy_kcal;
+      if (activeEnergyKcal == null) {
+        const wkg = (await latestWeightKg(env, sid, at_ms)) ?? (await latestWeightKg(env, sid, null));
+        if (wkg != null) {
+          const est = estimateExerciseKcal({
+            activityType,
+            durationSeconds,
+            distanceMeters,
+            weightKg: wkg,
+          });
+          if (est != null) {
+            await env.DB.prepare(`UPDATE wm_exercise_entries SET active_energy_kcal=?1 WHERE id=?2 AND active_energy_kcal IS NULL`)
+              .bind(est, existing.id)
+              .run();
+            activeEnergyKcal = est;
+          }
+        }
+      }
       return {
         ok: true,
         deduped: true,
         scope_id: sid,
         exerciseEntryId: existing.id,
         at_ms: existing.at_ms,
-        activeEnergyKcal: existing.active_energy_kcal,
+        activeEnergyKcal,
       };
     }
+
+    const wkg = (await latestWeightKg(env, sid, at_ms)) ?? (await latestWeightKg(env, sid, null));
+    const estimatedActiveEnergyKcal =
+      providedActiveEnergyKcal == null && wkg != null
+        ? estimateExerciseKcal({ activityType, durationSeconds, distanceMeters, weightKg: wkg })
+        : null;
+    const activeEnergyKcalOut = providedActiveEnergyKcal ?? estimatedActiveEnergyKcal ?? null;
 
     const id = crypto.randomUUID();
     await env.DB.prepare(
@@ -1755,22 +1853,16 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         at_ms,
         source,
         workoutId,
-        normStr((args as any).activityType),
-        typeof (args as any).durationSeconds === "number" && Number.isFinite((args as any).durationSeconds)
-          ? Math.trunc((args as any).durationSeconds)
-          : null,
-        typeof (args as any).distanceMeters === "number" && Number.isFinite((args as any).distanceMeters)
-          ? Number((args as any).distanceMeters)
-          : null,
-        typeof (args as any).activeEnergyKcal === "number" && Number.isFinite((args as any).activeEnergyKcal)
-          ? Number((args as any).activeEnergyKcal)
-          : null,
+        activityType,
+        durationSeconds,
+        distanceMeters,
+        activeEnergyKcalOut,
         isRecord((args as any).raw) ? JSON.stringify((args as any).raw) : null,
         ts,
       )
       .run();
 
-    return { ok: true, deduped: false, scope_id: sid, exerciseEntryId: id, at_ms };
+    return { ok: true, deduped: false, scope_id: sid, exerciseEntryId: id, at_ms, activeEnergyKcal: activeEnergyKcalOut };
   }
 
   if (name === "weight_log_photo") {
@@ -1871,12 +1963,45 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
       .bind(sid, dayStart, dayEnd)
       .first<{ c: number }>();
 
-    const exerciseRow = await env.DB.prepare(
-      `SELECT COALESCE(SUM(active_energy_kcal),0) as e FROM wm_exercise_entries WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<?3`,
+    const wkg = (await latestWeightKg(env, sid, dayEnd - 1)) ?? (await latestWeightKg(env, sid, null));
+    const exRows = await env.DB.prepare(
+      `SELECT id, activity_type, duration_seconds, distance_meters, active_energy_kcal
+       FROM wm_exercise_entries
+       WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<?3
+       ORDER BY at_ms ASC
+       LIMIT 15000`,
     )
       .bind(sid, dayStart, dayEnd)
-      .first<{ e: number }>();
-    const exercise_kcal = exerciseRow?.e ?? 0;
+      .all<{
+        id: string;
+        activity_type: string | null;
+        duration_seconds: number | null;
+        distance_meters: number | null;
+        active_energy_kcal: number | null;
+      }>();
+    let exercise_kcal = 0;
+    for (const r of exRows.results ?? []) {
+      const stored = typeof (r as any).active_energy_kcal === "number" ? Number((r as any).active_energy_kcal) : null;
+      if (stored != null && Number.isFinite(stored)) {
+        exercise_kcal += stored;
+        continue;
+      }
+      if (wkg == null) continue;
+      const est = estimateExerciseKcal({
+        activityType: (r as any).activity_type,
+        durationSeconds: (r as any).duration_seconds,
+        distanceMeters: (r as any).distance_meters,
+        weightKg: wkg,
+      });
+      if (est == null) continue;
+      exercise_kcal += est;
+      const exId = typeof (r as any).id === "string" ? String((r as any).id) : "";
+      if (exId) {
+        await env.DB.prepare(`UPDATE wm_exercise_entries SET active_energy_kcal=?1 WHERE id=?2 AND active_energy_kcal IS NULL`)
+          .bind(est, exId)
+          .run();
+      }
+    }
 
     const targetsRow = await env.DB.prepare(`SELECT targets_json, updated_at FROM wm_daily_targets WHERE scope_id=?1 LIMIT 1`)
       .bind(sid)
