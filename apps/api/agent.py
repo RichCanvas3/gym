@@ -361,6 +361,11 @@ def _fitnesscore_use_graphdb() -> bool:
     return (os.getenv("FITNESSCORE_USE_GRAPHDB", "1") or "").strip() not in ("0", "false", "False", "no", "NO")
 
 
+def _fitnesscore_graphdb_only() -> bool:
+    # When enabled, fitness handlers should not fall back to Strava/Weight MCP.
+    return (os.getenv("FITNESSCORE_GRAPHDB_ONLY", "0") or "").strip() in ("1", "true", "True", "yes", "YES", "on")
+
+
 def _fitnesscore_graph_context_base() -> str:
     return (os.getenv("FITNESSCORE_GRAPH_CONTEXT_BASE", "https://id.fitnesscore.ai/graph/d1") or "").strip().rstrip("/")
 
@@ -2345,19 +2350,26 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
                     except Exception:
                         g_intake_kcal = 0.0
 
-        # fallback to Weight MCP if graph disabled / empty / missing burn estimates
-        day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
-        totals = day0.get("totals") if isinstance(day0, dict) else None
-        totals = totals if isinstance(totals, dict) else {}
-        w_intake_kcal = float(totals.get("calories") or 0) if isinstance(totals.get("calories"), (int, float)) else 0.0
-        w_ex_kcal = float(totals.get("exercise_kcal") or 0) if isinstance(totals.get("exercise_kcal"), (int, float)) else 0.0
+        totals = {}
+        if _fitnesscore_graphdb_only() and graph_mode:
+            intake_kcal = g_intake_kcal
+            ex_kcal = g_ex_kcal
+            net_kcal = intake_kcal - ex_kcal
+        else:
+            # fallback to Weight MCP if graph disabled / empty / missing burn estimates
+            day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
+            totals0 = day0.get("totals") if isinstance(day0, dict) else None
+            totals0 = totals0 if isinstance(totals0, dict) else {}
+            w_intake_kcal = float(totals0.get("calories") or 0) if isinstance(totals0.get("calories"), (int, float)) else 0.0
+            w_ex_kcal = float(totals0.get("exercise_kcal") or 0) if isinstance(totals0.get("exercise_kcal"), (int, float)) else 0.0
+            totals = totals0
 
-        intake_kcal = g_intake_kcal if (graph_mode and g_intake_kcal > 0.0) else w_intake_kcal
-        ex_kcal = g_ex_kcal if (graph_mode and g_ex_kcal > 0.0) else w_ex_kcal
-        net_kcal = intake_kcal - ex_kcal
+            intake_kcal = g_intake_kcal if (graph_mode and g_intake_kcal > 0.0) else w_intake_kcal
+            ex_kcal = g_ex_kcal if (graph_mode and g_ex_kcal > 0.0) else w_ex_kcal
+            net_kcal = intake_kcal - ex_kcal
 
         # If we didn't get workouts from GraphDB, fall back to Strava list for display.
-        if (not workouts_today) and tg_user_id:
+        if (not workouts_today) and tg_user_id and not (_fitnesscore_graphdb_only() and graph_mode):
             str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
             workouts = str0.get("workouts") if isinstance(str0, dict) else None
             wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
@@ -2381,7 +2393,7 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
 
         # If Strava has workouts but weight-mcp shows 0 burn, attempt a lightweight ingest
         # (no Telegram sync; just ensure workouts exist in wm_exercise_entries).
-        if tg_user_id and workouts_today and ex_kcal <= 0.0:
+        if tg_user_id and workouts_today and ex_kcal <= 0.0 and not (_fitnesscore_graphdb_only() and graph_mode):
             for w in workouts_today[:10]:
                 try:
                     await _weight_call_json(
@@ -2469,14 +2481,14 @@ SELECT (SUM(?k) AS ?exerciseKcal) (COUNT(?w) AS ?workouts) WHERE {{
                     except Exception:
                         ex_out = 0.0
 
-        if ex_out <= 0.0:
+        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and tg_user_id):
             day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
             totals = day0.get("totals") if isinstance(day0, dict) else None
             totals = totals if isinstance(totals, dict) else {}
             ex_kcal = totals.get("exercise_kcal")
             ex_out = float(ex_kcal) if isinstance(ex_kcal, (int, float)) else 0.0
 
-        if ex_out <= 0.0:
+        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and tg_user_id):
             if tg_user_id:
                 str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
                 workouts = str0.get("workouts") if isinstance(str0, dict) else None

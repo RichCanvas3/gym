@@ -219,6 +219,73 @@ function workoutTypeToConcept(activityType: string): string {
   return "fc:ActivityType_Other";
 }
 
+function weightKgFromProfile(profile: any): number | null {
+  try {
+    const kg =
+      (typeof profile?.weight_kg === "number" && Number.isFinite(profile.weight_kg) ? Number(profile.weight_kg) : null) ??
+      (typeof profile?.weightKg === "number" && Number.isFinite(profile.weightKg) ? Number(profile.weightKg) : null) ??
+      (typeof profile?.body_weight_kg === "number" && Number.isFinite(profile.body_weight_kg) ? Number(profile.body_weight_kg) : null) ??
+      (typeof profile?.bodyWeightKg === "number" && Number.isFinite(profile.bodyWeightKg) ? Number(profile.bodyWeightKg) : null);
+    if (kg != null && kg > 0) return kg;
+    const lb =
+      (typeof profile?.weight_lb === "number" && Number.isFinite(profile.weight_lb) ? Number(profile.weight_lb) : null) ??
+      (typeof profile?.weightLb === "number" && Number.isFinite(profile.weightLb) ? Number(profile.weightLb) : null) ??
+      (typeof profile?.bodyWeightLb === "number" && Number.isFinite(profile.bodyWeightLb) ? Number(profile.bodyWeightLb) : null);
+    if (lb != null && lb > 0) return lb * 0.45359237;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function latestWeightKgFromWeights(weightItems: any[]): number | null {
+  if (!Array.isArray(weightItems) || !weightItems.length) return null;
+  const sorted = weightItems
+    .map((x) => ({ at_ms: typeof x?.at_ms === "number" ? x.at_ms : -1, weight_kg: typeof x?.weight_kg === "number" ? x.weight_kg : null }))
+    .filter((x) => typeof x.at_ms === "number")
+    .sort((a, b) => b.at_ms - a.at_ms);
+  for (const r of sorted) {
+    const kg = r.weight_kg;
+    if (typeof kg === "number" && Number.isFinite(kg) && kg > 0) return kg;
+  }
+  return null;
+}
+
+function estimateExerciseKcal(args: {
+  activityType: unknown;
+  durationSeconds: unknown;
+  distanceMeters: unknown;
+  weightKg: number;
+}): number | null {
+  const w = args.weightKg;
+  if (!Number.isFinite(w) || w <= 0) return null;
+
+  const typ = typeof args.activityType === "string" ? args.activityType.trim().toLowerCase() : "";
+  const dur = typeof args.durationSeconds === "number" && Number.isFinite(args.durationSeconds) ? Math.max(0, Math.trunc(args.durationSeconds)) : 0;
+  const distM = typeof args.distanceMeters === "number" && Number.isFinite(args.distanceMeters) ? Number(args.distanceMeters) : 0;
+
+  // Prefer distance-based for run/walk when distance is present.
+  if (distM > 0) {
+    const km = distM / 1000.0;
+    if (typ.includes("run") || typ.includes("jog")) return Math.round(w * km * 1.0);
+    if (typ.includes("walk") || typ.includes("hike")) return Math.round(w * km * 0.6);
+  }
+
+  if (dur > 0) {
+    const hours = dur / 3600.0;
+    // Simple MET mapping (coarse). kcal ≈ MET * kg * hours
+    let met = 5.0;
+    if (typ.includes("walk")) met = 3.3;
+    else if (typ.includes("run")) met = 9.8;
+    else if (typ.includes("ride") || typ.includes("bike") || typ.includes("cycle")) met = 8.0;
+    else if (typ.includes("swim")) met = 8.0;
+    else if (typ.includes("strength") || typ.includes("weight") || typ.includes("workout")) met = 6.0;
+    return Math.round(met * w * hours);
+  }
+
+  return null;
+}
+
 async function syncFitnesscoreGraphDb(env: Env): Promise<{ ok: boolean; contextIri?: string; bytes?: number; reason?: string }> {
   if (!truthy(env.GRAPHDB_SYNC_ENABLED)) return { ok: true, reason: "disabled" };
   const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
@@ -240,6 +307,9 @@ async function syncFitnesscoreGraphDb(env: Env): Promise<{ ok: boolean; contextI
   const foodItems = Array.isArray(foods?.items) ? foods.items : [];
   const weights0 = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_list_weights", { scope, fromISO, toISO, limit: 200 });
   const weightItems = Array.isArray(weights0?.items) ? weights0.items : [];
+  const prof0 = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_profile_get", { scope });
+  const profile = prof0 && typeof prof0 === "object" ? (prof0 as any).profile : null;
+  const weightKg = latestWeightKgFromWeights(weightItems) ?? (profile ? weightKgFromProfile(profile) : null);
 
   const idBase = (env.GRAPHDB_ID_BASE ?? "https://id.fitnesscore.ai").trim() || "https://id.fitnesscore.ai";
   const contextBase = (env.GRAPHDB_CONTEXT_BASE ?? "https://id.fitnesscore.ai/graph/d1").trim() || "https://id.fitnesscore.ai/graph/d1";
@@ -263,7 +333,20 @@ async function syncFitnesscoreGraphDb(env: Env): Promise<{ ok: boolean; contextI
     parts.push(`fc:activityType ${typ}`);
     if (typeof wk?.duration_seconds === "number") parts.push(`fc:durationSeconds "${Math.trunc(wk.duration_seconds)}"^^xsd:integer`);
     if (typeof wk?.distance_meters === "number") parts.push(`fc:distanceMeters "${wk.distance_meters}"^^xsd:decimal`);
-    if (typeof wk?.active_energy_kcal === "number") parts.push(`fc:activeEnergyKcal "${wk.active_energy_kcal}"^^xsd:decimal`);
+    if (typeof wk?.active_energy_kcal === "number") {
+      parts.push(`fc:activeEnergyKcal "${wk.active_energy_kcal}"^^xsd:decimal`);
+    } else if (weightKg != null) {
+      const est = estimateExerciseKcal({
+        activityType: wk?.activity_type,
+        durationSeconds: wk?.duration_seconds,
+        distanceMeters: wk?.distance_meters,
+        weightKg,
+      });
+      if (typeof est === "number" && Number.isFinite(est) && est > 0) {
+        parts.push(`fc:activeEnergyKcal "${est}"^^xsd:decimal`);
+        parts.push(`fc:description ${litStr("activeEnergyKcalSource:estimated")}`);
+      }
+    }
     lines.push(parts.join(" ; ") + " .");
   }
   lines.push("");
