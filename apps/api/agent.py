@@ -1553,21 +1553,11 @@ async def run(input: Input) -> Output:
     if goal_cmd is not None:
         return goal_cmd
 
-    # Always try to import new Telegram meal/weight texts before answering normal user questions,
-    # so asking "what have I eaten" reflects recent Telegram logs.
+    # Telegram->weight ingestion is handled by gym-cron-sync; avoid doing it inline during chat turns.
     had_session_goal_bundle = bool(input.session and isinstance(getattr(input.session, "goalBundle", None), dict))
     base_goal_bundle = copy.deepcopy(_session_goal_bundle(input.session))
     imported_meals: list[dict[str, Any]] = []
     imported_weights: list[dict[str, Any]] = []
-    if not msg.startswith("__"):
-        try:
-            base_goal_bundle, imported_meals = await _auto_import_telegram_meal_texts(input.session, base_goal_bundle)
-        except Exception:
-            imported_meals = []
-        try:
-            base_goal_bundle, imported_weights = await _auto_import_telegram_weight_texts(input.session, base_goal_bundle)
-        except Exception:
-            imported_weights = []
 
     # Deterministic helper: "book/reserve next available" for a class definition mentioned in-thread.
     if (not msg.startswith("__")) and any(k in mlow for k in ["next available", "next opening", "next slot"]) and any(
