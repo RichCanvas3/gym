@@ -152,6 +152,50 @@ function scopeId(scope: Scope): string {
   return `tg:${scope.telegramUserId}`;
 }
 
+async function migrateScopeId(env: Env, fromScopeId: string, toScopeId: string): Promise<{ ok: true; migrated: boolean; fromScopeId: string; toScopeId: string; tablesUpdated: number }> {
+  const from = String(fromScopeId ?? "").trim();
+  const to = String(toScopeId ?? "").trim();
+  if (!from || !to || from === to) return { ok: true, migrated: false, fromScopeId: from, toScopeId: to, tablesUpdated: 0 };
+
+  const tables = [
+    "wm_events",
+    "wm_profiles",
+    "wm_weights",
+    "wm_food_entries",
+    "wm_food_items",
+    "wm_meal_analyses",
+    "wm_exercise_entries",
+    "wm_photos",
+    "wm_water_log",
+    "wm_fast_windows",
+    "wm_daily_targets",
+  ];
+  let updated = 0;
+  for (const t of tables) {
+    await env.DB.prepare(`UPDATE ${t} SET scope_id=?1 WHERE scope_id=?2`).bind(to, from).run();
+    updated += 1;
+  }
+  return { ok: true, migrated: true, fromScopeId: from, toScopeId: to, tablesUpdated: updated };
+}
+
+async function maybeAutoMigrateLegacyAcctScope(env: Env, toScopeId: string): Promise<{ migrated: boolean; fromScopeId: string | null }> {
+  const sid = String(toScopeId ?? "").trim();
+  if (!sid.startsWith("tg:")) return { migrated: false, fromScopeId: null };
+
+  // If we already have scoped rows, do nothing.
+  const anyScoped = await env.DB.prepare(`SELECT 1 FROM wm_food_entries WHERE scope_id=?1 LIMIT 1`).bind(sid).first();
+  if (anyScoped) return { migrated: false, fromScopeId: null };
+
+  // If there is exactly one legacy acct:* scope present, assume it belongs to this single-user deployment and migrate.
+  const legacy = await env.DB.prepare(`SELECT DISTINCT scope_id FROM wm_food_entries WHERE scope_id LIKE 'acct:%' LIMIT 3`).all<{ scope_id: string }>();
+  const ids = (legacy.results ?? []).map((r: any) => String(r?.scope_id ?? "").trim()).filter(Boolean);
+  const uniq = Array.from(new Set(ids));
+  if (uniq.length !== 1) return { migrated: false, fromScopeId: null };
+  const from = uniq[0]!;
+  await migrateScopeId(env, from, sid);
+  return { migrated: true, fromScopeId: from };
+}
+
 function normStr(v: unknown): string | null {
   if (typeof v !== "string") return null;
   const t = v.trim();
@@ -1474,6 +1518,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     const from = "fromISO" in args ? Date.parse(String(args.fromISO)) : NaN;
     const to = "toISO" in args ? Date.parse(String(args.toISO)) : NaN;
     const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? Math.min(200, Math.max(1, Math.trunc(args.limit))) : 50;
+    await maybeAutoMigrateLegacyAcctScope(env, sid);
     const where: string[] = ["scope_id=?1"];
     const binds: unknown[] = [sid];
     if (Number.isFinite(from)) {
@@ -1780,6 +1825,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     const win = dayWindowUtcMsFromLocalDate(dateISO, tzName);
     const dayStart = win.startMs;
     const dayEnd = win.endMs;
+    await maybeAutoMigrateLegacyAcctScope(env, sid);
 
     const weights = await env.DB.prepare(
       `SELECT id, at_ms, weight_kg, bodyfat_pct, notes FROM wm_weights

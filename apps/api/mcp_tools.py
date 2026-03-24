@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import timedelta
 from typing import Any, Optional, Tuple
 
@@ -109,15 +110,59 @@ def _filter_tools(tools: list[BaseTool]) -> list[BaseTool]:
     return out
 
 
+def _mcp_tools_cache_ttl_seconds() -> int:
+    """
+    Cache tool discovery to avoid reconnecting/handshaking every request.
+    Set MCP_TOOLS_CACHE_TTL_SECONDS=0 to disable.
+    """
+    raw = os.environ.get("MCP_TOOLS_CACHE_TTL_SECONDS", "1800").strip()
+    try:
+        n = int(float(raw))
+    except Exception:
+        n = 1800
+    return max(0, n)
+
+
+def _cache_key_for_env() -> str:
+    # Key off the env vars that affect tool discovery/filtering.
+    parts = {
+        "MCP_SERVERS_JSON": os.environ.get("MCP_SERVERS_JSON", "").strip(),
+        "MCP_TOOL_NAME_PREFIX": os.environ.get("MCP_TOOL_NAME_PREFIX", "").strip(),
+        "MCP_TOOL_ALLOWLIST": os.environ.get("MCP_TOOL_ALLOWLIST", "").strip(),
+        "MCP_TOOL_DENYLIST": os.environ.get("MCP_TOOL_DENYLIST", "").strip(),
+        "MCP_STREAMABLE_HTTP_TIMEOUT_SECONDS": os.environ.get("MCP_STREAMABLE_HTTP_TIMEOUT_SECONDS", "").strip(),
+        "MCP_STREAMABLE_HTTP_SSE_READ_TIMEOUT_SECONDS": os.environ.get("MCP_STREAMABLE_HTTP_SSE_READ_TIMEOUT_SECONDS", "").strip(),
+    }
+    return json.dumps(parts, sort_keys=True)
+
+
+_CACHED_TOOLS: list[BaseTool] | None = None
+_CACHED_DIAG: dict[str, Any] | None = None
+_CACHED_AT_MONO: float | None = None
+_CACHED_KEY: str | None = None
+
+
 async def load_mcp_tools_from_env() -> list[BaseTool]:
     tools, _diag = await load_mcp_tools_with_diagnostics_from_env()
     return tools
 
 
 async def load_mcp_tools_with_diagnostics_from_env() -> Tuple[list[BaseTool], dict[str, Any]]:
+    ttl = _mcp_tools_cache_ttl_seconds()
+    key = _cache_key_for_env()
+    now = time.monotonic()
+    global _CACHED_TOOLS, _CACHED_DIAG, _CACHED_AT_MONO, _CACHED_KEY
+    if ttl > 0 and _CACHED_TOOLS is not None and _CACHED_DIAG is not None and _CACHED_AT_MONO is not None and _CACHED_KEY == key:
+        if (now - _CACHED_AT_MONO) < ttl:
+            return _CACHED_TOOLS, _CACHED_DIAG
+
     servers = _parse_servers_json()
     if not servers:
-        return [], {"okServers": [], "failedServers": []}
+        tools0: list[BaseTool] = []
+        diag0 = {"okServers": [], "failedServers": []}
+        if ttl > 0:
+            _CACHED_TOOLS, _CACHED_DIAG, _CACHED_AT_MONO, _CACHED_KEY = tools0, diag0, now, key
+        return tools0, diag0
 
     servers = _apply_timeouts(servers)
     tool_name_prefix = _truthy_env("MCP_TOOL_NAME_PREFIX", default=True)
@@ -145,5 +190,9 @@ async def load_mcp_tools_with_diagnostics_from_env() -> Tuple[list[BaseTool], di
             # Skip this server; other servers may still be usable.
             failed_servers.append({"name": name, "error": f"{type(e).__name__}: {e}"})
             continue
-    return _filter_tools(all_tools), {"okServers": ok_servers, "failedServers": failed_servers}
+    tools_out = _filter_tools(all_tools)
+    diag_out = {"okServers": ok_servers, "failedServers": failed_servers}
+    if ttl > 0:
+        _CACHED_TOOLS, _CACHED_DIAG, _CACHED_AT_MONO, _CACHED_KEY = tools_out, diag_out, now, key
+    return tools_out, diag_out
 
