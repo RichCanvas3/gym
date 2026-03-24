@@ -498,7 +498,7 @@ async def _compose_fitness_answer(user_msg: str, context: dict[str, Any]) -> str
             "Rules:\n"
             "- Answer ALL questions in the user's message.\n"
             "- Use ONLY numbers present in the context; never invent.\n"
-            "- If the user asks what BMR/TDEE mean, explain briefly.\n"
+            "- If the user asks what BMR/TDEE mean, include a short Definitions section. Use context.termDefinitions.\n"
             "- Keep it concise. Prefer bullet points.\n"
             "- Workout types must be human-readable labels, never IRIs.\n"
         )
@@ -2341,36 +2341,7 @@ SELECT ?t ?desc ?cal ?p ?c ?f WHERE {{
                 lines.append(f"  - (+{len(rows) - 10} more)")
 
         lines.append("\n" + fmt_tot("Total so far", totals))
-        fallback = "\n".join(lines).strip()
-        context = {
-            "intent": "exercise_overview_day",
-            "dateISO": date_iso,
-            "tzName": tz_name,
-            "intakeKcal": intake_kcal,
-            "exerciseKcal": burn_kcal,
-            "netKcal": net_vs_exercise,
-            "bmrKcalDay": bmr,
-            "tdeeKcalDay": tdee,
-            "activityLevel": activity,
-            "weightKgUsed": kg,
-            "workouts": [
-                {
-                    "type": _activity_type_label(w.get("activity_type")),
-                    "startedLocal": (  # best-effort
-                        (datetime.fromisoformat(str(w.get("started_at_iso")).replace("Z", "+00:00")).astimezone(tz).strftime("%H:%M"))
-                        if isinstance(w.get("started_at_iso"), str) and str(w.get("started_at_iso")).strip()
-                        else None
-                    ),
-                    "durationSeconds": _int(w.get("duration_seconds")),
-                    "distanceMeters": _num(w.get("distance_meters")),
-                    "activeEnergyKcal": _num(w.get("active_energy_kcal")),
-                }
-                for w in today_workouts[:6]
-                if isinstance(w, dict)
-            ],
-            "fallbackAnswer": fallback,
-        }
-        answer = await _compose_fitness_answer(msg, context)
+        answer = "\n".join(lines).strip()
         if thread_id:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", answer)
@@ -3035,7 +3006,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         lines = [
             f"Calorie overview ({date_iso}, {tz_name}):",
             f"- Calories in (food): **{int(round(intake_kcal))} kcal**",
-            f"- Calories out (workouts today): **{int(round(burn_kcal))} kcal**"
+            f"- Calories out (workouts): **{int(round(burn_kcal))} kcal**"
             + (f" (using {kg:.1f} kg{' assumed (220 lb)' if assumed_weight else ''})" if kg is not None else ""),
             f"- Net (in − workouts): **{int(round(net_vs_exercise))} kcal**",
         ]
@@ -3069,7 +3040,36 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
                 bits = " • ".join([b for b in [started_local, dist_s, dur_out] if b])
                 lines.append(f"- {typ}" + (f" ({bits})" if bits else ""))
 
-        answer = "\n".join(lines).strip()
+        fallback = "\n".join(lines).strip()
+        context = {
+            "intent": "exercise_overview_day",
+            "dateISO": date_iso,
+            "tzName": tz_name,
+            "intakeKcal": intake_kcal,
+            "exerciseKcal": burn_kcal,
+            "netKcal": net_vs_exercise,
+            "bmrKcalDay": bmr,
+            "tdeeKcalDay": tdee,
+            "activityLevel": activity,
+            "weightKgUsed": kg,
+            "termDefinitions": {
+                "BMR": "Basal Metabolic Rate: calories/day your body burns at rest.",
+                "TDEE": "Total Daily Energy Expenditure: estimated total calories/day burned (BMR × activity factor).",
+            },
+            "workouts": [
+                {
+                    "type": _activity_type_label(w.get("activity_type")),
+                    "startedLocal": (started.astimezone(tz).strftime("%H:%M") if started else None),
+                    "durationSeconds": _int(w.get("duration_seconds")),
+                    "distanceMeters": _num(w.get("distance_meters")),
+                    "activeEnergyKcal": _num(w.get("active_energy_kcal")),
+                }
+                for w in today_workouts[:6]
+                if isinstance(w, dict)
+            ],
+            "fallbackAnswer": fallback,
+        }
+        answer = await _compose_fitness_answer(msg, context)
         if thread_id:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", answer)
