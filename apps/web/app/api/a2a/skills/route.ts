@@ -31,7 +31,6 @@ export async function GET() {
         tools: [
           "weight_weight_day_summary",
           "weight_weight_log_weight",
-          "weight_weight_list_weights",
           "weight_weight_log_food",
           "weight_weight_list_food",
           "weight_weight_log_meal_from_text",

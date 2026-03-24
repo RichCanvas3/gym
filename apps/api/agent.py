@@ -363,7 +363,7 @@ def _fitnesscore_use_graphdb() -> bool:
 
 def _fitnesscore_graphdb_only() -> bool:
     # When enabled, fitness handlers should not fall back to Strava/Weight MCP.
-    return (os.getenv("FITNESSCORE_GRAPHDB_ONLY", "0") or "").strip() in ("1", "true", "True", "yes", "YES", "on")
+    return (os.getenv("FITNESSCORE_GRAPHDB_ONLY", "1") or "").strip() in ("1", "true", "True", "yes", "YES", "on")
 
 
 def _fitnesscore_graph_context_base() -> str:
@@ -2605,15 +2605,15 @@ SELECT ?cal ?p ?c ?f WHERE {{
                     if isinstance(v, (int, float)):
                         intake[k] += float(v)
 
-        # Latest weight (for burn estimate)
-        wt0 = await _weight_call_json("weight_list_weights", {"scope": scope, "fromISO": None, "toISO": None, "limit": 5}) or {}
-        witems = wt0.get("items") if isinstance(wt0, dict) else None
+        # Latest weight (for burn estimate) is stored in profile (wm_profiles.profile_json).
+        prof0 = await _weight_call_json("weight_profile_get", {"scope": scope}) or {}
+        prof = prof0.get("profile") if isinstance(prof0, dict) else None
+        prof = prof if isinstance(prof, dict) else {}
         latest_kg: Optional[float] = None
-        if isinstance(witems, list):
-            for r in witems:
-                if isinstance(r, dict) and isinstance(r.get("weight_kg"), (int, float)):
-                    latest_kg = float(r.get("weight_kg"))
-                    break
+        if isinstance(prof.get("weight_kg"), (int, float)):
+            latest_kg = float(prof.get("weight_kg"))
+        elif isinstance(prof.get("weight_lb"), (int, float)):
+            latest_kg = float(prof.get("weight_lb")) * 0.45359237
 
         # If user provided "220 lb" etc, use that.
         kg_from_text, lb_from_text = _parse_weight_from_text(msg)
@@ -2802,15 +2802,15 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
             items_list = [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
             intake_kcal = sum(float(_num(it.get("calories")) or 0.0) for it in items_list if _num(it.get("calories")) is not None)
 
-        # Body weight (kg) for workout burn estimate.
-        wt0 = await _weight_call_json("weight_list_weights", {"scope": scope, "fromISO": None, "toISO": None, "limit": 5}) or {}
-        witems = wt0.get("items") if isinstance(wt0, dict) else None
+        # Body weight (kg) for workout burn estimate (from profile; wm_weights removed).
+        prof0 = await _weight_call_json("weight_profile_get", {"scope": scope}) or {}
+        prof = prof0.get("profile") if isinstance(prof0, dict) else None
+        prof = prof if isinstance(prof, dict) else {}
         kg: Optional[float] = None
-        if isinstance(witems, list):
-            for r in witems:
-                if isinstance(r, dict) and isinstance(r.get("weight_kg"), (int, float)):
-                    kg = float(r.get("weight_kg"))
-                    break
+        if isinstance(prof.get("weight_kg"), (int, float)):
+            kg = float(prof.get("weight_kg"))
+        elif isinstance(prof.get("weight_lb"), (int, float)):
+            kg = float(prof.get("weight_lb")) * 0.45359237
         kg_from_text, lb_from_text = _parse_weight_from_text(msg)
         if kg_from_text is not None:
             kg = float(kg_from_text)

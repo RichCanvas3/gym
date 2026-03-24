@@ -7,20 +7,6 @@ CREATE TABLE IF NOT EXISTS wm_profiles (
   updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS wm_weights (
-  id TEXT PRIMARY KEY,
-  scope_id TEXT NOT NULL,
-  at_ms INTEGER NOT NULL,
-  weight_kg REAL,
-  bodyfat_pct REAL,
-  notes TEXT,
-  source TEXT,
-  telegram_chat_id TEXT,
-  telegram_message_id INTEGER,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_wm_weights_scope_time ON wm_weights(scope_id, at_ms DESC);
-
 CREATE TABLE IF NOT EXISTS wm_food_entries (
   id TEXT PRIMARY KEY,
   scope_id TEXT NOT NULL,

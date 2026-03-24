@@ -160,7 +160,6 @@ async function migrateScopeId(env: Env, fromScopeId: string, toScopeId: string):
   const tables = [
     "wm_events",
     "wm_profiles",
-    "wm_weights",
     "wm_food_entries",
     "wm_food_items",
     "wm_meal_analyses",
@@ -203,18 +202,8 @@ function normStr(v: unknown): string | null {
 }
 
 async function latestWeightKg(env: Env, sid: string, atMsUpperBound: number | null): Promise<number | null> {
-  const row = await env.DB.prepare(
-    `SELECT weight_kg, at_ms FROM wm_weights
-     WHERE scope_id=?1 AND weight_kg IS NOT NULL ${atMsUpperBound != null ? "AND at_ms<=?2" : ""}
-     ORDER BY at_ms DESC
-     LIMIT 1`,
-  )
-    .bind(sid, ...(atMsUpperBound != null ? [atMsUpperBound] : []))
-    .first<{ weight_kg: number | null; at_ms: number | null }>();
-  const kg = row && typeof (row as any).weight_kg === "number" ? Number((row as any).weight_kg) : null;
-  if (kg != null && Number.isFinite(kg) && kg > 0) return kg;
-
-  // Fallback: profile weight (so exercise kcal works even without weigh-ins logged).
+  // Weight is stored in wm_profiles.profile_json (wm_weights table is deprecated/removed).
+  void atMsUpperBound;
   const prow = await env.DB.prepare(`SELECT profile_json FROM wm_profiles WHERE scope_id=?1 LIMIT 1`)
     .bind(sid)
     .first<{ profile_json: string | null }>();
@@ -1271,17 +1260,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         imageUrl: (existingFood as any).image_url ?? null,
       };
     }
-    const existingWeight = await env.DB.prepare(
-      `SELECT id, at_ms, weight_kg
-       FROM wm_weights
-       WHERE scope_id=?1 AND telegram_chat_id=?2 AND telegram_message_id=?3
-       LIMIT 1`,
-    )
-      .bind(sid, chatId, messageId)
-      .first<{ id: string; at_ms: number; weight_kg: number | null }>();
-    if (existingWeight?.id) {
-      return { ok: true, deduped: true, kind: "weight", scope_id: sid, weightId: existingWeight.id, at_ms: existingWeight.at_ms };
-    }
+    // Weight is stored in wm_profiles.profile_json only; no per-message weight row dedupe.
     const existingAnalysis = await env.DB.prepare(
       `SELECT id, at_ms, summary
        FROM wm_meal_analyses
@@ -1382,7 +1361,6 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
   }
 
   if (name === "weight_log_weight") {
-    const id = crypto.randomUUID();
     const at_ms = "atMs" in args ? parseAtMs(args.atMs) : parseAtMs(args.atISO);
     const weightKg = numOrNull(args.weightKg);
     const weightLb = numOrNull(args.weightLb);
@@ -1397,37 +1375,41 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     if (kg == null) throw new Error("Provide weightKg or weightLb");
 
     const ts = nowMs();
+    // Store weight on profile_json (wm_weights table is deprecated/removed).
+    const row = await env.DB.prepare(`SELECT profile_json FROM wm_profiles WHERE scope_id=?1 LIMIT 1`)
+      .bind(sid)
+      .first<{ profile_json: string | null }>();
+    let prof: Record<string, unknown> = {};
+    try {
+      const raw = row && typeof (row as any).profile_json === "string" ? String((row as any).profile_json) : "";
+      const parsed = raw ? JSON.parse(raw) : {};
+      prof = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      prof = {};
+    }
+    const next: Record<string, unknown> = { ...prof };
+    next.weight_kg = kg;
+    if (weightLb != null) next.weight_lb = weightLb;
+    if (bodyfat != null) next.bodyfat_pct = bodyfat;
+    if (notes) next.weight_notes = notes;
+    if (source) next.weight_source = source;
+    if (chatId) next.weight_telegram_chat_id = chatId;
+    if (messageId != null) next.weight_telegram_message_id = messageId;
+    next.weight_at_ms = at_ms;
+
     await env.DB.prepare(
-      `INSERT INTO wm_weights (id, scope_id, at_ms, weight_kg, bodyfat_pct, notes, source, telegram_chat_id, telegram_message_id, created_at)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`,
+      `INSERT INTO wm_profiles (scope_id, scope_json, profile_json, updated_at)
+       VALUES (?1, ?2, ?3, ?4)
+       ON CONFLICT(scope_id) DO UPDATE SET profile_json=excluded.profile_json, updated_at=excluded.updated_at`,
     )
-      .bind(id, sid, at_ms, kg, bodyfat, notes, source, chatId, messageId, ts)
+      .bind(sid, JSON.stringify(scope), JSON.stringify(next), ts)
       .run();
 
-    return { ok: true, id, scope_id: sid, at_ms, weight_kg: kg };
+    return { ok: true, scope_id: sid, at_ms, weight_kg: kg, updated_at: ts };
   }
 
   if (name === "weight_list_weights") {
-    const from = "fromISO" in args ? Date.parse(String(args.fromISO)) : NaN;
-    const to = "toISO" in args ? Date.parse(String(args.toISO)) : NaN;
-    const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? Math.min(200, Math.max(1, Math.trunc(args.limit))) : 50;
-    const where: string[] = ["scope_id=?1"];
-    const binds: unknown[] = [sid];
-    if (Number.isFinite(from)) {
-      where.push("at_ms >= ?2");
-      binds.push(from);
-    }
-    if (Number.isFinite(to)) {
-      where.push(`at_ms <= ?${binds.length + 1}`);
-      binds.push(to);
-    }
-    const sql = `SELECT id, at_ms, weight_kg, bodyfat_pct, notes, source, telegram_chat_id, telegram_message_id
-                 FROM wm_weights
-                 WHERE ${where.join(" AND ")}
-                 ORDER BY at_ms DESC
-                 LIMIT ${limit}`;
-    const res = await env.DB.prepare(sql).bind(...binds).all();
-    return { ok: true, scope_id: sid, items: res.results ?? [] };
+    return { ok: true, scope_id: sid, items: [], reason: "wm_weights_removed_use_weight_profile_get" };
   }
 
   if (name === "weight_log_food") {
@@ -1945,13 +1927,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
     const dayEnd = win.endMs;
     await maybeAutoMigrateLegacyAcctScope(env, sid);
 
-    const weights = await env.DB.prepare(
-      `SELECT id, at_ms, weight_kg, bodyfat_pct, notes FROM wm_weights
-       WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<?3
-       ORDER BY at_ms DESC LIMIT 10`,
-    )
-      .bind(sid, dayStart, dayEnd)
-      .all();
+    const weights = { results: [] as any[] };
 
     const foods = await env.DB.prepare(
       `SELECT calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg FROM wm_food_entries
@@ -2404,7 +2380,7 @@ async function toolCall(env: Env, name: string, args: Record<string, unknown>): 
         .bind(sid, dayStart, dayEnd)
         .first<{ w: number }>();
       const wc = await env.DB.prepare(
-        `SELECT COUNT(1) as c FROM wm_weights WHERE scope_id=?1 AND at_ms>=?2 AND at_ms<?3`,
+        `SELECT 0 as c`,
       )
         .bind(sid, dayStart, dayEnd)
         .first<{ c: number }>();
