@@ -394,6 +394,30 @@ def _sparql_get_val(binding: dict[str, Any], var: str) -> Optional[str]:
     return str(s) if isinstance(s, (str, int, float)) else None
 
 
+def _num(v: Any) -> Optional[float]:
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str) and v.strip():
+        try:
+            return float(v.strip())
+        except Exception:
+            return None
+    return None
+
+
+def _int(v: Any) -> Optional[int]:
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str) and v.strip():
+        try:
+            return int(float(v.strip()))
+        except Exception:
+            return None
+    return None
+
+
 async def _fitnesscore_graphdb_select(query: str) -> Optional[dict[str, Any]]:
     # tool name in MCP discovery can be either core_graphdb_sparql_select or core_core_graphdb_sparql_select
     return await _core_call_json("graphdb_sparql_select", {"query": query})
@@ -766,7 +790,8 @@ def build_system_prompt() -> str:
             "- The user defines outcomes; you help operationalize them. Do not assume fitness, racing, or any single domain unless the user’s text implies it.",
             "- Session may include UserGoals (free text) and GoalBundle (structured JSON). Treat GoalBundle as the persisted spec the UI and tools can act on.",
             "- If the user's outcomes involve training, exercise, nutrition, or weight, use Strava MCP (workouts) and Weight MCP (day summaries / food logs / weigh-ins) when available to ground updates and progress.",
-            "- For exercise calorie-burn questions, prefer Weight MCP `weight_day_summary` and use `totals.exercise_kcal` (it may be estimated/backfilled).",
+            "- Prefer FitnessCore GraphDB (via core GraphDB SPARQL tool) for workout/food/weight data when available; fall back to Strava/Weight MCP if GraphDB returns no rows or lacks fields.",
+            "- For exercise calorie-burn questions, prefer GraphDB SUM over `fc:activeEnergyKcal` when present; otherwise fall back to Weight MCP `weight_day_summary` `totals.exercise_kcal` (it may be estimated/backfilled).",
             "- When you break work into milestones or a time-ordered checklist, end the reply with `GoalBundleJSON:` then compact JSON (merge with prior bundle when updating):",
             '  {"version":1,"primaryGoal":{"text":"<main outcome>","targetDateISO":"YYYY-MM-DD|null"},"weeklyFocus":["<near-term priorities>"],"trainingPlan":[{"id":"stable-id","dayLabel":"<time bucket or phase>","activity":"<concrete action>","startTimeISO":null,"endTimeISO":null,"completed":false}],"suggestedNext":["<optional next automation hints>"}',
             "- Field `trainingPlan` is a generic checklist of executable items (name is legacy); you may also use `actionPlan` with the same array shape—either is accepted.",
@@ -2647,13 +2672,13 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
             if started.astimezone(tz).date().isoformat() != date_iso:
                 continue
             today_workouts.append(w)
-            kcal = w.get("active_energy_kcal")
-            if isinstance(kcal, (int, float)):
+            kcal = _num(w.get("active_energy_kcal"))
+            if kcal is not None:
                 burn_kcal += float(kcal)
             else:
                 # Recalc using ~1.0 kcal/kg/km if distance available.
-                dist_m = w.get("distance_meters")
-                if latest_kg is not None and isinstance(dist_m, (int, float)) and float(dist_m) > 0:
+                dist_m = _num(w.get("distance_meters"))
+                if latest_kg is not None and dist_m is not None and float(dist_m) > 0:
                     km = float(dist_m) / 1000.0
                     burn_kcal += latest_kg * km * 1.0
 
@@ -2671,11 +2696,12 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
                 started = _parse_iso(w.get("started_at_iso"))
                 started_local = started.astimezone(tz).strftime("%H:%M") if started else ""
                 dist_m = w.get("distance_meters")
-                dist_s = f"{float(dist_m)/1609.34:.1f} mi" if isinstance(dist_m, (int, float)) and float(dist_m) > 0 else ""
+                dist_m_num = _num(dist_m)
+                dist_s = f"{float(dist_m_num)/1609.34:.1f} mi" if dist_m_num is not None and float(dist_m_num) > 0 else ""
                 dur_s = w.get("duration_seconds")
                 dur_out = ""
                 try:
-                    s = int(dur_s)
+                    s = int(_int(dur_s) or 0)
                     m = s // 60
                     dur_out = f"{m}m" if m < 60 else f"{m//60}h{m%60:02d}m"
                 except Exception:
@@ -2725,26 +2751,44 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         prof = prof0.get("profile") if isinstance(prof0, dict) else None
         prof = prof if isinstance(prof, dict) else {}
 
-        def _num(v: Any) -> Optional[float]:
-            if isinstance(v, (int, float)):
-                return float(v)
-            try:
-                if isinstance(v, str) and v.strip():
-                    return float(v.strip())
-            except Exception:
-                return None
-            return None
-
         age = int(_num(prof.get("age")) or 0) if _num(prof.get("age")) is not None else None
         sex = str(prof.get("sex") or "").strip().lower()
         height_in = _num(prof.get("height_in"))
         activity = str(prof.get("activity_level") or "").strip().lower()
 
-        # Intake (food)
-        food0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500}) or {}
-        items = food0.get("items") if isinstance(food0, dict) else None
-        items_list = [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
-        intake_kcal = sum(float(it.get("calories")) for it in items_list if isinstance(it.get("calories"), (int, float)))
+        tg_user_id = _session_telegram_user_id(input.session)
+
+        # Intake (food) - prefer GraphDB
+        intake_kcal = 0.0
+        if _fitnesscore_use_graphdb() and tg_user_id:
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q_in = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
+  GRAPH <{g}> {{
+    ?e a fc:FoodEntry ;
+      prov:generatedAtTime ?t ;
+      fc:caloriesKcal ?k .
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}}
+""".strip()
+            out_in = await _fitnesscore_graphdb_select(q_in)
+            results_in = out_in.get("results") if isinstance(out_in, dict) else None
+            rows_in = _sparql_bindings_rows(results_in)
+            if rows_in:
+                v = _sparql_get_val(rows_in[0], "kcalTotal")
+                n = _num(v)
+                if n is not None:
+                    intake_kcal = float(n)
+
+        if intake_kcal <= 0.0:
+            food0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500}) or {}
+            items = food0.get("items") if isinstance(food0, dict) else None
+            items_list = [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
+            intake_kcal = sum(float(_num(it.get("calories")) or 0.0) for it in items_list if _num(it.get("calories")) is not None)
 
         # Body weight (kg) for workout burn estimate.
         wt0 = await _weight_call_json("weight_list_weights", {"scope": scope, "fromISO": None, "toISO": None, "limit": 5}) or {}
@@ -2767,17 +2811,50 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
             kg = 99.8  # 220 lb
             assumed_weight = True
 
-        # Exercise (today)
-        tg_user_id = _session_telegram_user_id(input.session)
+        # Exercise (today) - prefer GraphDB, fallback Strava
         if not tg_user_id:
             answer = "I can list workouts, but I need you signed in with Telegram."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
-        str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
-        workouts = str0.get("workouts") if isinstance(str0, dict) else None
-        wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
+        wlist: list[dict[str, Any]] = []
+        if _fitnesscore_use_graphdb():
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q_w = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ;
+      prov:startedAtTime ?started .
+    OPTIONAL {{ ?w fc:activityType ?activityType . }}
+    OPTIONAL {{ ?w fc:activeEnergyKcal ?activeEnergyKcal . }}
+    OPTIONAL {{ ?w fc:durationSeconds ?durationSeconds . }}
+    OPTIONAL {{ ?w fc:distanceMeters ?distanceMeters . }}
+    FILTER(?started >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?started < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}} ORDER BY ?started
+""".strip()
+            out_w = await _fitnesscore_graphdb_select(q_w)
+            results_w = out_w.get("results") if isinstance(out_w, dict) else None
+            rows_w = _sparql_bindings_rows(results_w)
+            for b in rows_w:
+                wlist.append(
+                    {
+                        "activity_type": _sparql_get_val(b, "activityType"),
+                        "started_at_iso": _sparql_get_val(b, "started"),
+                        "active_energy_kcal": _sparql_get_val(b, "activeEnergyKcal"),
+                        "duration_seconds": _sparql_get_val(b, "durationSeconds"),
+                        "distance_meters": _sparql_get_val(b, "distanceMeters"),
+                    }
+                )
+
+        if not wlist:
+            str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            workouts = str0.get("workouts") if isinstance(str0, dict) else None
+            wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
         def _parse_iso(s: Any) -> Optional[datetime]:
             if not isinstance(s, str) or not s.strip():
@@ -2796,12 +2873,12 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
             if started.astimezone(tz).date().isoformat() != date_iso:
                 continue
             today_workouts.append(w)
-            kcal = w.get("active_energy_kcal")
-            if isinstance(kcal, (int, float)):
+            kcal = _num(w.get("active_energy_kcal"))
+            if kcal is not None:
                 burn_kcal += float(kcal)
             else:
-                dist_m = w.get("distance_meters")
-                if kg is not None and isinstance(dist_m, (int, float)) and float(dist_m) > 0:
+                dist_m = _num(w.get("distance_meters"))
+                if kg is not None and dist_m is not None and float(dist_m) > 0:
                     burn_kcal += kg * (float(dist_m) / 1000.0) * 1.0
 
         # Estimate BMR/TDEE if profile present.
@@ -2843,11 +2920,12 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
                 started = _parse_iso(w.get("started_at_iso"))
                 started_local = started.astimezone(tz).strftime("%H:%M") if started else ""
                 dist_m = w.get("distance_meters")
-                dist_s = f"{float(dist_m)/1609.34:.1f} mi" if isinstance(dist_m, (int, float)) and float(dist_m) > 0 else ""
+                dist_m_num = _num(dist_m)
+                dist_s = f"{float(dist_m_num)/1609.34:.1f} mi" if dist_m_num is not None and float(dist_m_num) > 0 else ""
                 dur_s = w.get("duration_seconds")
                 dur_out = ""
                 try:
-                    s = int(dur_s)
+                    s = int(_int(dur_s) or 0)
                     m = s // 60
                     dur_out = f"{m}m" if m < 60 else f"{m//60}h{m%60:02d}m"
                 except Exception:
@@ -2956,9 +3034,8 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
         lines = [header]
 
         def _fmt_duration(sec: Any) -> str:
-            try:
-                s = int(sec)
-            except Exception:
+            s = _int(sec)
+            if s is None:
                 return ""
             m = s // 60
             ss = s % 60
@@ -2984,8 +3061,9 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
 
             dist_m = w.get("distance_meters")
             dist_s = ""
-            if isinstance(dist_m, (int, float)) and float(dist_m) > 0:
-                km = float(dist_m) / 1000.0
+            dist_m_num = _num(dist_m)
+            if dist_m_num is not None and float(dist_m_num) > 0:
+                km = float(dist_m_num) / 1000.0
                 dist_s = f"{km:.2f} km"
 
             dur_s = _fmt_duration(w.get("duration_seconds"))
@@ -3009,6 +3087,64 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
         tg_user_id = _session_telegram_user_id(input.session)
         if not tg_user_id:
             return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
+
+        if _fitnesscore_use_graphdb():
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?activityType ?started ?durationSeconds ?distanceMeters WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ;
+      prov:startedAtTime ?started .
+    OPTIONAL {{ ?w fc:activityType ?activityType . }}
+    OPTIONAL {{ ?w fc:durationSeconds ?durationSeconds . }}
+    OPTIONAL {{ ?w fc:distanceMeters ?distanceMeters . }}
+    FILTER(?started >= "{_sparql_iso_dt(cutoff.isoformat())}"^^xsd:dateTime)
+  }}
+}} ORDER BY DESC(?started) LIMIT 200
+""".strip()
+            out = await _fitnesscore_graphdb_select(q)
+            results = out.get("results") if isinstance(out, dict) else None
+            rows = _sparql_bindings_rows(results)
+            if rows:
+                def _fmt_duration(sec: Any) -> str:
+                    s = _int(sec)
+                    if s is None:
+                        return ""
+                    m = s // 60
+                    if m < 60:
+                        return f"{m}m"
+                    return f"{m//60}h{m%60:02d}m"
+
+                lines = [f"Workouts (last {days} days):"]
+                for b in rows[:10]:
+                    typ = str(_sparql_get_val(b, "activityType") or "Workout").strip() or "Workout"
+                    started = _parse_iso(_sparql_get_val(b, "started"))
+                    started_local = ""
+                    if started:
+                        try:
+                            started_local = started.astimezone(tz).strftime("%a %H:%M")
+                        except Exception:
+                            started_local = started.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+                    dist_m_num = _num(_sparql_get_val(b, "distanceMeters"))
+                    dist_s = f"{float(dist_m_num)/1609.34:.1f} mi" if dist_m_num is not None and dist_m_num > 0 else ""
+                    dur_s = _fmt_duration(_sparql_get_val(b, "durationSeconds"))
+                    bits = " • ".join([x for x in [started_local, dist_s, dur_s] if x])
+                    lines.append(f"- {typ}" + (f" ({bits})" if bits else ""))
+
+                answer = "\n".join(lines).strip()
+                if thread_id:
+                    await _memory_append(thread_id, "user", msg)
+                    await _memory_append(thread_id, "assistant", answer)
+                return Output(
+                    answer=answer,
+                    citations=[],
+                    goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+                    data={"asOfISO": _now_iso(), "count": len(rows), "days": days},
+                )
+
         data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200})
         if data0 is None:
             answer = (
@@ -3063,9 +3199,8 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
             )
 
         def _fmt_duration(sec: Any) -> str:
-            try:
-                s = int(sec)
-            except Exception:
+            s = _int(sec)
+            if s is None:
                 return ""
             m = s // 60
             if m < 60:
@@ -3085,8 +3220,9 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
                     started_local = started.astimezone(tz).strftime("%Y-%m-%d %H:%M")
             dist_m = w.get("distance_meters")
             dist_s = ""
-            if isinstance(dist_m, (int, float)) and dist_m > 0:
-                dist_s = f"{dist_m/1609.34:.1f} mi"
+            dist_m_num = _num(dist_m)
+            if dist_m_num is not None and dist_m_num > 0:
+                dist_s = f"{dist_m_num/1609.34:.1f} mi"
             dur_s = _fmt_duration(w.get("duration_seconds"))
             bits = " • ".join([b for b in [started_local, dist_s, dur_s] if b])
             lines.append(f"- {typ}" + (f" ({bits})" if bits else ""))
