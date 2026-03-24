@@ -2173,6 +2173,34 @@ async def run(input: Input) -> Output:
                     continue
                 workouts_today.append(w)
 
+        # If Strava has workouts but weight-mcp shows 0 burn, attempt a lightweight ingest
+        # (no Telegram sync; just ensure workouts exist in wm_exercise_entries).
+        if tg_user_id and workouts_today and ex_kcal <= 0.0:
+            for w in workouts_today[:10]:
+                try:
+                    await _weight_call_json(
+                        "weight_ingest_workout",
+                        {
+                            "scope": scope,
+                            "source": "strava",
+                            "workoutId": str(w.get("workout_id") or w.get("id") or "").strip(),
+                            "startedAtISO": w.get("started_at_iso") or w.get("ended_at_iso"),
+                            "activityType": w.get("activity_type"),
+                            "durationSeconds": w.get("duration_seconds"),
+                            "distanceMeters": w.get("distance_meters"),
+                            "activeEnergyKcal": w.get("active_energy_kcal"),
+                            "raw": {"metadata_json": w.get("metadata_json")},
+                        },
+                    )
+                except Exception:
+                    pass
+            day1 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
+            totals1 = day1.get("totals") if isinstance(day1, dict) else None
+            totals1 = totals1 if isinstance(totals1, dict) else {}
+            ex_kcal = float(totals1.get("exercise_kcal") or 0) if isinstance(totals1.get("exercise_kcal"), (int, float)) else ex_kcal
+            net_kcal = float(totals1.get("net_calories") or (intake_kcal - ex_kcal)) if isinstance(totals1.get("net_calories"), (int, float)) else (intake_kcal - ex_kcal)
+            totals = totals1 or totals
+
         lines = [
             f"Daily calories ({date_iso}, {tz_name}):",
             f"- Intake: **{int(round(intake_kcal))} kcal**",
@@ -2209,6 +2237,56 @@ async def run(input: Input) -> Output:
         totals = totals if isinstance(totals, dict) else {}
         ex_kcal = totals.get("exercise_kcal")
         ex_out = float(ex_kcal) if isinstance(ex_kcal, (int, float)) else 0.0
+
+        if ex_out <= 0.0:
+            tg_user_id = _session_telegram_user_id(input.session)
+            if tg_user_id:
+                str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+                workouts = str0.get("workouts") if isinstance(str0, dict) else None
+                wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
+                tz = ZoneInfo(tz_name or "UTC")
+
+                def _parse_iso2(s: Any) -> Optional[datetime]:
+                    if not isinstance(s, str) or not s.strip():
+                        return None
+                    try:
+                        return datetime.fromisoformat(s.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
+                    except Exception:
+                        return None
+
+                day_workouts: list[dict[str, Any]] = []
+                for w in wlist:
+                    started = _parse_iso2(w.get("started_at_iso")) or _parse_iso2(w.get("ended_at_iso"))
+                    if not started:
+                        continue
+                    if started.astimezone(tz).date().isoformat() != date_iso:
+                        continue
+                    day_workouts.append(w)
+
+                for w in day_workouts[:10]:
+                    try:
+                        await _weight_call_json(
+                            "weight_ingest_workout",
+                            {
+                                "scope": scope,
+                                "source": "strava",
+                                "workoutId": str(w.get("workout_id") or w.get("id") or "").strip(),
+                                "startedAtISO": w.get("started_at_iso") or w.get("ended_at_iso"),
+                                "activityType": w.get("activity_type"),
+                                "durationSeconds": w.get("duration_seconds"),
+                                "distanceMeters": w.get("distance_meters"),
+                                "activeEnergyKcal": w.get("active_energy_kcal"),
+                                "raw": {"metadata_json": w.get("metadata_json")},
+                            },
+                        )
+                    except Exception:
+                        pass
+                day1 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
+                totals1 = day1.get("totals") if isinstance(day1, dict) else None
+                totals1 = totals1 if isinstance(totals1, dict) else {}
+                ex2 = totals1.get("exercise_kcal")
+                if isinstance(ex2, (int, float)):
+                    ex_out = float(ex2)
 
         answer = f"For **{date_iso}** ({tz_name}), your **exercise burn** is **{int(round(ex_out))} kcal**."
         if thread_id:

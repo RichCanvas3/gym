@@ -212,7 +212,33 @@ async function latestWeightKg(env: Env, sid: string, atMsUpperBound: number | nu
     .bind(sid, ...(atMsUpperBound != null ? [atMsUpperBound] : []))
     .first<{ weight_kg: number | null; at_ms: number | null }>();
   const kg = row && typeof (row as any).weight_kg === "number" ? Number((row as any).weight_kg) : null;
-  return kg != null && Number.isFinite(kg) && kg > 0 ? kg : null;
+  if (kg != null && Number.isFinite(kg) && kg > 0) return kg;
+
+  // Fallback: profile weight (so exercise kcal works even without weigh-ins logged).
+  const prow = await env.DB.prepare(`SELECT profile_json FROM wm_profiles WHERE scope_id=?1 LIMIT 1`)
+    .bind(sid)
+    .first<{ profile_json: string | null }>();
+  const pjson = prow && typeof (prow as any).profile_json === "string" ? String((prow as any).profile_json) : "";
+  if (!pjson) return null;
+  try {
+    const p = JSON.parse(pjson);
+    if (!p || typeof p !== "object") return null;
+    const anyP: any = p as any;
+    const kg2 =
+      (typeof anyP.weight_kg === "number" && Number.isFinite(anyP.weight_kg) ? Number(anyP.weight_kg) : null) ??
+      (typeof anyP.weightKg === "number" && Number.isFinite(anyP.weightKg) ? Number(anyP.weightKg) : null) ??
+      (typeof anyP.body_weight_kg === "number" && Number.isFinite(anyP.body_weight_kg) ? Number(anyP.body_weight_kg) : null) ??
+      (typeof anyP.bodyWeightKg === "number" && Number.isFinite(anyP.bodyWeightKg) ? Number(anyP.bodyWeightKg) : null);
+    if (kg2 != null && kg2 > 0) return kg2;
+    const lb =
+      (typeof anyP.weight_lb === "number" && Number.isFinite(anyP.weight_lb) ? Number(anyP.weight_lb) : null) ??
+      (typeof anyP.weightLb === "number" && Number.isFinite(anyP.weightLb) ? Number(anyP.weightLb) : null) ??
+      (typeof anyP.bodyWeightLb === "number" && Number.isFinite(anyP.bodyWeightLb) ? Number(anyP.bodyWeightLb) : null);
+    if (lb != null && lb > 0) return lb * 0.45359237;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function estimateExerciseKcal(args: {
