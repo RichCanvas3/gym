@@ -22,6 +22,14 @@ export type Env = {
   TELEGRAM_MCP: Service;
   WEIGHT_MCP: Service;
   STRAVA_MCP: Service;
+
+  // Optional: LLM kcal estimation during GraphDB sync
+  OPENAI_API_KEY?: string;
+  OPENAI_MODEL?: string;
+  GRAPHDB_KCAL_LLM_ENABLED?: string;
+
+  // If profile is missing weight, set this (lb) into wm_profiles.profile_json.
+  DEFAULT_PROFILE_WEIGHT_LB?: string;
 };
 
 function nowISO() {
@@ -183,6 +191,80 @@ async function graphDbClearAndUploadTtl(env: Env, contextIri: string, ttl: strin
   if (!res1.ok) throw new Error(`GraphDB upload failed: ${res1.status} ${await res1.text()}`);
 }
 
+async function openaiJson(env: Env, messages: Array<{ role: "system" | "user"; content: string }>): Promise<any> {
+  const key = (env.OPENAI_API_KEY ?? "").trim();
+  if (!key) throw new Error("Missing OPENAI_API_KEY");
+  const model = (env.OPENAI_MODEL ?? "").trim() || "gpt-4o-mini";
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${key}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0,
+      messages,
+      response_format: { type: "json_object" },
+    }),
+  });
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`OpenAI error ${res.status}: ${txt.slice(0, 500)}`);
+  return JSON.parse(txt);
+}
+
+function isFinitePosNum(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0;
+}
+
+async function estimateWorkoutsKcalWithLlm(
+  env: Env,
+  args: { weightKg: number; workouts: any[] },
+): Promise<Record<string, number>> {
+  const wk = Array.isArray(args.workouts) ? args.workouts : [];
+  const weightKg = args.weightKg;
+  const items = wk
+    .map((w) => ({
+      workout_id: asString(w?.workout_id).trim(),
+      activity_type: asString(w?.activity_type).trim(),
+      duration_seconds: typeof w?.duration_seconds === "number" ? Math.trunc(w.duration_seconds) : null,
+      distance_meters: typeof w?.distance_meters === "number" ? w.distance_meters : null,
+      started_at_iso: asString(w?.started_at_iso).trim() || null,
+    }))
+    .filter((w) => Boolean(w.workout_id));
+
+  const sys =
+    "You estimate active calories burned (kcal) for workouts.\n" +
+    "Return JSON only, shape: {\"kcalByWorkoutId\": {\"<workout_id>\": <kcal_number>, ...}}.\n" +
+    "Rules:\n" +
+    "- Use the provided weightKg.\n" +
+    "- Use activity_type, duration_seconds, distance_meters.\n" +
+    "- If data is insufficient, omit that workout_id (do not guess wildly).\n" +
+    "- kcal must be a positive number.\n";
+  const user = JSON.stringify({ weightKg, workouts: items });
+  const out = await openaiJson(env, [
+    { role: "system", content: sys },
+    { role: "user", content: user },
+  ]);
+  const content = out?.choices?.[0]?.message?.content;
+  let parsed: any = null;
+  try {
+    parsed = typeof content === "string" ? JSON.parse(content) : content;
+  } catch {
+    parsed = null;
+  }
+  const m = parsed?.kcalByWorkoutId;
+  const outMap: Record<string, number> = {};
+  if (m && typeof m === "object") {
+    for (const [k, v] of Object.entries(m)) {
+      const id = String(k ?? "").trim();
+      const n = typeof v === "number" ? v : Number(v);
+      if (id && Number.isFinite(n) && n > 0) outMap[id] = n;
+    }
+  }
+  return outMap;
+}
+
 function ttlEscape(s: string): string {
   return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
 }
@@ -236,19 +318,6 @@ function weightKgFromProfile(profile: any): number | null {
   } catch {
     return null;
   }
-}
-
-function latestWeightKgFromWeights(weightItems: any[]): number | null {
-  if (!Array.isArray(weightItems) || !weightItems.length) return null;
-  const sorted = weightItems
-    .map((x) => ({ at_ms: typeof x?.at_ms === "number" ? x.at_ms : -1, weight_kg: typeof x?.weight_kg === "number" ? x.weight_kg : null }))
-    .filter((x) => typeof x.at_ms === "number")
-    .sort((a, b) => b.at_ms - a.at_ms);
-  for (const r of sorted) {
-    const kg = r.weight_kg;
-    if (typeof kg === "number" && Number.isFinite(kg) && kg > 0) return kg;
-  }
-  return null;
 }
 
 function estimateExerciseKcal(args: {
@@ -305,11 +374,32 @@ async function syncFitnesscoreGraphDb(env: Env): Promise<{ ok: boolean; contextI
   const scope = { telegramUserId: tgUserId };
   const foods = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_list_food", { scope, fromISO, toISO, limit: 500 });
   const foodItems = Array.isArray(foods?.items) ? foods.items : [];
-  const weights0 = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_list_weights", { scope, fromISO, toISO, limit: 200 });
-  const weightItems = Array.isArray(weights0?.items) ? weights0.items : [];
   const prof0 = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_profile_get", { scope });
-  const profile = prof0 && typeof prof0 === "object" ? (prof0 as any).profile : null;
-  const weightKg = latestWeightKgFromWeights(weightItems) ?? (profile ? weightKgFromProfile(profile) : null);
+  let profile = prof0 && typeof prof0 === "object" ? (prof0 as any).profile : null;
+  let weightKg = profile ? weightKgFromProfile(profile) : null;
+  if (weightKg == null) {
+    const defLbRaw = (env.DEFAULT_PROFILE_WEIGHT_LB ?? "").trim();
+    const defLb = defLbRaw ? Number(defLbRaw) : 220;
+    if (Number.isFinite(defLb) && defLb > 0) {
+      const next = profile && typeof profile === "object" ? { ...(profile as any) } : {};
+      // Only set if missing (don't overwrite).
+      if (next.weight_lb == null && next.weightKg == null && next.weight_kg == null && next.weightLb == null) {
+        next.weight_lb = defLb;
+        // Persist back into wm_profiles.profile_json
+        await mcpCall(env.WEIGHT_MCP, apiKey, "weight_profile_upsert", { scope, profile: next });
+        profile = next;
+        weightKg = weightKgFromProfile(profile);
+      }
+    }
+  }
+
+  // If Strava doesn't provide kcal, optionally use LLM to estimate per-workout kcal (batch).
+  const wantLlm = truthy(env.GRAPHDB_KCAL_LLM_ENABLED) && typeof env.OPENAI_API_KEY === "string" && env.OPENAI_API_KEY.trim().length > 10;
+  const missingKcal = workouts.filter((wk: any) => asString(wk?.workout_id).trim() && typeof wk?.active_energy_kcal !== "number");
+  const kcalByWorkoutId =
+    wantLlm && weightKg != null && missingKcal.length
+      ? await estimateWorkoutsKcalWithLlm(env, { weightKg, workouts: missingKcal.slice(0, 50) })
+      : {};
 
   const idBase = (env.GRAPHDB_ID_BASE ?? "https://id.fitnesscore.ai").trim() || "https://id.fitnesscore.ai";
   const contextBase = (env.GRAPHDB_CONTEXT_BASE ?? "https://id.fitnesscore.ai/graph/d1").trim() || "https://id.fitnesscore.ai/graph/d1";
@@ -335,33 +425,44 @@ async function syncFitnesscoreGraphDb(env: Env): Promise<{ ok: boolean; contextI
     if (typeof wk?.distance_meters === "number") parts.push(`fc:distanceMeters "${wk.distance_meters}"^^xsd:decimal`);
     if (typeof wk?.active_energy_kcal === "number") {
       parts.push(`fc:activeEnergyKcal "${wk.active_energy_kcal}"^^xsd:decimal`);
-    } else if (weightKg != null) {
-      const est = estimateExerciseKcal({
-        activityType: wk?.activity_type,
-        durationSeconds: wk?.duration_seconds,
-        distanceMeters: wk?.distance_meters,
-        weightKg,
-      });
-      if (typeof est === "number" && Number.isFinite(est) && est > 0) {
-        parts.push(`fc:activeEnergyKcal "${est}"^^xsd:decimal`);
-        parts.push(`fc:description ${litStr("activeEnergyKcalSource:estimated")}`);
+    } else {
+      const wkid = workoutId;
+      const llmKcal = wkid ? (kcalByWorkoutId[wkid] ?? null) : null;
+      if (llmKcal != null && isFinitePosNum(llmKcal)) {
+        parts.push(`fc:activeEnergyKcal "${llmKcal}"^^xsd:decimal`);
+        parts.push(`fc:description ${litStr("activeEnergyKcalSource:llm")}`);
+      } else if (weightKg != null) {
+        // Fallback heuristic if LLM disabled/unavailable
+        const est = estimateExerciseKcal({
+          activityType: wk?.activity_type,
+          durationSeconds: wk?.duration_seconds,
+          distanceMeters: wk?.distance_meters,
+          weightKg,
+        });
+        if (typeof est === "number" && Number.isFinite(est) && est > 0) {
+          parts.push(`fc:activeEnergyKcal "${est}"^^xsd:decimal`);
+          parts.push(`fc:description ${litStr("activeEnergyKcalSource:estimated")}`);
+        }
       }
     }
     lines.push(parts.join(" ; ") + " .");
   }
   lines.push("");
 
-  for (const it of weightItems.slice(0, 2000)) {
-    const id = asString(it?.id).trim();
-    if (!id) continue;
-    const subj = iri(idBase, "weight", id);
-    const parts: string[] = [`${subj} a fc:BodyWeightObservation, sosa:Observation`, `sosa:hasFeatureOfInterest ${athlete}`, `prov:wasAttributedTo ${athlete}`];
-    const at_ms = typeof it?.at_ms === "number" ? it.at_ms : null;
-    if (at_ms != null) parts.push(`prov:generatedAtTime "${new Date(at_ms).toISOString()}"^^xsd:dateTime`);
-    if (typeof it?.weight_kg === "number") parts.push(`fc:bodyWeightKg "${it.weight_kg}"^^xsd:decimal`);
+  // Body weight from profile (wm_profiles.profile_json), represented as an Observation snapshot.
+  if (weightKg != null && Number.isFinite(weightKg) && weightKg > 0) {
+    const subj = iri(idBase, "weight", `profile:${tgUserId}`);
+    const parts: string[] = [
+      `${subj} a fc:BodyWeightObservation, sosa:Observation`,
+      `sosa:hasFeatureOfInterest ${athlete}`,
+      `prov:wasAttributedTo ${athlete}`,
+      `prov:generatedAtTime "${new Date().toISOString()}"^^xsd:dateTime`,
+      `fc:bodyWeightKg "${weightKg}"^^xsd:decimal`,
+      `fc:description ${litStr("bodyWeightKgSource:profile")}`,
+    ];
     lines.push(parts.join(" ; ") + " .");
+    lines.push("");
   }
-  lines.push("");
 
   for (const it of foodItems.slice(0, 5000)) {
     const id = asString(it?.id).trim();

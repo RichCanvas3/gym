@@ -55,6 +55,7 @@ export default function ChatPage() {
   const [profileAge, setProfileAge] = useState("");
   const [profileSex, setProfileSex] = useState<"male" | "female" | "other" | "">("");
   const [profileHeightIn, setProfileHeightIn] = useState("");
+  const [profileWeightLb, setProfileWeightLb] = useState("");
   const [profileBodyShape, setProfileBodyShape] = useState<"lean" | "average" | "stocky" | "athletic" | "">("");
   const [profileActivityLevel, setProfileActivityLevel] = useState<
     "sedentary" | "light" | "moderate" | "very_active" | ""
@@ -239,6 +240,16 @@ export default function ChatPage() {
         const age = typeof prof?.age === "number" ? String(prof.age) : typeof prof?.age === "string" ? prof.age : "";
         const sex = prof?.sex === "male" || prof?.sex === "female" || prof?.sex === "other" ? prof.sex : "";
         const heightIn = typeof prof?.height_in === "number" ? String(prof.height_in) : typeof prof?.height_in === "string" ? prof.height_in : "";
+        const weightLb =
+          typeof prof?.weight_lb === "number"
+            ? String(prof.weight_lb)
+            : typeof prof?.weight_lb === "string"
+              ? prof.weight_lb
+              : typeof prof?.weightLb === "number"
+                ? String(prof.weightLb)
+                : typeof prof?.weightLb === "string"
+                  ? prof.weightLb
+                  : "";
         const bodyShape = prof?.body_shape === "lean" || prof?.body_shape === "average" || prof?.body_shape === "stocky" || prof?.body_shape === "athletic" ? prof.body_shape : "";
         const activityLevel =
           prof?.activity_level === "sedentary" ||
@@ -251,9 +262,10 @@ export default function ChatPage() {
           setProfileAge(age);
           setProfileSex(sex);
           setProfileHeightIn(heightIn);
+          setProfileWeightLb(weightLb);
           setProfileBodyShape(bodyShape);
           setProfileActivityLevel(activityLevel);
-          setProfileMissing(!(age && sex && heightIn && activityLevel));
+          setProfileMissing(!(age && sex && heightIn && weightLb && activityLevel));
         }
       } catch {
         // ignore
@@ -499,7 +511,7 @@ export default function ChatPage() {
           <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-50">
             <div className="font-semibold">Complete your profile (for TDEE + calorie burn estimates)</div>
             {profileError ? <div className="mt-2 text-xs opacity-90">{profileError}</div> : null}
-            <div className="mt-2 grid gap-2 sm:grid-cols-5">
+            <div className="mt-2 grid gap-2 sm:grid-cols-6">
               <input
                 value={profileAge}
                 onChange={(e) => setProfileAge(e.target.value)}
@@ -520,6 +532,12 @@ export default function ChatPage() {
                 value={profileHeightIn}
                 onChange={(e) => setProfileHeightIn(e.target.value)}
                 placeholder="Height (in)"
+                className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
+              />
+              <input
+                value={profileWeightLb}
+                onChange={(e) => setProfileWeightLb(e.target.value)}
+                placeholder="Weight (lb)"
                 className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
               />
               <select
@@ -556,10 +574,12 @@ export default function ChatPage() {
                     const tok = await getAccessToken();
                     const ageN = Number.parseInt(profileAge.trim(), 10);
                     const heightN = Number.parseFloat(profileHeightIn.trim());
+                    const weightLbN = Number.parseFloat(profileWeightLb.trim());
                     const profile: Record<string, unknown> = {};
                     if (Number.isFinite(ageN)) profile.age = ageN;
                     if (profileSex) profile.sex = profileSex;
                     if (Number.isFinite(heightN)) profile.height_in = heightN;
+                    if (Number.isFinite(weightLbN)) profile.weight_lb = weightLbN;
                     if (profileBodyShape) profile.body_shape = profileBodyShape;
                     if (profileActivityLevel) profile.activity_level = profileActivityLevel;
                     await fetch("/api/agent/run", {

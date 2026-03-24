@@ -28,6 +28,7 @@ const res = await fetch(`${coreUrl}/mcp`, {
   method: "POST",
   headers: {
     "content-type": "application/json",
+    accept: "application/json, text/event-stream",
     ...(apiKey ? { "x-api-key": apiKey } : {}),
   },
   body: JSON.stringify({
@@ -38,7 +39,23 @@ const res = await fetch(`${coreUrl}/mcp`, {
   }),
 });
 
-const json = await res.json().catch(() => ({}));
-if (!res.ok) throw new Error(`HTTP ${res.status}: ${JSON.stringify(json).slice(0, 800)}`);
-console.log(JSON.stringify({ ok: true, graph, out: json }, null, 2));
+const txt = await res.text();
+if (!res.ok) throw new Error(`HTTP ${res.status}: ${txt.slice(0, 800)}`);
+// Worker MCP commonly responds as SSE; extract first `data: ...` line if present.
+let out;
+const m = txt.match(/data: (.+)\n/);
+if (m && m[1]) {
+  try {
+    out = JSON.parse(m[1]);
+  } catch {
+    out = { raw: txt.slice(0, 2000) };
+  }
+} else {
+  try {
+    out = JSON.parse(txt);
+  } catch {
+    out = { raw: txt.slice(0, 2000) };
+  }
+}
+console.log(JSON.stringify({ ok: true, graph, out }, null, 2));
 
