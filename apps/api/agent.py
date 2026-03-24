@@ -2770,10 +2770,15 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
             f"- Exercise burn (today): **{int(round(burn_kcal))} kcal**" + (f" (using {latest_kg:.1f} kg)" if latest_kg is not None else ""),
             f"- Net (intake − exercise): **{int(round(net))} kcal**",
         ]
+        bmr_kcal_day, tdee_kcal_day = _tdee_from_profile(prof)
+        if bmr_kcal_day is not None:
+            lines.append(f"- Baseline (BMR): **{int(round(bmr_kcal_day))} kcal/day**")
+        if tdee_kcal_day is not None:
+            lines.append(f"- Baseline (TDEE): **{int(round(tdee_kcal_day))} kcal/day**")
         if today_workouts:
             lines.append("\nWorkouts today:")
             for w in today_workouts[:6]:
-                typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
+                typ = _activity_type_label(w.get("activity_type"))
                 started = _parse_iso(w.get("started_at_iso"))
                 started_local = started.astimezone(tz).strftime("%H:%M") if started else ""
                 dist_m = w.get("distance_meters")
@@ -2997,7 +3002,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         if today_workouts:
             lines.append("\nWorkouts today:")
             for w in today_workouts[:6]:
-                typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
+                typ = _activity_type_label(w.get("activity_type"))
                 started = _parse_iso(w.get("started_at_iso"))
                 started_local = started.astimezone(tz).strftime("%H:%M") if started else ""
                 dist_m = w.get("distance_meters")
