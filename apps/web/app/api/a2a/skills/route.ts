@@ -79,6 +79,20 @@ export async function GET() {
         ],
       },
       {
+        id: "googlecalendar",
+        label: "Calendar (Google)",
+        tools: [
+          "googlecalendar_googlecalendar_get_connection_status",
+          "googlecalendar_googlecalendar_list_calendars",
+          "googlecalendar_googlecalendar_list_events",
+          "googlecalendar_googlecalendar_sync_events",
+          "googlecalendar_googlecalendar_list_events_cached",
+          "googlecalendar_googlecalendar_create_event",
+          "googlecalendar_googlecalendar_update_event",
+          "googlecalendar_googlecalendar_delete_event",
+        ],
+      },
+      {
         id: "content",
         label: "Content + Erie web crawl (KB)",
         tools: [

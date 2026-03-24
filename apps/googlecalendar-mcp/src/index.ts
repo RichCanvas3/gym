@@ -55,6 +55,51 @@ function jsonText(obj: unknown) {
   return JSON.stringify(obj, null, 2);
 }
 
+async function ensureEventCacheTables(env: Env): Promise<void> {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS google_calendar_events (
+      account_address TEXT NOT NULL,
+      calendar_id TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      start_iso TEXT,
+      end_iso TEXT,
+      start_ms INTEGER,
+      end_ms INTEGER,
+      summary TEXT,
+      description TEXT,
+      status TEXT,
+      updated_at_iso TEXT NOT NULL,
+      raw_json TEXT NOT NULL,
+      PRIMARY KEY (account_address, calendar_id, event_id)
+    )`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_google_calendar_events_start ON google_calendar_events(account_address, start_ms)`,
+  ).run();
+}
+
+function eventStartIso(e: any): string | null {
+  const dt = e?.start?.dateTime;
+  if (typeof dt === "string" && dt.trim()) return dt.trim();
+  const d = e?.start?.date;
+  if (typeof d === "string" && d.trim()) return d.trim();
+  return null;
+}
+
+function eventEndIso(e: any): string | null {
+  const dt = e?.end?.dateTime;
+  if (typeof dt === "string" && dt.trim()) return dt.trim();
+  const d = e?.end?.date;
+  if (typeof d === "string" && d.trim()) return d.trim();
+  return null;
+}
+
+function isoToMs(iso: string | null): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 async function requireApiKey(request: Request, env: Env) {
   const want = (env.MCP_API_KEY ?? "").trim();
   if (!want) return;
@@ -306,6 +351,137 @@ function createServer(env: Env) {
       const json = (await res.json().catch(() => ({}))) as any;
       if (!res.ok) throw new Error(googleApiErrorHint(res.status, json, "events.list"));
       return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), events: json.items ?? [] }) }] };
+    },
+  );
+
+  server.tool(
+    "googlecalendar_sync_events",
+    "Fetch events from Google and upsert them into D1 for cached retrieval.",
+    {
+      accountAddress: z.string().min(3),
+      timeMinISO: z.string().min(10),
+      timeMaxISO: z.string().min(10),
+      q: z.string().optional(),
+      maxResults: z.number().int().positive().max(2500).optional(),
+    },
+    async (args) => {
+      const p = z
+        .object({
+          accountAddress: z.string().min(3),
+          timeMinISO: z.string().min(10),
+          timeMaxISO: z.string().min(10),
+          q: z.string().optional(),
+          maxResults: z.number().int().positive().max(2500).optional(),
+        })
+        .parse(args);
+      await ensureEventCacheTables(env);
+      const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
+      const calendarIdRaw = getTargetCalendarId(env);
+      const calendarId = calendarIdForApiPath(calendarIdRaw);
+      const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`);
+      url.searchParams.set("timeMin", p.timeMinISO);
+      url.searchParams.set("timeMax", p.timeMaxISO);
+      url.searchParams.set("singleEvents", "true");
+      url.searchParams.set("orderBy", "startTime");
+      url.searchParams.set("maxResults", String(p.maxResults ?? 250));
+      if (p.q && p.q.trim()) url.searchParams.set("q", p.q.trim());
+      const res = await fetch(url.toString(), { headers: { authorization: `Bearer ${accessToken}` } });
+      const json = (await res.json().catch(() => ({}))) as any;
+      if (!res.ok) throw new Error(googleApiErrorHint(res.status, json, "events.list(sync)"));
+      const items: any[] = Array.isArray(json?.items) ? json.items : [];
+      const ts = nowISO();
+      let upserted = 0;
+      for (const e of items) {
+        const eventId = typeof e?.id === "string" ? e.id.trim() : "";
+        if (!eventId) continue;
+        const startIso = eventStartIso(e);
+        const endIso = eventEndIso(e);
+        const startMs = isoToMs(startIso);
+        const endMs = isoToMs(endIso);
+        await env.DB.prepare(
+          `INSERT INTO google_calendar_events (
+            account_address, calendar_id, event_id,
+            start_iso, end_iso, start_ms, end_ms,
+            summary, description, status,
+            updated_at_iso, raw_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(account_address, calendar_id, event_id) DO UPDATE SET
+            start_iso=excluded.start_iso,
+            end_iso=excluded.end_iso,
+            start_ms=excluded.start_ms,
+            end_ms=excluded.end_ms,
+            summary=excluded.summary,
+            description=excluded.description,
+            status=excluded.status,
+            updated_at_iso=excluded.updated_at_iso,
+            raw_json=excluded.raw_json`,
+        )
+          .bind(
+            p.accountAddress,
+            calendarIdRaw,
+            eventId,
+            startIso,
+            endIso,
+            startMs,
+            endMs,
+            typeof e?.summary === "string" ? e.summary : null,
+            typeof e?.description === "string" ? e.description : null,
+            typeof e?.status === "string" ? e.status : null,
+            ts,
+            JSON.stringify(e ?? {}),
+          )
+          .run();
+        upserted += 1;
+      }
+      return { content: [{ type: "text", text: jsonText({ asOfISO: ts, calendarId: calendarIdRaw, upserted, fetched: items.length }) }] };
+    },
+  );
+
+  server.tool(
+    "googlecalendar_list_events_cached",
+    "List cached events from D1 (populated via googlecalendar_sync_events).",
+    {
+      accountAddress: z.string().min(3),
+      timeMinISO: z.string().min(10),
+      timeMaxISO: z.string().min(10),
+      q: z.string().optional(),
+      maxResults: z.number().int().positive().max(200).optional(),
+    },
+    async (args) => {
+      const p = z
+        .object({
+          accountAddress: z.string().min(3),
+          timeMinISO: z.string().min(10),
+          timeMaxISO: z.string().min(10),
+          q: z.string().optional(),
+          maxResults: z.number().int().positive().max(200).optional(),
+        })
+        .parse(args);
+      await ensureEventCacheTables(env);
+      const calendarIdRaw = getTargetCalendarId(env);
+      const t0 = Date.parse(p.timeMinISO);
+      const t1 = Date.parse(p.timeMaxISO);
+      const minMs = Number.isFinite(t0) ? t0 : 0;
+      const maxMs = Number.isFinite(t1) ? t1 : Date.now() + 365 * 24 * 3600 * 1000;
+      const q = (p.q ?? "").trim().toLowerCase();
+      const res = await env.DB.prepare(
+        `SELECT event_id, start_iso, end_iso, start_ms, end_ms, summary, description, status, raw_json
+         FROM google_calendar_events
+         WHERE account_address = ?
+           AND calendar_id = ?
+           AND start_ms IS NOT NULL
+           AND start_ms >= ?
+           AND start_ms < ?
+         ORDER BY start_ms ASC
+         LIMIT ?`,
+      )
+        .bind(p.accountAddress, calendarIdRaw, minMs, maxMs, p.maxResults ?? 50)
+        .all();
+      let events = (res.results ?? []) as any[];
+      if (q) {
+        events = events.filter((e) => String(e?.summary ?? "").toLowerCase().includes(q) || String(e?.description ?? "").toLowerCase().includes(q));
+      }
+      return { content: [{ type: "text", text: jsonText({ asOfISO: nowISO(), calendarId: calendarIdRaw, events }) }] };
     },
   );
 
