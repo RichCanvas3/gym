@@ -423,6 +423,64 @@ def _int(v: Any) -> Optional[int]:
     return None
 
 
+def _activity_type_label(v: Any) -> str:
+    """
+    Normalize activity type values coming from GraphDB/Strava.
+    Examples:
+      - https://ontology.fitnesscore.ai/fc#ActivityType_Run -> Run
+      - fc:ActivityType_Ride -> Ride
+      - Run -> Run
+    """
+    s = str(v or "").strip()
+    if not s:
+        return "Workout"
+    # Full IRI
+    if "://" in s:
+        if "#" in s:
+            s = s.split("#", 1)[1]
+        else:
+            s = s.rsplit("/", 1)[-1]
+    # Prefixed
+    if ":" in s and not s.lower().startswith("http"):
+        s = s.split(":", 1)[1]
+    # Remove common scheme prefix
+    if s.startswith("ActivityType_"):
+        s = s[len("ActivityType_") :]
+    s = s.replace("_", " ").strip()
+    return s.title() if s else "Workout"
+
+
+def _tdee_from_profile(profile: dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    """
+    Returns (bmr_kcal_day, tdee_kcal_day).
+    Uses Mifflin-St Jeor + activity multiplier.
+    """
+    sex = str(profile.get("sex") or "").strip().lower()
+    age = _num(profile.get("age"))
+    height_in = _num(profile.get("height_in"))
+    # Prefer kg; allow lb.
+    kg = _num(profile.get("weight_kg"))
+    if kg is None:
+        lb = _num(profile.get("weight_lb"))
+        if lb is not None:
+            kg = lb * 0.45359237
+    activity = str(profile.get("activity_level") or "").strip().lower()
+    if kg is None or height_in is None or age is None or sex not in {"male", "female"}:
+        return None, None
+    cm = float(height_in) * 2.54
+    s = 5 if sex == "male" else -161
+    bmr = 10.0 * float(kg) + 6.25 * cm - 5.0 * float(age) + float(s)
+    mult = {
+        "sedentary": 1.2,
+        "light": 1.375,
+        "moderate": 1.55,
+        "very_active": 1.725,
+    }.get(activity)
+    if not mult:
+        return bmr, None
+    return bmr, bmr * mult
+
+
 async def _fitnesscore_graphdb_select(query: str) -> Optional[dict[str, Any]]:
     # tool name in MCP discovery can be either core_graphdb_sparql_select or core_core_graphdb_sparql_select
     return await _core_call_json("graphdb_sparql_select", {"query": query})
@@ -2426,10 +2484,21 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
             f"- Exercise burn: **{int(round(ex_kcal))} kcal**",
             f"- Net (intake − exercise): **{int(round(net_kcal))} kcal**",
         ]
+
+        # Add baseline burn estimates from profile (BMR/TDEE).
+        profile = await _weight_call_json("weight_profile_get", {"scope": scope}) or {}
+        profile_obj = profile.get("profile") if isinstance(profile, dict) else None
+        profile_obj = profile_obj if isinstance(profile_obj, dict) else {}
+        bmr_kcal_day, tdee_kcal_day = _tdee_from_profile(profile_obj)
+        if bmr_kcal_day is not None:
+            lines.append(f"- Baseline (BMR): **{int(round(bmr_kcal_day))} kcal/day**")
+        if tdee_kcal_day is not None:
+            lines.append(f"- Baseline (TDEE): **{int(round(tdee_kcal_day))} kcal/day**")
+
         if workouts_today:
             lines.append("\nWorkouts:")
             for w in workouts_today[:6]:
-                typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
+                typ = _activity_type_label(w.get("activity_type"))
                 lines.append(f"- {typ}")
 
         answer = "\n".join(lines).strip()

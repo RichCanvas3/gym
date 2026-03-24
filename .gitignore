@@ -6,6 +6,7 @@ dist
 
 # python
 .venv
+.venv-lg
 __pycache__/
 *.pyc
 
