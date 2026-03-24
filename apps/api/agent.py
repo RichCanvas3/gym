@@ -166,17 +166,7 @@ def _resolve_date_iso_with_context(msg: str, tz_name: str, bundle: dict[str, Any
     if "yesterday" in mlow:
         return (base - timedelta(days=1)).isoformat()
     if "today" in mlow:
-        ctx = _goal_integrations(bundle).get("lastDateContext")
-        if isinstance(ctx, dict):
-            d = ctx.get("dateISO")
-            set_at = ctx.get("setAtISO")
-            if isinstance(d, str) and d.strip() and isinstance(set_at, str) and set_at.strip():
-                try:
-                    ts = datetime.fromisoformat(set_at.replace("Z", "+00:00"))
-                    if datetime.now(timezone.utc) - ts.astimezone(timezone.utc) < timedelta(minutes=30):
-                        return d.strip()
-                except Exception:
-                    pass
+        # "today" should always mean today's local date, not the last cached date context.
         return base.isoformat()
     return base.isoformat()
 
