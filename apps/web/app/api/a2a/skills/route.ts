@@ -76,6 +76,7 @@ export async function GET() {
           "core_core_memory_append_message",
           "core_core_kb_upsert_chunks",
           "core_core_kb_list_chunks",
+          "core_core_graphdb_sparql_select",
         ],
       },
       {

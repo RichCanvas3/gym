@@ -83,6 +83,27 @@ function normalizeTelegramUserId(raw: string): string {
   return t;
 }
 
+function plausibleTelegramUserId(id: string): boolean {
+  const t = (id || "").trim();
+  if (!t) return false;
+  if (!/^\d+$/.test(t)) return false;
+  return t.length >= 6;
+}
+
+async function resolveSyncTelegramUserId(env: Env, apiKey: string | undefined): Promise<{ tgUserId: string; reason?: string; candidates?: string[] }> {
+  const explicit = normalizeTelegramUserId((env.SYNC_TELEGRAM_USER_ID ?? "").trim());
+  if (explicit) return { tgUserId: explicit };
+
+  const out = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_unique_user_ids", { limit: 200 });
+  const raw: unknown[] = Array.isArray((out as any)?.userIds) ? ((out as any).userIds as unknown[]) : [];
+  const ids: string[] = raw
+    .map((x) => String(x ?? "").trim())
+    .filter((s): s is string => Boolean(s && s.trim()));
+  const candidates: string[] = Array.from(new Set(ids.filter(plausibleTelegramUserId)));
+  if (candidates.length === 1) return { tgUserId: candidates[0] as string, candidates };
+  return { tgUserId: "", reason: "missing_sync_telegram_user_id", candidates: candidates.slice(0, 20) };
+}
+
 function fmtDistanceMeters(m: unknown): string {
   if (typeof m !== "number" || !Number.isFinite(m) || m <= 0) return "";
   const km = m / 1000;
@@ -200,10 +221,10 @@ function workoutTypeToConcept(activityType: string): string {
 
 async function syncFitnesscoreGraphDb(env: Env): Promise<{ ok: boolean; contextIri?: string; bytes?: number; reason?: string }> {
   if (!truthy(env.GRAPHDB_SYNC_ENABLED)) return { ok: true, reason: "disabled" };
-  const tgUserId = normalizeTelegramUserId((env.SYNC_TELEGRAM_USER_ID ?? "").trim());
-  if (!tgUserId) return { ok: true, reason: "missing_sync_telegram_user_id" };
-
   const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
+  const resolved = await resolveSyncTelegramUserId(env, apiKey);
+  const tgUserId = resolved.tgUserId;
+  if (!tgUserId) return { ok: true, reason: resolved.reason ?? "missing_sync_telegram_user_id" };
   const lookbackDays = Number.parseInt((env.SYNC_LOOKBACK_DAYS ?? "7").trim(), 10);
   const days = Number.isFinite(lookbackDays) ? lookbackDays : 7;
 
@@ -382,8 +403,9 @@ async function syncStrava(env: Env) {
   const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
   const tzName = (env.SYNC_TZ_NAME ?? "UTC").trim() || "UTC";
   const chatTitle = (env.SYNC_CHAT_TITLE ?? "Smart Agent").trim();
-  const tgUserId = normalizeTelegramUserId((env.SYNC_TELEGRAM_USER_ID ?? "").trim());
-  if (!tgUserId) return { ok: true, inserted: 0, messaged: 0, reason: "missing_sync_telegram_user_id" };
+  const resolved = await resolveSyncTelegramUserId(env, apiKey);
+  const tgUserId = resolved.tgUserId;
+  if (!tgUserId) return { ok: true, inserted: 0, messaged: 0, reason: resolved.reason ?? "missing_sync_telegram_user_id", candidates: resolved.candidates ?? [] };
 
   const chats = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_chats", { limit: 200 });
   const chatList = Array.isArray(chats?.chats) ? chats.chats : [];

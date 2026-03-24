@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Optional
+from urllib.parse import quote
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
@@ -354,6 +355,48 @@ async def _core_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[di
         return _tool_raw_to_json(raw)
     except Exception:
         return None
+
+
+def _fitnesscore_use_graphdb() -> bool:
+    return (os.getenv("FITNESSCORE_USE_GRAPHDB", "1") or "").strip() not in ("0", "false", "False", "no", "NO")
+
+
+def _fitnesscore_graph_context_base() -> str:
+    return (os.getenv("FITNESSCORE_GRAPH_CONTEXT_BASE", "https://id.fitnesscore.ai/graph/d1") or "").strip().rstrip("/")
+
+
+def _fitnesscore_graph_iri_for_telegram_user_id(telegram_user_id: str) -> str:
+    base = _fitnesscore_graph_context_base()
+    tg = (telegram_user_id or "").strip()
+    return f"{base}/{quote(f'tg:{tg}', safe='')}"
+
+
+def _sparql_iso_dt(iso: str) -> str:
+    s = str(iso or "").strip()
+    return s.replace("+00:00", "Z")
+
+
+def _sparql_bindings_rows(results_json: Any) -> list[dict[str, Any]]:
+    if not isinstance(results_json, dict):
+        return []
+    r = results_json.get("results")
+    if not isinstance(r, dict):
+        return []
+    b = r.get("bindings")
+    return [x for x in b if isinstance(x, dict)] if isinstance(b, list) else []
+
+
+def _sparql_get_val(binding: dict[str, Any], var: str) -> Optional[str]:
+    v = binding.get(var)
+    if not isinstance(v, dict):
+        return None
+    s = v.get("value")
+    return str(s) if isinstance(s, (str, int, float)) else None
+
+
+async def _fitnesscore_graphdb_select(query: str) -> Optional[dict[str, Any]]:
+    # tool name in MCP discovery can be either core_graphdb_sparql_select or core_core_graphdb_sparql_select
+    return await _core_call_json("graphdb_sparql_select", {"query": query})
 
 
 async def _strava_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -2031,19 +2074,84 @@ async def run(input: Input) -> Output:
         _set_last_date_context(base_goal_bundle, date_iso, tz_name)
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
-        data0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500})
-        if data0 is None:
-            answer = (
-                "Weight Management MCP isn't connected in this deployment, so I can't fetch your meal log. "
-                "Fix: add the weight worker to MCP_SERVERS_JSON and include weight_weight_list_food in MCP_TOOL_ALLOWLIST."
-            )
-            if thread_id:
-                await _memory_append(thread_id, "user", msg)
-                await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso})
+        items: list[dict[str, Any]] = []
+        tg_user_id = _session_telegram_user_id(input.session)
+        if _fitnesscore_use_graphdb() and tg_user_id:
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?t ?desc ?cal ?p ?c ?f WHERE {{
+  GRAPH <{g}> {{
+    ?e a fc:FoodEntry ;
+      prov:generatedAtTime ?t .
+    OPTIONAL {{ ?e fc:description ?desc . }}
+    OPTIONAL {{ ?e fc:caloriesKcal ?cal . }}
+    OPTIONAL {{ ?e fc:proteinGrams ?p . }}
+    OPTIONAL {{ ?e fc:carbsGrams ?c . }}
+    OPTIONAL {{ ?e fc:fatGrams ?f . }}
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}} ORDER BY ?t
+""".strip()
+            out = await _fitnesscore_graphdb_select(q)
+            results = out.get("results") if isinstance(out, dict) else None
+            rows = _sparql_bindings_rows(results)
+            by_time: dict[str, dict[str, Any]] = {}
+            for b in rows:
+                t = _sparql_get_val(b, "t")
+                if not t:
+                    continue
+                rec = by_time.setdefault(
+                    t,
+                    {
+                        "id": None,
+                        "at_ms": None,
+                        "meal": None,
+                        "text": None,
+                        "calories": None,
+                        "protein_g": None,
+                        "carbs_g": None,
+                        "fat_g": None,
+                        "image_url": None,
+                    },
+                )
+                desc = _sparql_get_val(b, "desc")
+                if isinstance(desc, str) and desc.startswith("meal:"):
+                    rec["meal"] = desc.split(":", 1)[1]
+                if isinstance(desc, str) and desc.startswith("text:"):
+                    rec["text"] = desc.split(":", 1)[1]
+                for (src, dst) in [("cal", "calories"), ("p", "protein_g"), ("c", "carbs_g"), ("f", "fat_g")]:
+                    v = _sparql_get_val(b, src)
+                    if v is None:
+                        continue
+                    try:
+                        rec[dst] = float(v)
+                    except Exception:
+                        pass
+                try:
+                    rec["at_ms"] = int(datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp() * 1000)
+                except Exception:
+                    pass
+            items = list(by_time.values())
 
-        items = (data0 or {}).get("items") if isinstance(data0, dict) else None
-        if not isinstance(items, list) or not items:
+        if not items:
+            # fallback: Weight MCP
+            data0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500})
+            if data0 is None:
+                answer = (
+                    "I can’t fetch your meal log right now. "
+                    "Fix: ensure either GraphDB sync is running or Weight MCP is connected (weight_weight_list_food)."
+                )
+                if thread_id:
+                    await _memory_append(thread_id, "user", msg)
+                    await _memory_append(thread_id, "assistant", answer)
+                return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso})
+            items0 = (data0 or {}).get("items") if isinstance(data0, dict) else None
+            items = [it for it in items0 if isinstance(it, dict)] if isinstance(items0, list) else []
+
+        if not items:
             answer = f"No meals logged for {date_iso}."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
@@ -2141,17 +2249,90 @@ async def run(input: Input) -> Output:
         date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
         _set_last_date_context(base_goal_bundle, date_iso, tz_name)
 
+        from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
+
+        tg_user_id = _session_telegram_user_id(input.session)
+        graph_mode = _fitnesscore_use_graphdb() and bool(tg_user_id)
+        g_intake_kcal = 0.0
+        g_ex_kcal = 0.0
+        workouts_today: list[dict[str, Any]] = []
+
+        if graph_mode:
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?workout ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters WHERE {{
+  GRAPH <{g}> {{
+    ?workout a fc:Workout ;
+      prov:startedAtTime ?started .
+    OPTIONAL {{ ?workout fc:activityType ?activityType . }}
+    OPTIONAL {{ ?workout fc:activeEnergyKcal ?activeEnergyKcal . }}
+    OPTIONAL {{ ?workout fc:durationSeconds ?durationSeconds . }}
+    OPTIONAL {{ ?workout fc:distanceMeters ?distanceMeters . }}
+    FILTER(?started >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?started < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}} ORDER BY ?started
+""".strip()
+            out = await _fitnesscore_graphdb_select(q)
+            results = out.get("results") if isinstance(out, dict) else None
+            rows = _sparql_bindings_rows(results)
+            for b in rows:
+                kcal = _sparql_get_val(b, "activeEnergyKcal")
+                if kcal is not None:
+                    try:
+                        g_ex_kcal += float(kcal)
+                    except Exception:
+                        pass
+                workouts_today.append(
+                    {
+                        "workout": _sparql_get_val(b, "workout"),
+                        "activity_type": _sparql_get_val(b, "activityType"),
+                        "started_at_iso": _sparql_get_val(b, "started"),
+                        "active_energy_kcal": kcal,
+                        "duration_seconds": _sparql_get_val(b, "durationSeconds"),
+                        "distance_meters": _sparql_get_val(b, "distanceMeters"),
+                    }
+                )
+
+            q_food = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
+  GRAPH <{g}> {{
+    ?e a fc:FoodEntry ;
+      prov:generatedAtTime ?t ;
+      fc:caloriesKcal ?k .
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}}
+""".strip()
+            out_food = await _fitnesscore_graphdb_select(q_food)
+            results_food = out_food.get("results") if isinstance(out_food, dict) else None
+            rows_food = _sparql_bindings_rows(results_food)
+            if rows_food:
+                v = _sparql_get_val(rows_food[0], "kcalTotal")
+                if v is not None:
+                    try:
+                        g_intake_kcal = float(v)
+                    except Exception:
+                        g_intake_kcal = 0.0
+
+        # fallback to Weight MCP if graph disabled / empty / missing burn estimates
         day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
         totals = day0.get("totals") if isinstance(day0, dict) else None
         totals = totals if isinstance(totals, dict) else {}
-        intake_kcal = float(totals.get("calories") or 0) if isinstance(totals.get("calories"), (int, float)) else 0.0
-        ex_kcal = float(totals.get("exercise_kcal") or 0) if isinstance(totals.get("exercise_kcal"), (int, float)) else 0.0
-        net_kcal = float(totals.get("net_calories") or (intake_kcal - ex_kcal)) if isinstance(totals.get("net_calories"), (int, float)) else (intake_kcal - ex_kcal)
+        w_intake_kcal = float(totals.get("calories") or 0) if isinstance(totals.get("calories"), (int, float)) else 0.0
+        w_ex_kcal = float(totals.get("exercise_kcal") or 0) if isinstance(totals.get("exercise_kcal"), (int, float)) else 0.0
 
-        # Also show workouts list for that date (from Strava), even if burn is missing.
-        tg_user_id = _session_telegram_user_id(input.session)
-        workouts_today: list[dict[str, Any]] = []
-        if tg_user_id:
+        intake_kcal = g_intake_kcal if (graph_mode and g_intake_kcal > 0.0) else w_intake_kcal
+        ex_kcal = g_ex_kcal if (graph_mode and g_ex_kcal > 0.0) else w_ex_kcal
+        net_kcal = intake_kcal - ex_kcal
+
+        # If we didn't get workouts from GraphDB, fall back to Strava list for display.
+        if (not workouts_today) and tg_user_id:
             str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
             workouts = str0.get("workouts") if isinstance(str0, dict) else None
             wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
@@ -2197,8 +2378,9 @@ async def run(input: Input) -> Output:
             day1 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
             totals1 = day1.get("totals") if isinstance(day1, dict) else None
             totals1 = totals1 if isinstance(totals1, dict) else {}
-            ex_kcal = float(totals1.get("exercise_kcal") or 0) if isinstance(totals1.get("exercise_kcal"), (int, float)) else ex_kcal
-            net_kcal = float(totals1.get("net_calories") or (intake_kcal - ex_kcal)) if isinstance(totals1.get("net_calories"), (int, float)) else (intake_kcal - ex_kcal)
+            ex_w = float(totals1.get("exercise_kcal") or 0) if isinstance(totals1.get("exercise_kcal"), (int, float)) else 0.0
+            ex_kcal = ex_kcal if ex_kcal > 0.0 else ex_w
+            net_kcal = intake_kcal - ex_kcal
             totals = totals1 or totals
 
         lines = [
@@ -2232,14 +2414,44 @@ async def run(input: Input) -> Output:
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
         _set_last_date_context(base_goal_bundle, date_iso, tz_name)
-        day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
-        totals = day0.get("totals") if isinstance(day0, dict) else None
-        totals = totals if isinstance(totals, dict) else {}
-        ex_kcal = totals.get("exercise_kcal")
-        ex_out = float(ex_kcal) if isinstance(ex_kcal, (int, float)) else 0.0
+        from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
+
+        tg_user_id = _session_telegram_user_id(input.session)
+        ex_out = 0.0
+        if _fitnesscore_use_graphdb() and tg_user_id:
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (SUM(?k) AS ?exerciseKcal) (COUNT(?w) AS ?workouts) WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ;
+      prov:startedAtTime ?t .
+    OPTIONAL {{ ?w fc:activeEnergyKcal ?k . }}
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}}
+""".strip()
+            out = await _fitnesscore_graphdb_select(q)
+            results = out.get("results") if isinstance(out, dict) else None
+            rows = _sparql_bindings_rows(results)
+            if rows:
+                v = _sparql_get_val(rows[0], "exerciseKcal")
+                if v is not None:
+                    try:
+                        ex_out = float(v)
+                    except Exception:
+                        ex_out = 0.0
 
         if ex_out <= 0.0:
-            tg_user_id = _session_telegram_user_id(input.session)
+            day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
+            totals = day0.get("totals") if isinstance(day0, dict) else None
+            totals = totals if isinstance(totals, dict) else {}
+            ex_kcal = totals.get("exercise_kcal")
+            ex_out = float(ex_kcal) if isinstance(ex_kcal, (int, float)) else 0.0
+
+        if ex_out <= 0.0:
             if tg_user_id:
                 str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
                 workouts = str0.get("workouts") if isinstance(str0, dict) else None
@@ -2310,16 +2522,51 @@ async def run(input: Input) -> Output:
         _set_last_date_context(base_goal_bundle, date_iso, tz_name)
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
-        # Intake (food)
-        food0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500}) or {}
-        items = food0.get("items") if isinstance(food0, dict) else None
-        items_list = [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
         intake = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
-        for it in items_list:
-            for k in ["calories", "protein_g", "carbs_g", "fat_g"]:
-                v = it.get(k)
-                if isinstance(v, (int, float)):
-                    intake[k] += float(v)
+        tg_user_id = _session_telegram_user_id(input.session)
+
+        # Prefer GraphDB for intake (food)
+        if _fitnesscore_use_graphdb() and tg_user_id:
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q_food = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?cal ?p ?c ?f WHERE {{
+  GRAPH <{g}> {{
+    ?e a fc:FoodEntry ;
+      prov:generatedAtTime ?t .
+    OPTIONAL {{ ?e fc:caloriesKcal ?cal . }}
+    OPTIONAL {{ ?e fc:proteinGrams ?p . }}
+    OPTIONAL {{ ?e fc:carbsGrams ?c . }}
+    OPTIONAL {{ ?e fc:fatGrams ?f . }}
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}}
+""".strip()
+            out_food = await _fitnesscore_graphdb_select(q_food)
+            results_food = out_food.get("results") if isinstance(out_food, dict) else None
+            rows_food = _sparql_bindings_rows(results_food)
+            for b in rows_food:
+                for (var, key) in [("cal", "calories"), ("p", "protein_g"), ("c", "carbs_g"), ("f", "fat_g")]:
+                    v = _sparql_get_val(b, var)
+                    if v is None:
+                        continue
+                    try:
+                        intake[key] += float(v)
+                    except Exception:
+                        pass
+
+        # Fallback to Weight MCP for intake
+        if intake["calories"] <= 0.0:
+            food0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500}) or {}
+            items = food0.get("items") if isinstance(food0, dict) else None
+            items_list = [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
+            for it in items_list:
+                for k in ["calories", "protein_g", "carbs_g", "fat_g"]:
+                    v = it.get(k)
+                    if isinstance(v, (int, float)):
+                        intake[k] += float(v)
 
         # Latest weight (for burn estimate)
         wt0 = await _weight_call_json("weight_list_weights", {"scope": scope, "fromISO": None, "toISO": None, "limit": 5}) or {}
@@ -2338,17 +2585,50 @@ async def run(input: Input) -> Output:
         elif lb_from_text is not None:
             latest_kg = float(lb_from_text) * 0.45359237
 
-        # Exercise (today)
-        tg_user_id = _session_telegram_user_id(input.session)
+        # Exercise (today) - prefer GraphDB, fallback Strava MCP
         if not tg_user_id:
             answer = "I can list workouts, but I need you signed in with Telegram."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
-        str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
-        workouts = str0.get("workouts") if isinstance(str0, dict) else None
-        wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
+        wlist: list[dict[str, Any]] = []
+        if _fitnesscore_use_graphdb():
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q_w = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ;
+      prov:startedAtTime ?started .
+    OPTIONAL {{ ?w fc:activityType ?activityType . }}
+    OPTIONAL {{ ?w fc:activeEnergyKcal ?activeEnergyKcal . }}
+    OPTIONAL {{ ?w fc:durationSeconds ?durationSeconds . }}
+    OPTIONAL {{ ?w fc:distanceMeters ?distanceMeters . }}
+    FILTER(?started >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?started < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}} ORDER BY ?started
+""".strip()
+            out_w = await _fitnesscore_graphdb_select(q_w)
+            results_w = out_w.get("results") if isinstance(out_w, dict) else None
+            rows_w = _sparql_bindings_rows(results_w)
+            for b in rows_w:
+                wlist.append(
+                    {
+                        "activity_type": _sparql_get_val(b, "activityType"),
+                        "started_at_iso": _sparql_get_val(b, "started"),
+                        "active_energy_kcal": _sparql_get_val(b, "activeEnergyKcal"),
+                        "duration_seconds": _sparql_get_val(b, "durationSeconds"),
+                        "distance_meters": _sparql_get_val(b, "distanceMeters"),
+                    }
+                )
+
+        if not wlist:
+            str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            workouts = str0.get("workouts") if isinstance(str0, dict) else None
+            wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
         def _parse_iso(s: Any) -> Optional[datetime]:
             if not isinstance(s, str) or not s.strip():
@@ -2600,9 +2880,46 @@ async def run(input: Input) -> Output:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
-        data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
-        workouts = data0.get("workouts") if isinstance(data0, dict) else None
-        wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
+        today_workouts: list[dict[str, Any]] = []
+        if _fitnesscore_use_graphdb():
+            from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
+            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            q = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ;
+      prov:startedAtTime ?started .
+    OPTIONAL {{ ?w fc:activityType ?activityType . }}
+    OPTIONAL {{ ?w fc:durationSeconds ?durationSeconds . }}
+    OPTIONAL {{ ?w fc:distanceMeters ?distanceMeters . }}
+    OPTIONAL {{ ?w fc:activeEnergyKcal ?activeEnergyKcal . }}
+    FILTER(?started >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?started < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}} ORDER BY DESC(?started)
+""".strip()
+            out = await _fitnesscore_graphdb_select(q)
+            results = out.get("results") if isinstance(out, dict) else None
+            rows = _sparql_bindings_rows(results)
+            for b in rows:
+                today_workouts.append(
+                    {
+                        "activity_type": _sparql_get_val(b, "activityType"),
+                        "started_at_iso": _sparql_get_val(b, "started"),
+                        "duration_seconds": _sparql_get_val(b, "durationSeconds"),
+                        "distance_meters": _sparql_get_val(b, "distanceMeters"),
+                        "active_energy_kcal": _sparql_get_val(b, "activeEnergyKcal"),
+                        "metadata_json": None,
+                    }
+                )
+
+        # Fallback: Strava MCP
+        if not today_workouts:
+            data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            workouts = data0.get("workouts") if isinstance(data0, dict) else None
+            wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
         def _parse_iso(s: Any) -> Optional[datetime]:
             if not isinstance(s, str) or not s.strip():
@@ -2612,14 +2929,14 @@ async def run(input: Input) -> Output:
             except Exception:
                 return None
 
-        today_workouts: list[dict[str, Any]] = []
-        for w in wlist:
-            started = _parse_iso(w.get("started_at_iso")) or _parse_iso(w.get("ended_at_iso"))
-            if not started:
-                continue
-            if started.astimezone(tz).date().isoformat() != date_iso:
-                continue
-            today_workouts.append(w)
+        if not today_workouts:
+            for w in wlist:
+                started = _parse_iso(w.get("started_at_iso")) or _parse_iso(w.get("ended_at_iso"))
+                if not started:
+                    continue
+                if started.astimezone(tz).date().isoformat() != date_iso:
+                    continue
+                today_workouts.append(w)
 
         if not today_workouts:
             day_word = "today" if "today" in mlow else "yesterday" if "yesterday" in mlow else "that day"

@@ -5,6 +5,13 @@ import { z } from "zod";
 export type Env = {
   MCP_API_KEY?: string;
   DB: D1Database;
+  // Optional: GraphDB access for FitnessCore graph queries (SPARQL).
+  GRAPHDB_BASE_URL?: string;
+  GRAPHDB_REPOSITORY?: string;
+  GRAPHDB_USERNAME?: string;
+  GRAPHDB_PASSWORD?: string;
+  GRAPHDB_CF_ACCESS_CLIENT_ID?: string;
+  GRAPHDB_CF_ACCESS_CLIENT_SECRET?: string;
 };
 
 const AccountAddress = z.string().min(3);
@@ -15,6 +22,50 @@ function nowISO() {
 
 function jsonText(obj: unknown) {
   return JSON.stringify(obj, null, 2);
+}
+
+function basicAuthHeader(username: string, password: string) {
+  const tok = btoa(`${username}:${password}`);
+  return `Basic ${tok}`;
+}
+
+function graphdbHeaders(env: Env, extra?: Record<string, string>): Record<string, string> {
+  const user = (env.GRAPHDB_USERNAME ?? "").trim();
+  const pass = (env.GRAPHDB_PASSWORD ?? "").trim();
+  if (!user || !pass) throw new Error("Missing GRAPHDB_USERNAME/GRAPHDB_PASSWORD");
+  const h: Record<string, string> = {
+    authorization: basicAuthHeader(user, pass),
+    ...(extra ?? {}),
+  };
+  const cfId = (env.GRAPHDB_CF_ACCESS_CLIENT_ID ?? "").trim();
+  const cfSecret = (env.GRAPHDB_CF_ACCESS_CLIENT_SECRET ?? "").trim();
+  if (cfId && cfSecret) {
+    h["CF-Access-Client-Id"] = cfId;
+    h["CF-Access-Client-Secret"] = cfSecret;
+  }
+  return h;
+}
+
+async function graphdbSparqlSelect(env: Env, query: string): Promise<unknown> {
+  const base = (env.GRAPHDB_BASE_URL ?? "").trim().replace(/\/+$/, "");
+  const repo = (env.GRAPHDB_REPOSITORY ?? "").trim();
+  if (!base || !repo) throw new Error("Missing GRAPHDB_BASE_URL/GRAPHDB_REPOSITORY");
+  const url = `${base}/repositories/${encodeURIComponent(repo)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: graphdbHeaders(env, {
+      "content-type": "application/sparql-query; charset=utf-8",
+      accept: "application/sparql-results+json",
+    }),
+    body: query,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GraphDB SELECT failed: ${res.status} ${text.slice(0, 500)}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { text };
+  }
 }
 
 async function requireApiKey(request: Request, env: Env) {
@@ -187,6 +238,17 @@ async function upsertExternalIdentityAndProfile(
 
 function createServer(env: Env) {
   const server = new McpServer({ name: "Gym Core MCP (D1)", version: "0.1.0" });
+
+  server.tool(
+    "core_graphdb_sparql_select",
+    "Run a SPARQL SELECT query against FitnessCore GraphDB and return SPARQL JSON results.",
+    { query: z.string().min(1) },
+    async (args) => {
+      const p = z.object({ query: z.string().min(1) }).parse(args);
+      const results = await graphdbSparqlSelect(env, p.query);
+      return { content: [{ type: "text", text: jsonText({ ok: true, results }) }] };
+    },
+  );
 
   server.tool(
     "core_upsert_account",

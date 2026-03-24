@@ -806,6 +806,36 @@ function createServer(env: Env) {
   );
 
   server.tool(
+    "telegram_list_unique_user_ids",
+    "List unique Telegram user ids observed in stored messages (from D1). Optionally filter by chatId.",
+    { chatId: z.union([z.string().min(1), z.number().int()]).optional(), limit: z.number().int().positive().max(5000).optional() },
+    async (args) => {
+      const p = z
+        .object({
+          chatId: z.union([z.string().min(1), z.number().int()]).optional(),
+          limit: z.number().int().positive().max(5000).optional(),
+        })
+        .parse(args);
+      const limit = p.limit ?? 500;
+      const chatId = p.chatId !== undefined ? String(p.chatId) : null;
+      const res = await env.DB.prepare(
+        `SELECT DISTINCT from_user_id
+         FROM telegram_messages
+         WHERE from_user_id IS NOT NULL
+           AND (? IS NULL OR chat_id = ?)
+         ORDER BY from_user_id ASC
+         LIMIT ?`,
+      )
+        .bind(chatId, chatId, limit)
+        .all();
+      const userIds = (res.results ?? [])
+        .map((r: any) => (r?.from_user_id != null ? String(r.from_user_id) : ""))
+        .filter((s: string) => s.trim());
+      return { content: [{ type: "text", text: jsonText({ userIds }) }] };
+    },
+  );
+
+  server.tool(
     "telegram_list_messages",
     "List stored messages for a chat (from D1). Photo/image messages include image.url and image.imageUrl (public worker URL) when PUBLIC_BASE_URL is set. Optional includeImageBytes for base64.",
     {
