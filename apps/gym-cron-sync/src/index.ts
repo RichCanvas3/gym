@@ -8,6 +8,17 @@ export type Env = {
   SYNC_TZ_NAME?: string;
   SYNC_LOOKBACK_DAYS?: string;
 
+  // Optional: GraphDB sync (FitnessCore KB graph). Enabled when GRAPHDB_SYNC_ENABLED=1.
+  GRAPHDB_SYNC_ENABLED?: string;
+  GRAPHDB_CONTEXT_BASE?: string;
+  GRAPHDB_ID_BASE?: string;
+  GRAPHDB_BASE_URL?: string;
+  GRAPHDB_REPOSITORY?: string;
+  GRAPHDB_USERNAME?: string;
+  GRAPHDB_PASSWORD?: string;
+  GRAPHDB_CF_ACCESS_CLIENT_ID?: string;
+  GRAPHDB_CF_ACCESS_CLIENT_SECRET?: string;
+
   TELEGRAM_MCP: Service;
   WEIGHT_MCP: Service;
   STRAVA_MCP: Service;
@@ -97,6 +108,178 @@ function fmtWorkoutLine(wk: any): string {
   const kcal = fmtKcal(wk?.active_energy_kcal);
   const parts = [activityType, when ? `(${when})` : "", dur ? `• ${dur}` : "", dist ? `• ${dist}` : "", kcal ? `• ${kcal}` : ""].filter(Boolean);
   return `Workout synced: ${parts.join(" ")}`.trim();
+}
+
+function truthy(s: string | undefined): boolean {
+  const v = (s ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
+}
+
+function b64(s: string): string {
+  // Browser-safe base64 (works in Workers).
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  // btoa expects binary string
+  return btoa(bin);
+}
+
+async function graphDbClearAndUploadTtl(env: Env, contextIri: string, ttl: string): Promise<void> {
+  const baseUrl = (env.GRAPHDB_BASE_URL ?? "").trim().replace(/\/+$/, "");
+  const repo = (env.GRAPHDB_REPOSITORY ?? "").trim();
+  const user = (env.GRAPHDB_USERNAME ?? "").trim();
+  const pass = (env.GRAPHDB_PASSWORD ?? "").trim();
+  if (!baseUrl || !repo || !user || !pass) throw new Error("Missing GRAPHDB_* env (base_url/repository/username/password)");
+
+  const headers: Record<string, string> = {
+    authorization: `Basic ${b64(`${user}:${pass}`)}`,
+  };
+  const cfId = (env.GRAPHDB_CF_ACCESS_CLIENT_ID ?? "").trim();
+  const cfSecret = (env.GRAPHDB_CF_ACCESS_CLIENT_SECRET ?? "").trim();
+  if (cfId && cfSecret) {
+    headers["CF-Access-Client-Id"] = cfId;
+    headers["CF-Access-Client-Secret"] = cfSecret;
+  }
+
+  const statementsUrl = `${baseUrl}/repositories/${encodeURIComponent(repo)}/statements`;
+
+  // Clear graph
+  const body = new URLSearchParams({ update: `CLEAR GRAPH <${contextIri}>` }).toString();
+  const res0 = await fetch(statementsUrl, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!res0.ok) throw new Error(`GraphDB CLEAR failed: ${res0.status} ${await res0.text()}`);
+
+  // Upload TTL
+  const uploadUrl = `${statementsUrl}?context=${encodeURIComponent(`<${contextIri}>`)}`;
+  const res1 = await fetch(uploadUrl, {
+    method: "POST",
+    headers: { ...headers, "content-type": "text/turtle; charset=utf-8" },
+    body: ttl,
+  });
+  if (!res1.ok) throw new Error(`GraphDB upload failed: ${res1.status} ${await res1.text()}`);
+}
+
+function ttlEscape(s: string): string {
+  return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
+
+function litStr(s: string): string {
+  return `"${ttlEscape(s)}"`;
+}
+
+function iri(base: string, kind: string, id: string): string {
+  return `<${base.replace(/\/+$/, "")}/${kind}/${encodeURIComponent(id)}>`;
+}
+
+function ttlPrefixBlock(): string {
+  return [
+    "@prefix fc: <https://ontology.fitnesscore.ai/fc#> .",
+    "@prefix prov: <http://www.w3.org/ns/prov#> .",
+    "@prefix sosa: <http://www.w3.org/ns/sosa/> .",
+    "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .",
+    "",
+  ].join("\n");
+}
+
+function workoutTypeToConcept(activityType: string): string {
+  const t = (activityType || "").trim().toLowerCase();
+  if (t === "run") return "fc:ActivityType_Run";
+  if (t === "ride") return "fc:ActivityType_Ride";
+  if (t === "walk") return "fc:ActivityType_Walk";
+  if (t === "hike") return "fc:ActivityType_Hike";
+  if (t === "swim") return "fc:ActivityType_Swim";
+  if (t === "row") return "fc:ActivityType_Row";
+  if (t === "weighttraining" || t === "weight training" || t === "weight_training") return "fc:ActivityType_WeightTraining";
+  if (t === "workout") return "fc:ActivityType_Workout";
+  if (t === "yoga") return "fc:ActivityType_Yoga";
+  return "fc:ActivityType_Other";
+}
+
+async function syncFitnesscoreGraphDb(env: Env): Promise<{ ok: boolean; contextIri?: string; bytes?: number; reason?: string }> {
+  if (!truthy(env.GRAPHDB_SYNC_ENABLED)) return { ok: true, reason: "disabled" };
+  const tgUserId = normalizeTelegramUserId((env.SYNC_TELEGRAM_USER_ID ?? "").trim());
+  if (!tgUserId) return { ok: true, reason: "missing_sync_telegram_user_id" };
+
+  const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
+  const lookbackDays = Number.parseInt((env.SYNC_LOOKBACK_DAYS ?? "7").trim(), 10);
+  const days = Number.isFinite(lookbackDays) ? lookbackDays : 7;
+
+  // Pull recent workouts + food + weights via MCPs, then upload a compact TTL snapshot.
+  const w = await mcpCall(env.STRAVA_MCP, apiKey, "strava_list_workouts", { telegramUserId: tgUserId, limit: 200 });
+  const workouts = Array.isArray(w?.workouts) ? w.workouts : [];
+
+  const now = Date.now();
+  const fromISO = new Date(now - days * 24 * 3600 * 1000).toISOString();
+  const toISO = new Date(now).toISOString();
+  const scope = { telegramUserId: tgUserId };
+  const foods = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_list_food", { scope, fromISO, toISO, limit: 500 });
+  const foodItems = Array.isArray(foods?.items) ? foods.items : [];
+  const weights0 = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_list_weights", { scope, fromISO, toISO, limit: 200 });
+  const weightItems = Array.isArray(weights0?.items) ? weights0.items : [];
+
+  const idBase = (env.GRAPHDB_ID_BASE ?? "https://id.fitnesscore.ai").trim() || "https://id.fitnesscore.ai";
+  const contextBase = (env.GRAPHDB_CONTEXT_BASE ?? "https://id.fitnesscore.ai/graph/d1").trim() || "https://id.fitnesscore.ai/graph/d1";
+  const contextIri = `${contextBase.replace(/\/+$/, "")}/${encodeURIComponent(`tg:${tgUserId}`)}`;
+
+  const athlete = iri(idBase, "athlete", `tg:${tgUserId}`);
+  const lines: string[] = [ttlPrefixBlock()];
+  lines.push(`${athlete} a fc:Athlete ; fc:description ${litStr(`telegramUserId:${tgUserId}`)} .`);
+  lines.push("");
+
+  for (const wk of workouts.slice(0, 500)) {
+    const workoutId = asString(wk?.workout_id).trim();
+    if (!workoutId) continue;
+    const subj = iri(idBase, "workout", workoutId);
+    const parts: string[] = [`${subj} a fc:Workout`, `prov:wasAssociatedWith ${athlete}`];
+    const started = asString(wk?.started_at_iso).trim();
+    const ended = asString(wk?.ended_at_iso).trim();
+    if (started) parts.push(`prov:startedAtTime "${ttlEscape(started)}"^^xsd:dateTime`);
+    if (ended) parts.push(`prov:endedAtTime "${ttlEscape(ended)}"^^xsd:dateTime`);
+    const typ = workoutTypeToConcept(asString(wk?.activity_type));
+    parts.push(`fc:activityType ${typ}`);
+    if (typeof wk?.duration_seconds === "number") parts.push(`fc:durationSeconds "${Math.trunc(wk.duration_seconds)}"^^xsd:integer`);
+    if (typeof wk?.distance_meters === "number") parts.push(`fc:distanceMeters "${wk.distance_meters}"^^xsd:decimal`);
+    if (typeof wk?.active_energy_kcal === "number") parts.push(`fc:activeEnergyKcal "${wk.active_energy_kcal}"^^xsd:decimal`);
+    lines.push(parts.join(" ; ") + " .");
+  }
+  lines.push("");
+
+  for (const it of weightItems.slice(0, 2000)) {
+    const id = asString(it?.id).trim();
+    if (!id) continue;
+    const subj = iri(idBase, "weight", id);
+    const parts: string[] = [`${subj} a fc:BodyWeightObservation, sosa:Observation`, `sosa:hasFeatureOfInterest ${athlete}`, `prov:wasAttributedTo ${athlete}`];
+    const at_ms = typeof it?.at_ms === "number" ? it.at_ms : null;
+    if (at_ms != null) parts.push(`prov:generatedAtTime "${new Date(at_ms).toISOString()}"^^xsd:dateTime`);
+    if (typeof it?.weight_kg === "number") parts.push(`fc:bodyWeightKg "${it.weight_kg}"^^xsd:decimal`);
+    lines.push(parts.join(" ; ") + " .");
+  }
+  lines.push("");
+
+  for (const it of foodItems.slice(0, 5000)) {
+    const id = asString(it?.id).trim();
+    if (!id) continue;
+    const subj = iri(idBase, "food", id);
+    const parts: string[] = [`${subj} a fc:FoodEntry`, `prov:wasAttributedTo ${athlete}`];
+    const at_ms = typeof it?.at_ms === "number" ? it.at_ms : null;
+    if (at_ms != null) parts.push(`prov:generatedAtTime "${new Date(at_ms).toISOString()}"^^xsd:dateTime`);
+    const meal = asString(it?.meal).trim();
+    const text = asString(it?.text).trim();
+    if (meal) parts.push(`fc:description ${litStr(`meal:${meal}`)}`);
+    if (text) parts.push(`fc:description ${litStr(`text:${text}`)}`);
+    if (typeof it?.calories === "number") parts.push(`fc:caloriesKcal "${it.calories}"^^xsd:decimal`);
+    if (typeof it?.protein_g === "number") parts.push(`fc:proteinGrams "${it.protein_g}"^^xsd:decimal`);
+    if (typeof it?.carbs_g === "number") parts.push(`fc:carbsGrams "${it.carbs_g}"^^xsd:decimal`);
+    if (typeof it?.fat_g === "number") parts.push(`fc:fatGrams "${it.fat_g}"^^xsd:decimal`);
+    lines.push(parts.join(" ; ") + " .");
+  }
+
+  const ttl = lines.join("\n");
+  await graphDbClearAndUploadTtl(env, contextIri, ttl);
+  return { ok: true, contextIri, bytes: ttl.length };
 }
 
 async function syncTelegram(env: Env) {
@@ -263,7 +446,8 @@ async function runCron(env: Env) {
   const t0 = Date.now();
   const tg = await syncTelegram(env).catch((e) => ({ ok: false, error: String((e as any)?.message ?? e) }));
   const st = await syncStrava(env).catch((e) => ({ ok: false, error: String((e as any)?.message ?? e) }));
-  return { ok: true, asOfISO: nowISO(), ms: Date.now() - t0, telegram: tg, strava: st };
+  const kb = await syncFitnesscoreGraphDb(env).catch((e) => ({ ok: false, error: String((e as any)?.message ?? e) }));
+  return { ok: true, asOfISO: nowISO(), ms: Date.now() - t0, telegram: tg, strava: st, graphdb: kb };
 }
 
 export default {

@@ -15,7 +15,10 @@
   "vars": {
     "SYNC_CHAT_TITLE": "Smart Agent",
     "SYNC_TZ_NAME": "America/Denver",
-    "SYNC_LOOKBACK_DAYS": "7"
+    "SYNC_LOOKBACK_DAYS": "7",
+    "GRAPHDB_SYNC_ENABLED": "1",
+    "GRAPHDB_CONTEXT_BASE": "https://id.fitnesscore.ai/graph/d1",
+    "GRAPHDB_ID_BASE": "https://id.fitnesscore.ai"
   },
   "triggers": {
     "crons": ["*/10 * * * *"]
