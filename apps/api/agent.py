@@ -182,6 +182,7 @@ async def _router_fitness_intent(msg: str) -> str:
       - food_exercise_day
       - workouts_day
       - workouts_trend
+      - fitness_metric_period
       - exercise_overview_day
       - none
     """
@@ -193,7 +194,7 @@ async def _router_fitness_intent(msg: str) -> str:
     sys = (
         "You route fitness chat intents.\n"
         "Return ONLY one label from this list:\n"
-        "food_day, food_trend, calories_day, exercise_burn_day, food_exercise_day, workouts_day, workouts_trend, exercise_overview_day, none\n"
+        "food_day, food_trend, calories_day, exercise_burn_day, food_exercise_day, workouts_day, workouts_trend, fitness_metric_period, exercise_overview_day, none\n"
         "\n"
         "Definitions:\n"
         "- food_day: what the user ate / meals / food log for a day (today/yesterday/explicit date or implied).\n"
@@ -203,6 +204,7 @@ async def _router_fitness_intent(msg: str) -> str:
         "- food_exercise_day: combined summary of what they ate + workouts + net.\n"
         "- workouts_day: list workouts/exercises done for a day.\n"
         "- workouts_trend: workouts summary over last few days / last week.\n"
+        "- fitness_metric_period: questions about totals for a period (this week/month, last week/month), e.g. run miles, ride miles, workout count, exercise kcal, intake kcal, net calories.\n"
         "- exercise_overview_day: deeper calorie overview incl. optional TDEE/BMR context.\n"
         "- none: anything else (booking/classes, profile edits, general Q&A).\n"
         "\n"
@@ -218,6 +220,7 @@ async def _router_fitness_intent(msg: str) -> str:
         "food_exercise_day",
         "workouts_day",
         "workouts_trend",
+        "fitness_metric_period",
         "exercise_overview_day",
         "none",
     }
@@ -228,6 +231,76 @@ def _tomorrow_date_iso(tz_name: str) -> str:
     tz = ZoneInfo(tz_name or "UTC")
     now_local = datetime.now(tz=tz)
     return (now_local.date() + timedelta(days=1)).isoformat()
+
+
+def _month_window_utc_for_now(tz_name: str) -> tuple[str, str, str]:
+    """
+    Returns (fromISO_utc_z, toISO_utc_z, label) for the current local month in tz_name.
+    toISO is an exclusive upper bound (start of next month).
+    """
+    tz = ZoneInfo(tz_name or "UTC")
+    now_local = datetime.now(tz=tz)
+    y, m = now_local.year, now_local.month
+    start_local = datetime(y, m, 1, 0, 0, 0, tzinfo=tz)
+    if m == 12:
+        ny, nm = y + 1, 1
+    else:
+        ny, nm = y, m + 1
+    end_local = datetime(ny, nm, 1, 0, 0, 0, tzinfo=tz)
+    from_iso = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    to_iso = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    label = now_local.strftime("%b %Y")
+    return from_iso, to_iso, label
+
+
+def _month_window_utc_for_relative(tz_name: str, month_offset: int) -> tuple[str, str, str]:
+    tz = ZoneInfo(tz_name or "UTC")
+    now_local = datetime.now(tz=tz)
+    y, m = now_local.year, now_local.month
+    # shift month by offset
+    mm = (y * 12 + (m - 1)) + int(month_offset)
+    yy = mm // 12
+    mon = (mm % 12) + 1
+    start_local = datetime(yy, mon, 1, 0, 0, 0, tzinfo=tz)
+    if mon == 12:
+        ny, nm = yy + 1, 1
+    else:
+        ny, nm = yy, mon + 1
+    end_local = datetime(ny, nm, 1, 0, 0, 0, tzinfo=tz)
+    from_iso = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    to_iso = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    label = start_local.strftime("%b %Y")
+    return from_iso, to_iso, label
+
+
+def _week_window_utc_for_relative(tz_name: str, week_offset: int) -> tuple[str, str, str]:
+    """
+    Local weeks start Monday 00:00 in tz_name.
+    week_offset=0 => this week, -1 => last week
+    """
+    tz = ZoneInfo(tz_name or "UTC")
+    now_local = datetime.now(tz=tz)
+    d = now_local.date() + timedelta(days=7 * int(week_offset))
+    start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz) - timedelta(days=d.weekday())
+    end_local = start_local + timedelta(days=7)
+    from_iso = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    to_iso = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    label = f"week of {start_local.date().isoformat()}"
+    return from_iso, to_iso, label
+
+
+def _resolve_period_window_utc(msg: str, tz_name: str) -> tuple[str, str, str]:
+    mlow = (msg or "").lower()
+    if "last month" in mlow:
+        return _month_window_utc_for_relative(tz_name, -1)
+    if "this month" in mlow or ("month" in mlow and "this" in mlow):
+        return _month_window_utc_for_relative(tz_name, 0)
+    if "last week" in mlow:
+        return _week_window_utc_for_relative(tz_name, -1)
+    if "this week" in mlow or ("week" in mlow and "this" in mlow):
+        return _week_window_utc_for_relative(tz_name, 0)
+    # default: this month for “this month” style questions
+    return _month_window_utc_for_relative(tz_name, 0)
 
 
 def _tool_raw_to_json(raw: Any) -> Optional[dict[str, Any]]:
@@ -3363,6 +3436,129 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters WHERE {{
             goalBundle=base_goal_bundle if had_session_goal_bundle else None,
             data={"asOfISO": _now_iso(), "count": len(recent)},
         )
+
+    # Deterministic: metric totals for a week/month window (GraphDB).
+    if fitness_intent == "fitness_metric_period":
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        tg_user_id = _session_telegram_user_id(input.session)
+        if not tg_user_id:
+            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
+
+        from_iso, to_iso, label = _resolve_period_window_utc(msg, tz_name)
+        mlow2 = (msg or "").lower()
+        wants_run = "run" in mlow2
+        wants_ride = any(k in mlow2 for k in ["ride", "bike", "cycling", "cycle"])
+        wants_distance = any(k in mlow2 for k in ["mile", "miles", "distance", "how far", "km", "kilometer"])
+        wants_workout_count = ("how many" in mlow2 and any(k in mlow2 for k in ["workout", "workouts", "runs", "rides"])) or "count" in mlow2
+        wants_intake = any(k in mlow2 for k in ["intake", "ate", "food", "eaten", "calories in"])
+        wants_exercise_kcal = any(k in mlow2 for k in ["exercise", "workout", "burn", "burned", "spent", "calories out"])
+        wants_net = "net" in mlow2
+
+        g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+
+        # Workout count
+        workouts_n = 0
+        if wants_workout_count and _fitnesscore_use_graphdb():
+            qn = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (COUNT(?w) AS ?n) WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ; prov:startedAtTime ?t .
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}}
+""".strip()
+            outn = await _fitnesscore_graphdb_select(qn)
+            rowsn = _sparql_bindings_rows(outn.get("results") if isinstance(outn, dict) else None)
+            if rowsn:
+                workouts_n = _int(_sparql_get_val(rowsn[0], "n")) or 0
+
+        # Distance miles (run/ride)
+        miles = None
+        if wants_distance and _fitnesscore_use_graphdb() and (wants_run or wants_ride):
+            typ = "run" if wants_run else "ride"
+            needle = "run" if wants_run else "ride"
+            qd = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (SUM(?d) AS ?distanceMeters) WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ; prov:startedAtTime ?t ; fc:activityType ?at .
+    OPTIONAL {{ ?w fc:distanceMeters ?distanceMeters . }}
+    BIND(COALESCE(xsd:decimal(?distanceMeters), 0) AS ?d)
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+    FILTER(CONTAINS(LCASE(STR(?at)), "{needle}"))
+  }}
+}}
+""".strip()
+            outd = await _fitnesscore_graphdb_select(qd)
+            rowsd = _sparql_bindings_rows(outd.get("results") if isinstance(outd, dict) else None)
+            if rowsd:
+                dm = _num(_sparql_get_val(rowsd[0], "distanceMeters")) or 0.0
+                miles = float(dm) / 1609.34
+
+        # Intake kcal
+        intake_kcal = None
+        if (wants_intake or wants_net) and _fitnesscore_use_graphdb():
+            qi = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
+  GRAPH <{g}> {{
+    ?e a fc:FoodEntry ; prov:generatedAtTime ?t ; fc:caloriesKcal ?k .
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}}
+""".strip()
+            outi = await _fitnesscore_graphdb_select(qi)
+            rowsi = _sparql_bindings_rows(outi.get("results") if isinstance(outi, dict) else None)
+            if rowsi:
+                intake_kcal = _num(_sparql_get_val(rowsi[0], "kcalTotal")) or 0.0
+
+        # Exercise kcal
+        ex_kcal = None
+        if (wants_exercise_kcal or wants_net) and _fitnesscore_use_graphdb():
+            qe = f"""
+PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
+  GRAPH <{g}> {{
+    ?w a fc:Workout ; prov:startedAtTime ?t ; fc:activeEnergyKcal ?k .
+    FILTER(?t >= "{_sparql_iso_dt(from_iso)}"^^xsd:dateTime && ?t < "{_sparql_iso_dt(to_iso)}"^^xsd:dateTime)
+  }}
+}}
+""".strip()
+            oute = await _fitnesscore_graphdb_select(qe)
+            rowse = _sparql_bindings_rows(oute.get("results") if isinstance(oute, dict) else None)
+            if rowse:
+                ex_kcal = _num(_sparql_get_val(rowse[0], "kcalTotal")) or 0.0
+
+        if _fitnesscore_graphdb_only() and (intake_kcal is None and ex_kcal is None and miles is None and workouts_n == 0):
+            answer = f"No matching FitnessCore GraphDB data for {label} ({tz_name})."
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso})
+
+        lines = [f"Summary ({label}, {tz_name}):"]
+        if miles is not None:
+            lines.append(f"- Distance: **{miles:.1f} mi**")
+        if intake_kcal is not None:
+            lines.append(f"- Intake: **{int(round(float(intake_kcal)))} kcal**")
+        if ex_kcal is not None:
+            lines.append(f"- Exercise burn: **{int(round(float(ex_kcal)))} kcal**")
+        if wants_net and intake_kcal is not None and ex_kcal is not None:
+            lines.append(f"- Net (intake − exercise): **{int(round(float(intake_kcal - ex_kcal)))} kcal**")
+        if wants_workout_count:
+            lines.append(f"- Workouts: **{workouts_n}**")
+
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], goalBundle=base_goal_bundle if had_session_goal_bundle else None, data={"asOfISO": _now_iso(), "fromISO": from_iso, "toISO": to_iso, "label": label, "miles": miles, "intake_kcal": intake_kcal, "exercise_kcal": ex_kcal, "workouts": workouts_n})
 
     if msg.startswith("__WEATHER_HOURLY__:"):
         try:
