@@ -481,6 +481,35 @@ def _tdee_from_profile(profile: dict[str, Any]) -> tuple[Optional[float], Option
     return bmr, bmr * mult
 
 
+async def _compose_fitness_answer(user_msg: str, context: dict[str, Any]) -> str:
+    """
+    Use an LLM for natural-language composition only.
+    The caller should provide deterministic computed values in `context`.
+    """
+    try:
+        llm = ChatOpenAI(
+            api_key=os.environ["OPENAI_API_KEY"],
+            model=os.environ.get("OPENAI_MODEL", "gpt-5.2"),
+            temperature=0.1,
+        )
+        sys = (
+            "You are a fitness calorie assistant.\n"
+            "You will be given a JSON context with computed values (intake/burn/net/BMR/TDEE/workouts).\n"
+            "Rules:\n"
+            "- Answer ALL questions in the user's message.\n"
+            "- Use ONLY numbers present in the context; never invent.\n"
+            "- If the user asks what BMR/TDEE mean, explain briefly.\n"
+            "- Keep it concise. Prefer bullet points.\n"
+            "- Workout types must be human-readable labels, never IRIs.\n"
+        )
+        human = f"User message:\n{(user_msg or '').strip()}\n\nContext (JSON):\n{json.dumps(context, ensure_ascii=False)}"
+        out = await llm.ainvoke([SystemMessage(content=sys), HumanMessage(content=human)])
+        txt = str(getattr(out, "content", "") or "").strip()
+        return txt or str(context.get("fallbackAnswer") or "").strip()
+    except Exception:
+        return str(context.get("fallbackAnswer") or "").strip()
+
+
 async def _fitnesscore_graphdb_select(query: str) -> Optional[dict[str, Any]]:
     # tool name in MCP discovery can be either core_graphdb_sparql_select or core_core_graphdb_sparql_select
     return await _core_call_json("graphdb_sparql_select", {"query": query})
@@ -2312,7 +2341,36 @@ SELECT ?t ?desc ?cal ?p ?c ?f WHERE {{
                 lines.append(f"  - (+{len(rows) - 10} more)")
 
         lines.append("\n" + fmt_tot("Total so far", totals))
-        answer = "\n".join(lines).strip()
+        fallback = "\n".join(lines).strip()
+        context = {
+            "intent": "exercise_overview_day",
+            "dateISO": date_iso,
+            "tzName": tz_name,
+            "intakeKcal": intake_kcal,
+            "exerciseKcal": burn_kcal,
+            "netKcal": net_vs_exercise,
+            "bmrKcalDay": bmr,
+            "tdeeKcalDay": tdee,
+            "activityLevel": activity,
+            "weightKgUsed": kg,
+            "workouts": [
+                {
+                    "type": _activity_type_label(w.get("activity_type")),
+                    "startedLocal": (  # best-effort
+                        (datetime.fromisoformat(str(w.get("started_at_iso")).replace("Z", "+00:00")).astimezone(tz).strftime("%H:%M"))
+                        if isinstance(w.get("started_at_iso"), str) and str(w.get("started_at_iso")).strip()
+                        else None
+                    ),
+                    "durationSeconds": _int(w.get("duration_seconds")),
+                    "distanceMeters": _num(w.get("distance_meters")),
+                    "activeEnergyKcal": _num(w.get("active_energy_kcal")),
+                }
+                for w in today_workouts[:6]
+                if isinstance(w, dict)
+            ],
+            "fallbackAnswer": fallback,
+        }
+        answer = await _compose_fitness_answer(msg, context)
         if thread_id:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", answer)
@@ -2765,7 +2823,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
 
         net = intake["calories"] - burn_kcal
         lines = [
-            f"Today ({date_iso}, {tz_name}) summary:",
+            f"Daily summary ({date_iso}, {tz_name}):",
             f"- Intake: **{int(round(intake['calories']))} kcal** (P {intake['protein_g']:.1f}g / C {intake['carbs_g']:.1f}g / F {intake['fat_g']:.1f}g)",
             f"- Exercise burn (today): **{int(round(burn_kcal))} kcal**" + (f" (using {latest_kg:.1f} kg)" if latest_kg is not None else ""),
             f"- Net (intake − exercise): **{int(round(net))} kcal**",
@@ -2776,7 +2834,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         if tdee_kcal_day is not None:
             lines.append(f"- Baseline (TDEE): **{int(round(tdee_kcal_day))} kcal/day**")
         if today_workouts:
-            lines.append("\nWorkouts today:")
+            lines.append("\nWorkouts:")
             for w in today_workouts[:6]:
                 typ = _activity_type_label(w.get("activity_type"))
                 started = _parse_iso(w.get("started_at_iso"))
@@ -2967,30 +3025,22 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
                 if kg is not None and dist_m is not None and float(dist_m) > 0:
                     burn_kcal += kg * (float(dist_m) / 1000.0) * 1.0
 
-        # Estimate BMR/TDEE if profile present.
-        bmr = None
-        tdee = None
-        if kg is not None and height_in is not None and age is not None and sex in {"male", "female"}:
-            cm = float(height_in) * 2.54
-            s = 5 if sex == "male" else -161
-            bmr = 10.0 * float(kg) + 6.25 * cm - 5.0 * float(age) + float(s)
-            mult = {
-                "sedentary": 1.2,
-                "light": 1.375,
-                "moderate": 1.55,
-                "very_active": 1.725,
-            }.get(activity)
-            if mult:
-                tdee = bmr * mult
+        # Estimate baseline burn (BMR/TDEE) from profile.
+        prof_for_tdee = dict(prof)
+        if kg is not None:
+            prof_for_tdee["weight_kg"] = float(kg)
+        bmr, tdee = _tdee_from_profile(prof_for_tdee)
 
         net_vs_exercise = intake_kcal - burn_kcal
         lines = [
-            f"Today ({date_iso}, {tz_name}) calorie overview:",
+            f"Calorie overview ({date_iso}, {tz_name}):",
             f"- Calories in (food): **{int(round(intake_kcal))} kcal**",
             f"- Calories out (workouts today): **{int(round(burn_kcal))} kcal**"
             + (f" (using {kg:.1f} kg{' assumed (220 lb)' if assumed_weight else ''})" if kg is not None else ""),
             f"- Net (in − workouts): **{int(round(net_vs_exercise))} kcal**",
         ]
+        if bmr is not None:
+            lines.append(f"- Est. BMR (profile): **{int(round(bmr))} kcal/day**")
         if tdee is not None:
             lines.append(f"- Est. TDEE (profile): **{int(round(tdee))} kcal/day** (activity={activity})")
         else:
@@ -3000,7 +3050,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
                 lines.append("- Est. TDEE (profile): missing age/sex/height/activity_level in profile.")
 
         if today_workouts:
-            lines.append("\nWorkouts today:")
+            lines.append("\nWorkouts:")
             for w in today_workouts[:6]:
                 typ = _activity_type_label(w.get("activity_type"))
                 started = _parse_iso(w.get("started_at_iso"))

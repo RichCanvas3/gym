@@ -494,10 +494,9 @@ async function syncTelegram(env: Env) {
 
   const tgUserIdEnv = normalizeTelegramUserId((env.SYNC_TELEGRAM_USER_ID ?? "").trim());
 
-  const chats = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_chats", {
-    limit: 200,
-    ...(tgUserIdEnv ? { fromUserId: tgUserIdEnv } : {}),
-  });
+  // NOTE: Smart Agent may be a channel feed (channel_post) where Telegram provides no from_user_id.
+  // In that case, filtering chats/messages by fromUserId will drop the chat entirely.
+  const chats = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_chats", { limit: 200 });
   const chatList = Array.isArray(chats?.chats) ? chats.chats : [];
   const chat = chatList.find((c: any) => asString(c?.title).trim().toLowerCase() === chatTitle.toLowerCase());
   const chatId = asString(chat?.chatId).trim();
@@ -505,7 +504,6 @@ async function syncTelegram(env: Env) {
 
   const msgs = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_messages", {
     chatId,
-    ...(tgUserIdEnv ? { fromUserId: tgUserIdEnv } : {}),
     limit: 50,
     includeImageUrls: true,
     includeImageBytes: false,
@@ -524,7 +522,11 @@ async function syncTelegram(env: Env) {
     const imageUrl = firstImageUrl(m);
     if (!text && !imageUrl) continue;
 
-    const tgUserId = asString(m?.fromUserId).trim();
+    // telegram-mcp returns fromUserId as a number (or null). Treat both string/number as valid.
+    // Also allow channel posts (no fromUserId) to map to a single configured user.
+    const fromRaw = (m as any)?.fromUserId;
+    const fromId = (typeof fromRaw === "number" && Number.isFinite(fromRaw)) || typeof fromRaw === "string" ? String(fromRaw).trim() : "";
+    const tgUserId = fromId || (tgUserIdEnv ?? "");
     if (!tgUserId) continue;
 
     const out = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_ingest_telegram_message", {
