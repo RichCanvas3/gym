@@ -1,0 +1,64 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix at: <https://agentictrust.io/ontology/core#> .
+@prefix ep-plan: <https://w3id.org/ep-plan#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix p-plan: <http://purl.org/net/p-plan#> .
+@prefix sosa: <http://www.w3.org/ns/sosa/> .
+@prefix dul: <http://www.ontologydesignpatterns.org/ont/dul/DUL.owl#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://ontology.fitnesscore.ai/fc/tbox/core>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore T-Box (core)" ;
+  rdfs:comment "FitnessCore base schema aligned to PROV-O + P-Plan + EP-PLAN, with DOLCE+DnS (DUL) and SOSA hooks." ;
+  owl:imports <https://agentictrust.io/ontology/core> ;
+  owl:imports <https://agentictrust.io/ontology/core/trust> ;
+  owl:imports <https://w3id.org/ep-plan> ;
+  owl:imports <http://www.w3.org/ns/prov-o-20130430> ;
+  owl:imports <http://purl.org/net/p-plan> ;
+  owl:imports <http://www.ontologydesignpatterns.org/ont/dul/DUL.owl> ;
+  owl:imports <http://www.w3.org/ns/sosa/> .
+
+### Core agent/entity/activity types
+
+fc:Person a owl:Class ;
+  rdfs:label "Person" ;
+  rdfs:subClassOf prov:Person .
+
+fc:Organization a owl:Class ;
+  rdfs:label "Organization" ;
+  rdfs:subClassOf prov:Organization, at:Organization .
+
+fc:Resource a owl:Class ;
+  rdfs:label "Resource" ;
+  rdfs:subClassOf prov:Entity .
+
+fc:Activity a owl:Class ;
+  rdfs:label "Activity" ;
+  rdfs:subClassOf prov:Activity, ep-plan:Activity, dul:Event .
+
+### Plan/execution correspondence (same pattern as ChurchCore)
+
+fc:Step a owl:Class ;
+  rdfs:label "Step" ;
+  rdfs:comment "Specification-side step (the way things are done), distinct from an executed Activity occurrence." ;
+  rdfs:subClassOf p-plan:Step, ep-plan:Step .
+
+fc:correspondsToStep a owl:ObjectProperty ;
+  rdfs:label "correspondsToStep" ;
+  rdfs:domain fc:Activity ;
+  rdfs:range fc:Step ;
+  rdfs:subPropertyOf ep-plan:correspondsToStep .
+
+### Common descriptive properties
+
+fc:name a owl:DatatypeProperty ;
+  rdfs:label "name" ;
+  rdfs:range xsd:string .
+
+fc:description a owl:DatatypeProperty ;
+  rdfs:label "description" ;
+  rdfs:range xsd:string .
+

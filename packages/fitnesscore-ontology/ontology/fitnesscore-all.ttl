@@ -1,0 +1,18 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<https://ontology.fitnesscore.ai/fc/ontology/all>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore Ontology (all)" ;
+  rdfs:comment "Master import wrapper for FitnessCore modules." ;
+  owl:imports
+    <https://ontology.fitnesscore.ai/fc/tbox/core> ,
+    <https://ontology.fitnesscore.ai/fc/tbox/fitness> ,
+    <https://ontology.fitnesscore.ai/fc/tbox/movement> ,
+    <https://ontology.fitnesscore.ai/fc/tbox/health> ,
+    <https://ontology.fitnesscore.ai/fc/tbox/context> ,
+    <https://ontology.fitnesscore.ai/fc/cbox/activity-types> ,
+    <https://ontology.fitnesscore.ai/fc/cbox/nutrition> ,
+    <https://ontology.fitnesscore.ai/fc/cbox/intensity> .
+

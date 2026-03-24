@@ -1,0 +1,54 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<https://ontology.fitnesscore.ai/fc/cbox/activity-types>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore C-Box (activity types)" ;
+  rdfs:comment "Controlled vocabulary for workout activity types (Strava-oriented). Use skos:Concept IRIs as fc:activityType values." .
+
+fc:ActivityTypeScheme
+  a skos:ConceptScheme ;
+  skos:prefLabel "Workout activity types" .
+
+fc:ActivityType_Run a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Run" .
+
+fc:ActivityType_Ride a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Ride" .
+
+fc:ActivityType_Walk a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Walk" .
+
+fc:ActivityType_Hike a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Hike" .
+
+fc:ActivityType_Swim a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Swim" .
+
+fc:ActivityType_Row a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Row" .
+
+fc:ActivityType_WeightTraining a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Weight training" .
+
+fc:ActivityType_Workout a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Workout" .
+
+fc:ActivityType_Yoga a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Yoga" .
+
+fc:ActivityType_Other a skos:Concept ;
+  skos:inScheme fc:ActivityTypeScheme ;
+  skos:prefLabel "Other" .
+

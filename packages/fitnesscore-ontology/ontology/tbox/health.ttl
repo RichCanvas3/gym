@@ -1,0 +1,73 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix dul: <http://www.ontologydesignpatterns.org/ont/dul/DUL.owl#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://ontology.fitnesscore.ai/fc/tbox/health>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore T-Box (health)" ;
+  rdfs:comment "Outcome + condition hooks for exercise, inspired by OPE (intended health outcomes / target ailments), kept lightweight and standards-aligned." ;
+  owl:imports <https://ontology.fitnesscore.ai/fc/tbox/fitness> .
+
+fc:Ailment a owl:Class ;
+  rdfs:label "Ailment" ;
+  rdfs:comment "A health condition/ailment (placeholder; can map to SNOMED/ICD/etc externally)." ;
+  rdfs:subClassOf dul:Concept .
+
+fc:Outcome a owl:Class ;
+  rdfs:label "Outcome" ;
+  rdfs:comment "Intended or observed health/fitness outcome (placeholder for later alignment)." ;
+  rdfs:subClassOf dul:Concept .
+
+fc:ClinicalMeasurement a owl:Class ;
+  rdfs:label "ClinicalMeasurement" ;
+  rdfs:comment "A clinical/physiologic measurement dimension (e.g., blood pressure, resting HR). Placeholder for later alignment." ;
+  rdfs:subClassOf dul:Concept .
+
+fc:targetsAilment a owl:ObjectProperty ;
+  rdfs:label "targetsAilment" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:Ailment .
+
+fc:intendedOutcome a owl:ObjectProperty ;
+  rdfs:label "intendedOutcome" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:Outcome .
+
+fc:improvesClinicalMeasurement a owl:ObjectProperty ;
+  rdfs:label "improvesClinicalMeasurement" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:ClinicalMeasurement .
+
+fc:lowersClinicalMeasurement a owl:ObjectProperty ;
+  rdfs:label "lowersClinicalMeasurement" ;
+  rdfs:subPropertyOf fc:improvesClinicalMeasurement ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:ClinicalMeasurement .
+
+fc:raisesClinicalMeasurement a owl:ObjectProperty ;
+  rdfs:label "raisesClinicalMeasurement" ;
+  rdfs:subPropertyOf fc:improvesClinicalMeasurement ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:ClinicalMeasurement .
+
+### Participant/assistance hooks (OPE-inspired)
+
+fc:requiresParticipant a owl:ObjectProperty ;
+  rdfs:label "requiresParticipant" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range prov:Person .
+
+fc:requiresAssistance a owl:ObjectProperty ;
+  rdfs:label "requiresAssistance" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range prov:Agent .
+
+fc:requiresProfessionalAssistance a owl:ObjectProperty ;
+  rdfs:label "requiresProfessionalAssistance" ;
+  rdfs:subPropertyOf fc:requiresAssistance ;
+  rdfs:domain fc:Workout ;
+  rdfs:range prov:Agent .
+

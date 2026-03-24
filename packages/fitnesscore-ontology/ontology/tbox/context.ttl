@@ -1,0 +1,80 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix dul: <http://www.ontologydesignpatterns.org/ont/dul/DUL.owl#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://ontology.fitnesscore.ai/fc/tbox/context>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore T-Box (context)" ;
+  rdfs:comment "PACO-style context + modifier layer for real-world activity data (intensity, amount, frequency, location, effects), aligned to PROV-O/DUL and expressed in FitnessCore namespace." ;
+  owl:imports <https://ontology.fitnesscore.ai/fc/tbox/fitness> ;
+  owl:imports <https://ontology.fitnesscore.ai/fc/cbox/intensity> .
+
+### Session concept (PACO: PhysicalActivity / Exercise descriptions)
+
+fc:WorkoutSession a owl:Class ;
+  rdfs:label "WorkoutSession" ;
+  rdfs:comment "A contextualized workout occurrence (session) with modifiers like intensity, location, and frequency." ;
+  rdfs:subClassOf fc:Workout .
+
+### Context concepts
+
+fc:Place a owl:Class ;
+  rdfs:label "Place" ;
+  rdfs:comment "A location/place context for activity (aligns to DUL Place)." ;
+  rdfs:subClassOf dul:Place .
+
+fc:ActivityEffect a owl:Class ;
+  rdfs:label "ActivityEffect" ;
+  rdfs:comment "Effect classification for activity (e.g., endurance/strength/balance/flexibility), inspired by PACO's exercise effects." ;
+  rdfs:subClassOf dul:Concept .
+
+fc:RequiredCondition a owl:Class ;
+  rdfs:label "RequiredCondition" ;
+  rdfs:comment "Precondition/required condition for activity (e.g., water, snow, indoor/outdoor), inspired by PACO." ;
+  rdfs:subClassOf dul:Concept .
+
+### Modifiers (PACO-style)
+
+fc:IntensityLevel a owl:Class ;
+  rdfs:label "IntensityLevel" ;
+  rdfs:comment "Intensity category (low/moderate/vigorous). Use SKOS concepts from the intensity C-Box." ;
+  rdfs:subClassOf dul:Concept .
+
+fc:Frequency a owl:Class ;
+  rdfs:label "Frequency" ;
+  rdfs:comment "A frequency concept (e.g., times per week). Kept abstract; instance data may use literals instead." ;
+  rdfs:subClassOf dul:Concept .
+
+### Properties
+
+fc:occursIn a owl:ObjectProperty ;
+  rdfs:label "occursIn" ;
+  rdfs:domain fc:WorkoutSession ;
+  rdfs:range fc:Place .
+
+fc:hasIntensity a owl:ObjectProperty ;
+  rdfs:label "hasIntensity" ;
+  rdfs:comment "Intensity modifier for a workout session (use SKOS concepts from fc:IntensityScheme)." ;
+  rdfs:domain fc:WorkoutSession ;
+  rdfs:range skos:Concept .
+
+fc:hasActivityEffect a owl:ObjectProperty ;
+  rdfs:label "hasActivityEffect" ;
+  rdfs:domain fc:WorkoutSession ;
+  rdfs:range fc:ActivityEffect .
+
+fc:hasRequiredCondition a owl:ObjectProperty ;
+  rdfs:label "hasRequiredCondition" ;
+  rdfs:domain fc:WorkoutSession ;
+  rdfs:range fc:RequiredCondition .
+
+fc:hasTotalAmountMinutes a owl:DatatypeProperty ;
+  rdfs:label "hasTotalAmountMinutes" ;
+  rdfs:comment "Total amount of activity in minutes (often weekly). Mirrors PACO's hasTotalAmountMin idea but kept in FitnessCore namespace." ;
+  rdfs:domain fc:WorkoutSession ;
+  rdfs:range xsd:integer .
+

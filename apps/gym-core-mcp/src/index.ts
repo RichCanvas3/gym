@@ -29,6 +29,21 @@ function canonicalizeAddress(address: string) {
 }
 
 async function ensureSchema(db: D1Database): Promise<void> {
+  // KB persistence (embeddings + text). Used by apps/api/knowledge_index.py to cache the KB index.
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS kb_chunks (
+        chunk_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        embedding_json TEXT NOT NULL,
+        created_at_iso TEXT NOT NULL,
+        updated_at_iso TEXT NOT NULL
+      )`,
+    )
+    .run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_kb_chunks_source ON kb_chunks(source_id)`).run();
+
   await db
     .prepare(
       `CREATE TABLE IF NOT EXISTS account_external_identities (
@@ -605,6 +620,7 @@ function createServer(env: Env) {
         .max(500),
     },
     async (args) => {
+      await ensureSchema(env.DB);
       const parsed = z
         .object({
           chunks: z
@@ -643,6 +659,7 @@ function createServer(env: Env) {
     "List KB chunks (text + embedding) for retrieval.",
     { limit: z.number().int().positive().max(2000).optional(), offset: z.number().int().nonnegative().optional() },
     async (args) => {
+      await ensureSchema(env.DB);
       const parsed = z
         .object({ limit: z.number().int().positive().max(2000).optional(), offset: z.number().int().nonnegative().optional() })
         .parse(args);

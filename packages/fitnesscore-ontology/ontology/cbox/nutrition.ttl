@@ -1,0 +1,34 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<https://ontology.fitnesscore.ai/fc/cbox/nutrition>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore C-Box (nutrition)" ;
+  rdfs:comment "Lightweight controlled vocabularies for meal types and nutrition concepts used by FitnessCore logs." .
+
+fc:MealTypeScheme
+  a skos:ConceptScheme ;
+  skos:prefLabel "Meal types" .
+
+fc:MealType_Breakfast a skos:Concept ;
+  skos:inScheme fc:MealTypeScheme ;
+  skos:prefLabel "Breakfast" .
+
+fc:MealType_Lunch a skos:Concept ;
+  skos:inScheme fc:MealTypeScheme ;
+  skos:prefLabel "Lunch" .
+
+fc:MealType_Dinner a skos:Concept ;
+  skos:inScheme fc:MealTypeScheme ;
+  skos:prefLabel "Dinner" .
+
+fc:MealType_Snack a skos:Concept ;
+  skos:inScheme fc:MealTypeScheme ;
+  skos:prefLabel "Snack" .
+
+fc:MealType_Unknown a skos:Concept ;
+  skos:inScheme fc:MealTypeScheme ;
+  skos:prefLabel "Unknown" .
+

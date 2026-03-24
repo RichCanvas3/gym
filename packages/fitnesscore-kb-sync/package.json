@@ -1,0 +1,13 @@
+{
+  "name": "@fitnesscore/kb-sync",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "bin": {
+    "fitnesscore-kb-sync": "./src/cli.mjs"
+  },
+  "dependencies": {
+    "sql.js": "^1.13.0"
+  }
+}
+

@@ -1,0 +1,115 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix sosa: <http://www.w3.org/ns/sosa/> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix qudt: <http://qudt.org/schema/qudt/> .
+@prefix unit: <http://qudt.org/vocab/unit/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://ontology.fitnesscore.ai/fc/tbox/fitness>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore T-Box (fitness)" ;
+  rdfs:comment "FitnessCore domain schema for workouts, body weight, and nutrition logs (Strava + weight management oriented)." ;
+  owl:imports <https://ontology.fitnesscore.ai/fc/tbox/core> .
+
+### People
+
+fc:Athlete a owl:Class ;
+  rdfs:label "Athlete" ;
+  rdfs:subClassOf prov:Person, fc:Person .
+
+### Workouts
+
+fc:Workout a owl:Class ;
+  rdfs:label "Workout" ;
+  rdfs:comment "An executed workout activity (e.g., Strava activity). Instance data should use prov:startedAtTime/prov:endedAtTime when available." ;
+  rdfs:subClassOf fc:Activity .
+
+fc:activityType a owl:ObjectProperty ;
+  rdfs:label "activityType" ;
+  rdfs:comment "Categorization for a workout; typically a SKOS concept (e.g., Strava activity type)." ;
+  rdfs:domain fc:Workout ;
+  rdfs:range skos:Concept .
+
+fc:distanceMeters a owl:DatatypeProperty ;
+  rdfs:label "distanceMeters" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range xsd:decimal .
+
+fc:durationSeconds a owl:DatatypeProperty ;
+  rdfs:label "durationSeconds" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range xsd:integer .
+
+fc:activeEnergyKcal a owl:DatatypeProperty ;
+  rdfs:label "activeEnergyKcal" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range xsd:decimal .
+
+fc:hasQuantityKind a owl:ObjectProperty ;
+  rdfs:label "hasQuantityKind" ;
+  rdfs:comment "Optional QUDT hook for quantities (e.g., active energy, distance)." ;
+  rdfs:range qudt:QuantityKind .
+
+fc:hasUnit a owl:ObjectProperty ;
+  rdfs:label "hasUnit" ;
+  rdfs:comment "Optional QUDT hook for units." ;
+  rdfs:range qudt:Unit .
+
+### Body weight
+
+fc:BodyWeightObservation a owl:Class ;
+  rdfs:label "BodyWeightObservation" ;
+  rdfs:comment "A body weight measurement modeled as SOSA observation. Use sosa:hasSimpleResult + unit annotations as needed." ;
+  rdfs:subClassOf sosa:Observation, prov:Entity .
+
+fc:bodyWeightKg a owl:DatatypeProperty ;
+  rdfs:label "bodyWeightKg" ;
+  rdfs:domain fc:BodyWeightObservation ;
+  rdfs:range xsd:decimal .
+
+### Nutrition / food entries
+
+fc:FoodEntry a owl:Class ;
+  rdfs:label "FoodEntry" ;
+  rdfs:comment "A logged food entry (free text or analyzed), representing intake." ;
+  rdfs:subClassOf prov:Entity .
+
+fc:mealType a owl:ObjectProperty ;
+  rdfs:label "mealType" ;
+  rdfs:comment "Optional meal type classification (SKOS concept: breakfast/lunch/etc.)." ;
+  rdfs:domain fc:FoodEntry ;
+  rdfs:range skos:Concept .
+
+fc:caloriesKcal a owl:DatatypeProperty ;
+  rdfs:label "caloriesKcal" ;
+  rdfs:domain fc:FoodEntry ;
+  rdfs:range xsd:decimal .
+
+fc:proteinGrams a owl:DatatypeProperty ;
+  rdfs:label "proteinGrams" ;
+  rdfs:domain fc:FoodEntry ;
+  rdfs:range xsd:decimal .
+
+fc:carbsGrams a owl:DatatypeProperty ;
+  rdfs:label "carbsGrams" ;
+  rdfs:domain fc:FoodEntry ;
+  rdfs:range xsd:decimal .
+
+fc:fatGrams a owl:DatatypeProperty ;
+  rdfs:label "fatGrams" ;
+  rdfs:domain fc:FoodEntry ;
+  rdfs:range xsd:decimal .
+
+### Suggested unit resources (for instance data; not required)
+
+fc:Unit_Kilogram a owl:NamedIndividual, qudt:Unit ;
+  rdfs:label "kilogram" ;
+  owl:sameAs unit:KiloGM .
+
+fc:Unit_KiloCalorie a owl:NamedIndividual, qudt:Unit ;
+  rdfs:label "kilocalorie" ;
+  owl:sameAs unit:KiloCAL .
+

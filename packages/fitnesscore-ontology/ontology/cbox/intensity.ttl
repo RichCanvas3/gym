@@ -1,0 +1,28 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<https://ontology.fitnesscore.ai/fc/cbox/intensity>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore C-Box (intensity)" ;
+  rdfs:comment "Controlled vocabulary for activity intensity levels (PACO-style)." .
+
+fc:IntensityScheme
+  a skos:ConceptScheme ;
+  skos:prefLabel "Intensity levels" .
+
+fc:Intensity_Low a skos:Concept ;
+  skos:inScheme fc:IntensityScheme ;
+  skos:prefLabel "Low" ;
+  skos:altLabel "light" .
+
+fc:Intensity_Moderate a skos:Concept ;
+  skos:inScheme fc:IntensityScheme ;
+  skos:prefLabel "Moderate" .
+
+fc:Intensity_Vigorous a skos:Concept ;
+  skos:inScheme fc:IntensityScheme ;
+  skos:prefLabel "Vigorous" ;
+  skos:altLabel "high" .
+

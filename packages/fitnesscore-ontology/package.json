@@ -1,0 +1,14 @@
+{
+  "name": "@fitnesscore/fitnesscore-ontology",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "files": [
+    "ontology/",
+    "src/"
+  ],
+  "scripts": {
+    "lint": "node ./src/verify.mjs"
+  }
+}
+

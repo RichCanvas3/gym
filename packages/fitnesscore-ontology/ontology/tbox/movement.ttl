@@ -1,0 +1,86 @@
+@prefix fc: <https://ontology.fitnesscore.ai/fc#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix dul: <http://www.ontologydesignpatterns.org/ont/dul/DUL.owl#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://ontology.fitnesscore.ai/fc/tbox/movement>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore T-Box (movement)" ;
+  rdfs:comment "Movement + equipment + monitoring hooks inspired by OPE (Ontology of Physical Exercises), aligned to PROV-O/DUL." ;
+  owl:imports <https://ontology.fitnesscore.ai/fc/tbox/fitness> .
+
+### Movement concepts
+
+fc:MovementPattern a owl:Class ;
+  rdfs:label "MovementPattern" ;
+  rdfs:comment "Functional movement pattern (e.g., squat, hinge, push, pull, rotate)." ;
+  rdfs:subClassOf dul:Concept .
+
+fc:AnatomicalStructure a owl:Class ;
+  rdfs:label "AnatomicalStructure" ;
+  rdfs:comment "Placeholder class for anatomy alignment (can later map to FMA/UBERON/etc.)." ;
+  rdfs:subClassOf dul:PhysicalObject .
+
+fc:Equipment a owl:Class ;
+  rdfs:label "Equipment" ;
+  rdfs:comment "Equipment used in a workout (e.g., barbell, treadmill, bike)." ;
+  rdfs:subClassOf dul:PhysicalObject, prov:Entity .
+
+fc:MonitoringDevice a owl:Class ;
+  rdfs:label "MonitoringDevice" ;
+  rdfs:comment "A device that can monitor a workout (e.g., smartwatch, HR strap, bike computer)." ;
+  rdfs:subClassOf dul:PhysicalObject, prov:Entity .
+
+### Workout movement relations (OPE-inspired)
+
+fc:hasMovementPattern a owl:ObjectProperty ;
+  rdfs:label "hasMovementPattern" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:MovementPattern .
+
+fc:engagesStructure a owl:ObjectProperty ;
+  rdfs:label "engagesStructure" ;
+  rdfs:comment "Links a workout to engaged musculoskeletal structures (coarse; align anatomy later)." ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:AnatomicalStructure .
+
+fc:usesEquipment a owl:ObjectProperty ;
+  rdfs:label "usesEquipment" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:Equipment .
+
+fc:canBeMonitoredBy a owl:ObjectProperty ;
+  rdfs:label "canBeMonitoredBy" ;
+  rdfs:comment "Links a workout to devices capable of monitoring it." ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:MonitoringDevice .
+
+### Primitive movement qualifiers (intentionally lightweight)
+
+fc:contracts a owl:ObjectProperty ;
+  rdfs:label "contracts" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:AnatomicalStructure .
+
+fc:extends a owl:ObjectProperty ;
+  rdfs:label "extends" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:AnatomicalStructure .
+
+fc:flexes a owl:ObjectProperty ;
+  rdfs:label "flexes" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:AnatomicalStructure .
+
+fc:rotates a owl:ObjectProperty ;
+  rdfs:label "rotates" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:AnatomicalStructure .
+
+fc:stretches a owl:ObjectProperty ;
+  rdfs:label "stretches" ;
+  rdfs:domain fc:Workout ;
+  rdfs:range fc:AnatomicalStructure .
+

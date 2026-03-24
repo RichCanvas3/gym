@@ -74,6 +74,8 @@ export async function GET() {
           "core_core_create_order",
           "core_core_memory_list_messages",
           "core_core_memory_append_message",
+          "core_core_kb_upsert_chunks",
+          "core_core_kb_list_chunks",
         ],
       },
       {

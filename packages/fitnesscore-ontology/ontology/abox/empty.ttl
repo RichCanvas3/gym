@@ -1,0 +1,8 @@
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<https://ontology.fitnesscore.ai/fc/abox/empty>
+  a owl:Ontology ;
+  rdfs:label "FitnessCore A-Box (empty placeholder)" ;
+  rdfs:comment "Instance data is loaded into GraphDB; this placeholder keeps the package structure consistent." .
+
