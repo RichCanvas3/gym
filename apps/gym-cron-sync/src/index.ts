@@ -3,7 +3,7 @@ type Service = { fetch(input: Request | string, init?: RequestInit): Promise<Res
 export type Env = {
   MCP_API_KEY?: string;
   // Which weight-management scope we sync into.
-  SYNC_ACCOUNT_ADDRESS?: string;
+  SYNC_TELEGRAM_USER_ID?: string;
   SYNC_CHAT_TITLE?: string;
   SYNC_TZ_NAME?: string;
   SYNC_LOOKBACK_DAYS?: string;
@@ -64,18 +64,12 @@ function fmtKcal(v: unknown): string {
   return typeof v === "number" && Number.isFinite(v) ? `~${Math.round(v)} kcal` : "";
 }
 
-function normalizeAccountAddress(raw: string): string {
+function normalizeTelegramUserId(raw: string): string {
   const t = (raw || "").trim();
   if (!t) return "";
-  // Accept either "acct_cust_casey" or "acct:acct_cust_casey"
-  if (t.startsWith("acct:")) return t.slice("acct:".length);
+  // Accept either "6105195555" or "tg:6105195555"
+  if (t.startsWith("tg:")) return t.slice("tg:".length);
   return t;
-}
-
-function fallbackAccountAddressFromChatId(chatId: string): string {
-  // Stable, non-secret default if SYNC_ACCOUNT_ADDRESS not provided.
-  const clean = (chatId || "unknown").replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-  return `tg_${clean || "unknown"}`;
 }
 
 function fmtDistanceMeters(m: unknown): string {
@@ -110,17 +104,20 @@ async function syncTelegram(env: Env) {
   const chatTitle = (env.SYNC_CHAT_TITLE ?? "Smart Agent").trim();
   const tzName = (env.SYNC_TZ_NAME ?? "UTC").trim() || "UTC";
 
-  const chats = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_chats", { limit: 200 });
+  const tgUserIdEnv = normalizeTelegramUserId((env.SYNC_TELEGRAM_USER_ID ?? "").trim());
+
+  const chats = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_chats", {
+    limit: 200,
+    ...(tgUserIdEnv ? { fromUserId: tgUserIdEnv } : {}),
+  });
   const chatList = Array.isArray(chats?.chats) ? chats.chats : [];
   const chat = chatList.find((c: any) => asString(c?.title).trim().toLowerCase() === chatTitle.toLowerCase());
   const chatId = asString(chat?.chatId).trim();
   if (!chatId) return { ok: true, imported: 0, replied: 0, reason: "chat_not_found" };
 
-  const acctRaw = normalizeAccountAddress((env.SYNC_ACCOUNT_ADDRESS ?? "").trim());
-  const acct = acctRaw || fallbackAccountAddressFromChatId(chatId);
-
   const msgs = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_messages", {
     chatId,
+    ...(tgUserIdEnv ? { fromUserId: tgUserIdEnv } : {}),
     limit: 50,
     includeImageUrls: true,
     includeImageBytes: false,
@@ -139,8 +136,11 @@ async function syncTelegram(env: Env) {
     const imageUrl = firstImageUrl(m);
     if (!text && !imageUrl) continue;
 
+    const tgUserId = asString(m?.fromUserId).trim();
+    if (!tgUserId) continue;
+
     const out = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_ingest_telegram_message", {
-      scope: { accountAddress: acct },
+      scope: { telegramUserId: tgUserId },
       tzName,
       chatId,
       messageId: mid,
@@ -192,13 +192,15 @@ async function syncTelegram(env: Env) {
     }
   }
 
-  return { ok: true, imported, replied, scopeAccountAddress: acct, errors: errors.slice(0, 5) };
+  return { ok: true, imported, replied, errors: errors.slice(0, 5) };
 }
 
 async function syncStrava(env: Env) {
   const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
   const tzName = (env.SYNC_TZ_NAME ?? "UTC").trim() || "UTC";
   const chatTitle = (env.SYNC_CHAT_TITLE ?? "Smart Agent").trim();
+  const tgUserId = normalizeTelegramUserId((env.SYNC_TELEGRAM_USER_ID ?? "").trim());
+  if (!tgUserId) return { ok: true, inserted: 0, messaged: 0, reason: "missing_sync_telegram_user_id" };
 
   const chats = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_chats", { limit: 200 });
   const chatList = Array.isArray(chats?.chats) ? chats.chats : [];
@@ -206,12 +208,12 @@ async function syncStrava(env: Env) {
   const chatId = asString(chat?.chatId).trim();
   if (!chatId) return { ok: true, inserted: 0, messaged: 0, reason: "chat_not_found" };
 
-  const acctRaw = normalizeAccountAddress((env.SYNC_ACCOUNT_ADDRESS ?? "").trim());
-  const acct = acctRaw || fallbackAccountAddressFromChatId(chatId);
-
   const lookbackDays = Number.parseInt((env.SYNC_LOOKBACK_DAYS ?? "7").trim(), 10);
-  await mcpCall(env.STRAVA_MCP, apiKey, "strava_sync", { lookbackDays: Number.isFinite(lookbackDays) ? lookbackDays : 7 });
-  const w = await mcpCall(env.STRAVA_MCP, apiKey, "strava_list_workouts", { limit: 50 });
+  await mcpCall(env.STRAVA_MCP, apiKey, "strava_sync", {
+    telegramUserId: tgUserId,
+    lookbackDays: Number.isFinite(lookbackDays) ? lookbackDays : 7,
+  });
+  const w = await mcpCall(env.STRAVA_MCP, apiKey, "strava_list_workouts", { telegramUserId: tgUserId, limit: 50 });
   const workouts = Array.isArray(w?.workouts) ? w.workouts : [];
 
   let inserted = 0;
@@ -227,7 +229,7 @@ async function syncStrava(env: Env) {
     const kcal = typeof wk?.active_energy_kcal === "number" ? wk.active_energy_kcal : null;
 
     const out = await mcpCall(env.WEIGHT_MCP, apiKey, "weight_ingest_workout", {
-      scope: { accountAddress: acct },
+      scope: { telegramUserId: tgUserId },
       source: "strava",
       workoutId,
       startedAtISO,
@@ -254,7 +256,7 @@ async function syncStrava(env: Env) {
     messaged += 1;
   }
 
-  return { ok: true, inserted, messaged, tzName, scopeAccountAddress: acct, errors: errors.slice(0, 5) };
+  return { ok: true, inserted, messaged, tzName, scopeTelegramUserId: tgUserId, errors: errors.slice(0, 5) };
 }
 
 async function runCron(env: Env) {

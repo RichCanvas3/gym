@@ -36,21 +36,128 @@ export function accountAddressFromPrivyDid(did: string): string {
   return `acct:privy_${h}`;
 }
 
+type UnknownAsyncFn = (arg: unknown) => Promise<unknown>;
+
+function extractDid(verifiedClaims: unknown): string {
+  if (!verifiedClaims || typeof verifiedClaims !== "object") return "";
+  const v = verifiedClaims as Record<string, unknown>;
+  const user = v.user && typeof v.user === "object" ? (v.user as Record<string, unknown>) : null;
+  const claims = v.claims && typeof v.claims === "object" ? (v.claims as Record<string, unknown>) : null;
+  const candidates: unknown[] = [
+    v.userId,
+    v.user_id,
+    v.sub,
+    user?.id,
+    user?.userId,
+    claims?.userId,
+    claims?.sub,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string") {
+      const s = c.trim();
+      if (s) return s;
+    }
+  }
+  return "";
+}
+
+function diagEnv(): string {
+  const appId = String(process.env.NEXT_PUBLIC_PRIVY_APP_ID ?? "").trim();
+  const appSecret = String(process.env.PRIVY_APP_SECRET ?? "").trim();
+  const jwtKey = String(process.env.PRIVY_JWT_VERIFICATION_KEY ?? "").trim();
+  return `env(appId=${Boolean(appId)},secret=${Boolean(appSecret)},jwtKey=${Boolean(jwtKey)})`;
+}
+
 export async function requirePrivyAuth(req: Request): Promise<PrivyAuthOk | PrivyAuthErr> {
   const auth = req.headers.get("authorization") ?? "";
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (!m) return { ok: false, status: 401, error: "Missing Authorization: Bearer <token>" };
   const accessToken = String(m[1] ?? "").trim();
   if (!accessToken) return { ok: false, status: 401, error: "Missing access token" };
+  if (accessToken.split(".").length !== 3) {
+    return { ok: false, status: 401, error: "Invalid access token format (expected JWT)" };
+  }
 
   try {
+    const dev = process.env.NODE_ENV !== "production";
     const privy = privyClient();
-    const verified = await privy.utils().auth().verifyAccessToken(accessToken);
-    const did = typeof (verified as any)?.userId === "string" ? String((verified as any).userId).trim() : "";
-    if (!did) return { ok: false, status: 401, error: "Invalid Privy token (missing DID)" };
+    const diag = dev ? diagEnv() : "";
+    let verified: unknown;
+    try {
+      // Current Privy SDK shape (per docs): verifyAccessToken({ access_token })
+      verified = await (privy as any).utils().auth().verifyAccessToken({ access_token: accessToken });
+    } catch (e) {
+      try {
+        // Back-compat: some versions accepted verifyAccessToken(accessToken)
+        verified = await (privy as any).utils().auth().verifyAccessToken(accessToken);
+      } catch (e2) {
+        const verifyAuthToken = (privy as any).verifyAuthToken as UnknownAsyncFn | undefined;
+        if (typeof verifyAuthToken === "function") {
+          verified = await verifyAuthToken.call(privy, accessToken);
+        } else {
+          throw e2;
+        }
+      }
+    }
+    const did = extractDid(verified);
+    if (!did) {
+      if (dev) {
+        const keys =
+          verified && typeof verified === "object" ? Object.keys(verified as Record<string, unknown>) : [];
+        console.warn("[privy] verified token but missing DID", { keys });
+      }
+      return {
+        ok: false,
+        status: 401,
+        error: dev ? `Invalid Privy token (missing DID). ${diag}` : "Invalid Privy token (missing DID)",
+      };
+    }
     return { ok: true, did, accountAddress: accountAddressFromPrivyDid(did) };
   } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e ?? "");
+    if (process.env.NODE_ENV !== "production" && msg) {
+      console.warn("[privy] access token verification failed", msg);
+      return {
+        ok: false,
+        status: 401,
+        error: `Unauthorized (check PRIVY_APP_SECRET matches NEXT_PUBLIC_PRIVY_APP_ID). ${msg} (${diagEnv()})`,
+      };
+    }
     return { ok: false, status: 401, error: "Unauthorized" };
+  }
+}
+
+function extractTelegramUserIdFromPrivyUser(user: unknown): string | null {
+  if (!user || typeof user !== "object") return null;
+  const u = user as Record<string, unknown>;
+  const linked = (u.linked_accounts ?? u.linkedAccounts) as unknown;
+  if (!Array.isArray(linked)) return null;
+  for (const a of linked) {
+    if (!a || typeof a !== "object") continue;
+    const acc = a as Record<string, unknown>;
+    const type = typeof acc.type === "string" ? acc.type : "";
+    if (type !== "telegram") continue;
+    const candidates: unknown[] = [acc.telegram_user_id, (acc as any).telegramUserId, (acc as any).telegram_userId];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.trim()) return c.trim();
+      if (typeof c === "number" && Number.isFinite(c)) return String(c);
+    }
+  }
+  return null;
+}
+
+export async function telegramUserIdForPrivyDid(did: string): Promise<string | null> {
+  const clean = String(did ?? "").trim();
+  if (!clean) return null;
+  try {
+    const privy = privyClient();
+    // Privy docs: users()._get(<did>) returns user JSON (linked_accounts includes telegram_user_id when linked).
+    const user = await (privy as unknown as { users: () => { _get: (id: string) => Promise<unknown> } })
+      .users()
+      ._get(clean);
+    return extractTelegramUserIdFromPrivyUser(user);
+  } catch {
+    return null;
   }
 }
 

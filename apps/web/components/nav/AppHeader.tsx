@@ -7,13 +7,50 @@ import { useCart } from "@/components/cart/CartProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
 import { CalendarDays, MessageCircle, ShoppingCart, UserCircle2 } from "lucide-react";
 
+function extractTelegramUserId(user: unknown): string | null {
+  if (!user || typeof user !== "object") return null;
+  const u = user as Record<string, unknown>;
+  const tg = u.telegram && typeof u.telegram === "object" ? (u.telegram as Record<string, unknown>) : null;
+  const directCandidates: unknown[] = [
+    tg?.telegram_user_id,
+    tg?.telegramUserId,
+    tg?.telegram_userId,
+    tg?.telegramUserID,
+  ];
+  for (const c of directCandidates) {
+    if (typeof c === "string" && c.trim()) return c.trim();
+    if (typeof c === "number" && Number.isFinite(c)) return String(c);
+  }
+
+  const linked = (u.linkedAccounts ?? (u as any).linked_accounts) as unknown;
+  if (Array.isArray(linked)) {
+    for (const a of linked) {
+      if (!a || typeof a !== "object") continue;
+      const acc = a as Record<string, unknown>;
+      const type = typeof acc.type === "string" ? acc.type : typeof (acc as any).accountType === "string" ? (acc as any).accountType : "";
+      if (type !== "telegram") continue;
+      const idCandidates: unknown[] = [
+        acc.telegram_user_id,
+        (acc as any).telegramUserId,
+        (acc as any).telegram_userId,
+      ];
+      for (const c of idCandidates) {
+        if (typeof c === "string" && c.trim()) return c.trim();
+        if (typeof c === "number" && Number.isFinite(c)) return String(c);
+      }
+    }
+  }
+  return null;
+}
+
 export function AppHeader() {
-  const { authenticated, accountAddress, login, logout } = useAuth();
+  const { authenticated, accountAddress, user, login, logout } = useAuth();
   const { lines, clear } = useCart();
   const { reservations, clearReservations } = useReservations();
 
   const cartCount = useMemo(() => lines.reduce((n, l) => n + (l.quantity || 0), 0), [lines]);
   const resCount = reservations.length;
+  const telegramUserId = useMemo(() => extractTelegramUserId(user), [user]);
 
   return (
     <div className="sticky top-0 z-20 border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-white/10 dark:bg-black/60">
@@ -52,13 +89,16 @@ export function AppHeader() {
           </Link>
         </div>
 
-        <div className="hidden items-center gap-3 md:flex">
+        <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-white/10 dark:bg-zinc-950">
             <UserCircle2 className="h-4 w-4 text-zinc-600 dark:text-zinc-400" aria-hidden="true" />
             {authenticated && accountAddress ? (
               <div className="min-w-0">
                 <div className="truncate font-semibold">Signed in</div>
                 <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">{accountAddress}</div>
+                <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">
+                  {telegramUserId ? `tg:${telegramUserId}` : "tg:(not linked)"}
+                </div>
               </div>
             ) : (
               <div className="text-zinc-600 dark:text-zinc-400">Not signed in</div>
@@ -69,6 +109,15 @@ export function AppHeader() {
               </span>
             ) : null}
           </div>
+
+          {authenticated ? (
+            <Link
+              href="/strava/connect"
+              className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 inline-flex items-center"
+            >
+              Connect Strava
+            </Link>
+          ) : null}
 
           <button
             onClick={() => {

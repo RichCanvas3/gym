@@ -28,6 +28,7 @@ type SkillsApiResponse = {
 };
 
 const GOAL_BUNDLE_STORAGE_KEY = "climb_gym_goal_bundle_v1";
+const CHAT_THREADS_STORAGE_KEY = "climb_gym_chat_threads_v1";
 
 type SuggestedCartItem = {
   sku: string;
@@ -38,7 +39,7 @@ type SuggestedCartItem = {
 export default function ChatPage() {
   const router = useRouter();
   const { lines, addLine, removeSku, clear } = useCart();
-  const { ready, authenticated, accountAddress, getAccessToken, login } = useAuth();
+  const { ready, authenticated, accountAddress, getAccessToken, login, logout } = useAuth();
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -96,7 +97,7 @@ export default function ChatPage() {
             }
           }
         }
-        const raw = window.localStorage.getItem("climb_gym_chat_threads_v1");
+        const raw = window.localStorage.getItem(CHAT_THREADS_STORAGE_KEY);
         if (raw) {
           const parsed = JSON.parse(raw) as unknown;
           if (parsed && typeof parsed === "object") {
@@ -112,7 +113,10 @@ export default function ChatPage() {
                 const images = Array.isArray(o.images) ? o.images.filter((u) => typeof u === "string" && u.trim()) : undefined;
                 if (role && text.trim()) cached.push({ role, text, images });
               }
-              if (!cancelled && cached.length) {
+              // Don't "stick" on a one-off auth failure cached in localStorage.
+              const onlyCachedAuthError =
+                cached.length === 1 && cached[0]?.role === "assistant" && isAuthErrorText(cached[0]?.text);
+              if (!cancelled && cached.length && !onlyCachedAuthError) {
                 setMessages(cached);
                 loadedAny = true;
               }
@@ -126,6 +130,7 @@ export default function ChatPage() {
       const url = "/api/agent/run";
       try {
         const tok = await getAccessToken();
+        if (!tok || tok.split(".").length !== 3) return;
         const res = await fetch(url, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
@@ -140,6 +145,16 @@ export default function ChatPage() {
             },
           }),
         });
+        if (!res.ok) {
+          const j = ((await res.json().catch(() => ({}))) as any) ?? {};
+          const msg = typeof j?.error === "string" ? j.error : typeof j?.detail === "string" ? j.detail : "Unauthorized";
+          if (!cancelled) {
+            setMessages([{ role: "assistant", text: msg }]);
+            loadedAny = true;
+          }
+          if (res.status === 401) logout();
+          return;
+        }
         const json = (await res.json().catch(() => ({}))) as any;
         const data = json?.data;
         const msgs = data?.messages;
@@ -188,6 +203,10 @@ export default function ChatPage() {
         setProfileBusy(true);
         setProfileError(null);
         const tok = await getAccessToken();
+        if (!tok || tok.split(".").length !== 3) {
+          setProfileError("Missing access token. Please log in again.");
+          return;
+        }
         const res = await fetch("/api/agent/run", {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
@@ -201,6 +220,14 @@ export default function ChatPage() {
             },
           }),
         });
+        if (!res.ok) {
+          const j = ((await res.json().catch(() => ({}))) as any) ?? {};
+          const msg = typeof j?.error === "string" ? j.error : typeof j?.detail === "string" ? j.detail : "Profile load failed.";
+          setProfileError(msg);
+          setProfileMissing(true);
+          if (res.status === 401) logout();
+          return;
+        }
         const json = (await res.json().catch(() => ({}))) as any;
         const ok = json?.data?.ok;
         if (ok === false) {
@@ -244,11 +271,12 @@ export default function ChatPage() {
     const tid = threadId || "thr_demo";
     try {
       if (!hydrated) return;
-      const raw = window.localStorage.getItem("climb_gym_chat_threads_v1");
+      const raw = window.localStorage.getItem(CHAT_THREADS_STORAGE_KEY);
       const parsed = raw ? (JSON.parse(raw) as unknown) : null;
       const map: Record<string, unknown> = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-      map[tid] = messages;
-      window.localStorage.setItem("climb_gym_chat_threads_v1", JSON.stringify(map));
+      const onlyAuthError = messages.length === 1 && messages[0]?.role === "assistant" && isAuthErrorText(messages[0]?.text);
+      map[tid] = onlyAuthError ? [] : messages;
+      window.localStorage.setItem(CHAT_THREADS_STORAGE_KEY, JSON.stringify(map));
     } catch {
       // ignore
     }
@@ -265,6 +293,10 @@ export default function ChatPage() {
     try {
       const url = "/api/agent/run";
       const tok = await getAccessToken();
+      if (!tok || tok.split(".").length !== 3) {
+        setMessages((m) => [...m, { role: "assistant", text: "Please log in again (missing access token)." }]);
+        return;
+      }
       const body = {
         message: text,
         session: {
@@ -288,6 +320,7 @@ export default function ChatPage() {
       const payload = json as ChatApiResponse;
       if (!res.ok) {
         const errMsg = extractErrorMessage(j);
+        if (res.status === 401) logout();
         setMessages((m) => [
           ...m,
           { role: "assistant", text: errMsg },
@@ -693,5 +726,17 @@ function parseUiActions(value: unknown): Array<{ type: "navigate"; to: string }>
     out.push({ type: "navigate", to });
   }
   return out;
+}
+
+function isAuthErrorText(text: unknown): boolean {
+  if (typeof text !== "string") return false;
+  const t = text.trim();
+  if (!t) return false;
+  return (
+    t.startsWith("Unauthorized") ||
+    t.startsWith("Missing Authorization") ||
+    t.startsWith("Missing access token") ||
+    t.startsWith("Invalid access token")
+  );
 }
 

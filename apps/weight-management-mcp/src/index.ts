@@ -21,12 +21,7 @@ export interface Env {
 }
 
 type Scope = {
-  churchId?: string;
-  userId?: string;
-  personId?: string;
-  householdId?: string | null;
-  // Optional stable app-level identity key.
-  accountAddress?: string;
+  telegramUserId: string;
 };
 
 type JsonRpcRequest = {
@@ -115,9 +110,12 @@ function summarizeWeightToolArgs(name: string, args: Record<string, unknown>): R
   const sc = isRecord(args.scope) ? args.scope : null;
   const scopeHint = sc
     ? {
-        churchId: typeof sc.churchId === "string" ? sc.churchId : undefined,
-        userId: typeof sc.userId === "string" ? sc.userId : undefined,
-        personId: typeof sc.personId === "string" ? sc.personId : undefined,
+        telegramUserId:
+          typeof (sc as any).telegramUserId === "string"
+            ? String((sc as any).telegramUserId).trim()
+            : typeof (sc as any).telegram_user_id === "string"
+              ? String((sc as any).telegram_user_id).trim()
+              : undefined,
       }
     : {};
 
@@ -151,8 +149,7 @@ function nowMs(): number {
 }
 
 function scopeId(scope: Scope): string {
-  if (scope.accountAddress) return `acct:${scope.accountAddress}`;
-  return [scope.churchId ?? "", scope.userId ?? "", scope.personId ?? "", scope.householdId ?? ""].join(":");
+  return `tg:${scope.telegramUserId}`;
 }
 
 function normStr(v: unknown): string | null {
@@ -287,12 +284,15 @@ async function fetchHttpUrlAsDataUrl(url: string, env: Env): Promise<string> {
 
 function parseScope(params: Record<string, unknown>): Scope {
   const s = isRecord(params.scope) ? (params.scope as Record<string, unknown>) : {};
+  const telegramUserId =
+    typeof (s as any).telegramUserId === "string"
+      ? String((s as any).telegramUserId).trim()
+      : typeof (s as any).telegram_user_id === "string"
+        ? String((s as any).telegram_user_id).trim()
+        : "";
+  if (!telegramUserId) throw new Error("Missing scope.telegramUserId");
   return {
-    churchId: typeof s.churchId === "string" ? s.churchId : undefined,
-    userId: typeof s.userId === "string" ? s.userId : undefined,
-    personId: typeof s.personId === "string" ? s.personId : undefined,
-    householdId: typeof s.householdId === "string" ? s.householdId : null,
-    accountAddress: typeof s.accountAddress === "string" ? s.accountAddress : undefined,
+    telegramUserId,
   };
 }
 
@@ -716,12 +716,9 @@ function toolList() {
   const scopeSchema = {
     type: "object",
     properties: {
-      churchId: { type: "string" },
-      userId: { type: "string" },
-      personId: { type: "string" },
-      householdId: { type: "string" },
-      accountAddress: { type: "string" },
+      telegramUserId: { type: "string", description: "Telegram numeric user id as string (e.g. '6105195555')." },
     },
+    required: ["telegramUserId"],
   };
 
   return [

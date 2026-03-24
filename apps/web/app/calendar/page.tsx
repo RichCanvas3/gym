@@ -81,7 +81,7 @@ type Filters = {
 function CalendarInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const { ready, authenticated, accountAddress, getAccessToken, login } = useAuth();
+  const { ready, authenticated, accountAddress, getAccessToken, login, logout } = useAuth();
   const { reservations, addReservation, clearReservations } = useReservations();
 
   const [classes, setClasses] = useState<GymClass[]>([]);
@@ -144,6 +144,7 @@ function CalendarInner() {
       if (!authenticated) return;
       setWeatherErr("");
       const tok = await getAccessToken();
+      if (!tok) return;
       const res = await fetch(
         `/api/calendar/week?start=${encodeURIComponent(weekStartISO)}&tz=${encodeURIComponent(clientTz || "America/Denver")}`,
         { cache: "no-store", headers: { authorization: `Bearer ${tok}` } },
@@ -152,6 +153,7 @@ function CalendarInner() {
       if (!res.ok) {
         const j = json as Record<string, unknown>;
         if (!cancelled) setWeatherErr(String(j?.error ?? j?.detail ?? "Calendar fetch failed."));
+        if (res.status === 401) logout();
         return;
       }
       const j = json as Record<string, unknown>;

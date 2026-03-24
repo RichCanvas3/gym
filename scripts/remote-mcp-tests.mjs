@@ -55,7 +55,8 @@ async function rpc(url, name, args) {
 }
 
 async function main() {
-  const scope = { accountAddress: process.env.ACCOUNT_ADDRESS || "acct_cust_casey" };
+  const telegramUserId = (process.env.TELEGRAM_USER_ID || "").trim();
+  const scope = telegramUserId ? { telegramUserId } : null;
   const now = new Date();
   const fromISO = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
   const toISO = now.toISOString();
@@ -67,10 +68,13 @@ async function main() {
     ["scheduling", "schedule_list_classes", { fromISO, toISO, limit: 3 }],
     ["weather", "weather_current", { lat: 40.03781, lon: -105.05228, units: "imperial" }],
     ["telegram", "telegram_ping", {}],
-    ["weight", "weight_profile_get", { scope }],
-    ["weight", "weight_list_food", { scope, fromISO, toISO, limit: 5 }],
-    ["strava", "strava_list_workouts", { limit: 5 }],
   ];
+
+  if (scope) {
+    checks.push(["weight", "weight_profile_get", { scope }]);
+    checks.push(["weight", "weight_list_food", { scope, fromISO, toISO, limit: 5 }]);
+    checks.push(["strava", "strava_list_workouts", { telegramUserId, limit: 5 }]);
+  }
 
   const results = [];
   for (const [svc, tool, args] of checks) {

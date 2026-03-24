@@ -17,6 +17,8 @@ export async function GET() {
         id: "strava",
         label: "Exercise (Strava)",
         tools: [
+          "strava_strava_connect",
+          "strava_strava_get_me",
           "strava_strava_sync",
           "strava_strava_list_workouts",
           "strava_strava_get_workout",

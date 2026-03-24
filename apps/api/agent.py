@@ -67,6 +67,14 @@ def _session_participant(session: Optional["Session"]) -> str:
     return _waiver_participant(session)
 
 
+def _session_telegram_user_id(session: Optional["Session"]) -> str:
+    if session and isinstance(getattr(session, "telegramUserId", None), str):
+        v = str(getattr(session, "telegramUserId") or "").strip()
+        if v:
+            return v
+    return ""
+
+
 def _waiver_participant(session: Optional["Session"]) -> str:
     if not session or not isinstance(session.waiver, dict):
         return ""
@@ -531,6 +539,7 @@ class Session(BaseModel):
     userName: Optional[str] = None
     userEmail: Optional[str] = None
     accountAddress: Optional[str] = None
+    telegramUserId: Optional[str] = None
     userGoals: Optional[str] = None
     """User-defined outcomes + executable checklist; synced from the chat UI (GoalBundleJSON). Domain-agnostic."""
     goalBundle: Optional[dict[str, Any]] = None
@@ -830,8 +839,8 @@ def _parse_weight_from_text(text: str) -> tuple[Optional[float], Optional[float]
 
 
 def _weight_scope_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
-    addr = _session_account_address(session)
-    return {"accountAddress": addr} if addr else None
+    tg_user_id = _session_telegram_user_id(session)
+    return {"telegramUserId": tg_user_id} if tg_user_id else None
 
 
 async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -847,8 +856,11 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
     tg_state = integrations.get("telegramMeals") if isinstance(integrations.get("telegramMeals"), dict) else {}
     last_id = tg_state.get("lastImportedMessageId")
     last_imported = int(last_id) if isinstance(last_id, (int, float)) else 0
+    tg_user_id = _session_telegram_user_id(session)
+    if not tg_user_id:
+        return bundle, []
 
-    chats = await _telegram_call_json("telegram_list_chats", {"limit": 200}) or {}
+    chats = await _telegram_call_json("telegram_list_chats", {"limit": 200, "fromUserId": tg_user_id}) or {}
     chat_list = chats.get("chats") if isinstance(chats, dict) else None
     chat_id: Optional[str] = None
     if isinstance(chat_list, list):
@@ -864,7 +876,7 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
 
     msgs = await _telegram_call_json(
         "telegram_list_messages",
-        {"chatId": chat_id, "limit": 50, "includeImageUrls": True, "includeImageBytes": False},
+        {"chatId": chat_id, "fromUserId": tg_user_id, "limit": 50, "includeImageUrls": True, "includeImageBytes": False},
     ) or {}
     items = msgs.get("messages") if isinstance(msgs, dict) else None
     if not isinstance(items, list) or not items:
@@ -968,8 +980,11 @@ async def _auto_import_telegram_weight_texts(session: Optional["Session"], bundl
     tg_state = integrations.get("telegramWeights") if isinstance(integrations.get("telegramWeights"), dict) else {}
     last_id = tg_state.get("lastImportedMessageId")
     last_imported = int(last_id) if isinstance(last_id, (int, float)) else 0
+    tg_user_id = _session_telegram_user_id(session)
+    if not tg_user_id:
+        return bundle, []
 
-    chats = await _telegram_call_json("telegram_list_chats", {"limit": 200}) or {}
+    chats = await _telegram_call_json("telegram_list_chats", {"limit": 200, "fromUserId": tg_user_id}) or {}
     chat_list = chats.get("chats") if isinstance(chats, dict) else None
     chat_id: Optional[str] = None
     if isinstance(chat_list, list):
@@ -985,7 +1000,7 @@ async def _auto_import_telegram_weight_texts(session: Optional["Session"], bundl
 
     msgs = await _telegram_call_json(
         "telegram_list_messages",
-        {"chatId": chat_id, "limit": 50, "includeImageUrls": False, "includeImageBytes": False},
+        {"chatId": chat_id, "fromUserId": tg_user_id, "limit": 50, "includeImageUrls": False, "includeImageBytes": False},
     ) or {}
     items = msgs.get("messages") if isinstance(msgs, dict) else None
     if not isinstance(items, list) or not items:
@@ -1378,17 +1393,17 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     )
 
     class FitnessSnapshotArgs(BaseModel):
-        accountAddress: str = Field(min_length=3, description="Canonical account address (used as weight-management scope id).")
+        telegramUserId: str = Field(min_length=3, description="Telegram numeric user id as string (used as weight-management scope id).")
         dateISO: Optional[str] = Field(default=None, description="Local date (YYYY-MM-DD). Defaults to today in tzName.")
         tzName: Optional[str] = Field(default="America/Denver", description="IANA timezone name for date defaulting.")
 
-    async def fitness_snapshot(accountAddress: str, dateISO: Optional[str] = None, tzName: str = "America/Denver") -> str:
+    async def fitness_snapshot(telegramUserId: str, dateISO: Optional[str] = None, tzName: str = "America/Denver") -> str:
         tz = ZoneInfo(tzName or "UTC")
         if not dateISO or not isinstance(dateISO, str) or not dateISO.strip():
             dateISO = datetime.now(tz=tz).date().isoformat()
-        scope = {"accountAddress": accountAddress.strip()}
+        scope = {"telegramUserId": telegramUserId.strip()}
         day = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": dateISO, "tzName": tzName}) or {}
-        workout = await _strava_call_json("strava_latest_workout", {}) or {}
+        workout = await _strava_call_json("strava_latest_workout", {"telegramUserId": telegramUserId.strip()}) or {}
         return json.dumps(
             {
                 "asOfISO": _now_iso(),
@@ -1401,7 +1416,7 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 
     fitness_snapshot_tool = StructuredTool.from_function(
         name="fitness_snapshot",
-        description="Return a combined snapshot: today's weight-management day summary + latest Strava workout for an accountAddress.",
+        description="Return a combined snapshot: today's weight-management day summary (scoped by telegramUserId) + latest Strava workout.",
         coroutine=fitness_snapshot,
         args_schema=FitnessSnapshotArgs,
     )
@@ -1449,10 +1464,10 @@ async def run(input: Input) -> Output:
 
     # UI helper: get current weight-management profile for this user.
     if msg == "__WEIGHT_PROFILE_GET__":
-        addr = _session_account_address(input.session)
-        if not addr:
-            return Output(answer="Missing accountAddress.", citations=[], data={"error": "missing_account"})
-        prof = await _weight_call_json("weight_profile_get", {"scope": {"accountAddress": addr}})
+        tg_user_id = _session_telegram_user_id(input.session)
+        if not tg_user_id:
+            return Output(answer="Missing telegramUserId.", citations=[], data={"error": "missing_telegram_user_id"})
+        prof = await _weight_call_json("weight_profile_get", {"scope": {"telegramUserId": tg_user_id}})
         if prof is None:
             return Output(
                 answer="Weight Management MCP profile_get failed.",
@@ -1461,7 +1476,7 @@ async def run(input: Input) -> Output:
                     "ok": False,
                     "error": "weight_profile_get_failed",
                     "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_profile_get and Weight MCP server is healthy.",
-                    "accountAddress": addr,
+                    "telegramUserId": tg_user_id,
                 },
             )
         return Output(
@@ -1469,15 +1484,15 @@ async def run(input: Input) -> Output:
             citations=[],
             data={
                 "ok": True,
-                "accountAddress": addr,
+                "telegramUserId": tg_user_id,
                 "profile": prof.get("profile") if isinstance(prof, dict) else None,
             },
         )
 
     if msg.startswith("__WEIGHT_PROFILE_UPSERT__:"):
-        addr = _session_account_address(input.session)
-        if not addr:
-            return Output(answer="Missing accountAddress.", citations=[], data={"error": "missing_account"})
+        tg_user_id = _session_telegram_user_id(input.session)
+        if not tg_user_id:
+            return Output(answer="Missing telegramUserId.", citations=[], data={"error": "missing_telegram_user_id"})
         try:
             payload = json.loads(msg.split(":", 1)[1].strip())
         except Exception:
@@ -1485,7 +1500,7 @@ async def run(input: Input) -> Output:
         profile = payload.get("profile") if isinstance(payload, dict) else {}
         if not isinstance(profile, dict):
             profile = {}
-        out = await _weight_call_json("weight_profile_upsert", {"scope": {"accountAddress": addr}, "profile": profile})
+        out = await _weight_call_json("weight_profile_upsert", {"scope": {"telegramUserId": tg_user_id}, "profile": profile})
         if out is None:
             return Output(
                 answer="Weight Management MCP profile_upsert failed.",
@@ -1494,7 +1509,7 @@ async def run(input: Input) -> Output:
                     "ok": False,
                     "error": "weight_profile_upsert_failed",
                     "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_profile_upsert and Weight MCP server is healthy.",
-                    "accountAddress": addr,
+                    "telegramUserId": tg_user_id,
                 },
             )
         return Output(
@@ -1502,7 +1517,7 @@ async def run(input: Input) -> Output:
             citations=[],
             data={
                 "ok": True,
-                "accountAddress": addr,
+                "telegramUserId": tg_user_id,
                 "updated_at": out.get("updated_at") if isinstance(out, dict) else None,
             },
         )
@@ -1763,7 +1778,7 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals, but I need your accountAddress (sign in)."
+            answer = "I can summarize meals, but I need you signed in with Telegram."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -1881,7 +1896,7 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals, but I need your accountAddress (sign in)."
+            answer = "I can summarize meals, but I need you signed in with Telegram."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -1994,7 +2009,7 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals + exercise, but I need your accountAddress (sign in)."
+            answer = "I can summarize meals + exercise, but I need you signed in with Telegram."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -2034,7 +2049,14 @@ async def run(input: Input) -> Output:
             latest_kg = float(lb_from_text) * 0.45359237
 
         # Exercise (today)
-        str0 = await _strava_call_json("strava_list_workouts", {"limit": 200}) or {}
+        tg_user_id = _session_telegram_user_id(input.session)
+        if not tg_user_id:
+            answer = "I can list workouts, but I need you signed in with Telegram."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[])
+        str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
         workouts = str0.get("workouts") if isinstance(str0, dict) else None
         wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
@@ -2119,7 +2141,7 @@ async def run(input: Input) -> Output:
     ):
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals + exercise, but I need your accountAddress (sign in)."
+            answer = "I can summarize meals + exercise, but I need you signed in with Telegram."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -2180,7 +2202,14 @@ async def run(input: Input) -> Output:
             assumed_weight = True
 
         # Exercise (today)
-        str0 = await _strava_call_json("strava_list_workouts", {"limit": 200}) or {}
+        tg_user_id = _session_telegram_user_id(input.session)
+        if not tg_user_id:
+            answer = "I can list workouts, but I need you signed in with Telegram."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[])
+        str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
         workouts = str0.get("workouts") if isinstance(str0, dict) else None
         wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
@@ -2271,6 +2300,98 @@ async def run(input: Input) -> Output:
             data={"asOfISO": _now_iso(), "dateISO": date_iso, "intake_kcal": intake_kcal, "burn_kcal": burn_kcal, "tdee_kcal": tdee},
         )
 
+    # Deterministic: "what exercise/workouts did I do today" (list all Strava workouts for today).
+    if (
+        (not msg.startswith("__"))
+        and ("today" in mlow)
+        and any(k in mlow for k in ["what exercise", "what exercises", "what workout", "what workouts"])
+    ):
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        tz = ZoneInfo(tz_name or "UTC")
+        date_iso = datetime.now(tz=tz).date().isoformat()
+
+        tg_user_id = _session_telegram_user_id(input.session)
+        if not tg_user_id:
+            answer = "I can list workouts, but I need you signed in with Telegram."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[])
+        data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+        workouts = data0.get("workouts") if isinstance(data0, dict) else None
+        wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
+
+        def _parse_iso(s: Any) -> Optional[datetime]:
+            if not isinstance(s, str) or not s.strip():
+                return None
+            try:
+                return datetime.fromisoformat(s.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        today_workouts: list[dict[str, Any]] = []
+        for w in wlist:
+            started = _parse_iso(w.get("started_at_iso")) or _parse_iso(w.get("ended_at_iso"))
+            if not started:
+                continue
+            if started.astimezone(tz).date().isoformat() != date_iso:
+                continue
+            today_workouts.append(w)
+
+        if not today_workouts:
+            answer = f"I’m not seeing any workouts for today ({date_iso}, {tz_name}) in your connected Strava data."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "dateISO": date_iso, "count": 0})
+
+        # Most recent first (Strava MCP returns most recent first; keep that).
+        lines = [f"Today you did ({date_iso}, {tz_name}):"]
+
+        def _fmt_duration(sec: Any) -> str:
+            try:
+                s = int(sec)
+            except Exception:
+                return ""
+            m = s // 60
+            ss = s % 60
+            if m < 60:
+                return f"{m}:{ss:02d}"
+            return f"{m//60}:{m%60:02d}:{ss:02d}"
+
+        for w in today_workouts[:10]:
+            typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
+            started = _parse_iso(w.get("started_at_iso")) or _parse_iso(w.get("ended_at_iso"))
+            started_local = started.astimezone(tz).strftime("%H:%M") if started else ""
+
+            # Optional name from metadata_json (Strava MCP stores {"name", "sport_type"}).
+            name = ""
+            meta = w.get("metadata_json")
+            if isinstance(meta, str) and meta.strip():
+                try:
+                    mj = json.loads(meta)
+                    if isinstance(mj, dict) and isinstance(mj.get("name"), str) and str(mj.get("name")).strip():
+                        name = str(mj.get("name")).strip()
+                except Exception:
+                    name = ""
+
+            dist_m = w.get("distance_meters")
+            dist_s = ""
+            if isinstance(dist_m, (int, float)) and float(dist_m) > 0:
+                km = float(dist_m) / 1000.0
+                dist_s = f"{km:.2f} km"
+
+            dur_s = _fmt_duration(w.get("duration_seconds"))
+            bits = " • ".join([b for b in [started_local, dist_s, dur_s] if b])
+            label = f"{typ}" + (f" “{name}”" if name else "")
+            lines.append(f"- {label}" + (f" ({bits})" if bits else ""))
+
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "dateISO": date_iso, "count": len(today_workouts)})
+
     # Deterministic: workouts summary (past few days / last week).
     if (
         (not msg.startswith("__"))
@@ -2294,7 +2415,10 @@ async def run(input: Input) -> Output:
         days = 7 if ("week" in mlow or "7" in mlow) else 3
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
 
-        data0 = await _strava_call_json("strava_list_workouts", {"limit": 200})
+        tg_user_id = _session_telegram_user_id(input.session)
+        if not tg_user_id:
+            return Output(answer="Missing telegramUserId.", citations=[], data={"error": "missing_telegram_user_id"})
+        data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200})
         if data0 is None:
             answer = (
                 "Strava MCP isn't connected in this deployment, so I can't fetch your workout list. "

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requirePrivyAuth } from "../../_lib/privy";
+import { requirePrivyAuth, telegramUserIdForPrivyDid } from "../../_lib/privy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,6 +34,8 @@ export async function POST(req: Request) {
 
   const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
   sessionOut.accountAddress = auth.accountAddress;
+  const telegramUserId = await telegramUserIdForPrivyDid(auth.did);
+  if (telegramUserId) sessionOut.telegramUserId = telegramUserId;
   // Remove legacy/unsupported identity field (waiver flow removed).
   if ("waiver" in sessionOut) delete (sessionOut as any).waiver;
   const derivedThreadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;

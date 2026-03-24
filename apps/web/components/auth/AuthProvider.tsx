@@ -67,8 +67,12 @@ function AuthContextInner({ children }: { children: React.ReactNode }) {
       user: (user as unknown) ?? null,
       accountAddress,
       getAccessToken: async () => {
-        const tok = await getAccessToken();
-        return typeof tok === "string" ? tok : "";
+        try {
+          const tok = await getAccessToken();
+          return typeof tok === "string" ? tok : "";
+        } catch {
+          return "";
+        }
       },
       login: () => login(),
       logout: () => logout(),
@@ -94,7 +98,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
   }
   return (
-    <PrivyProvider appId={appId}>
+    <PrivyProvider
+      appId={appId}
+      config={{
+        loginMethodsAndOrder: {
+          primary: ["google", "telegram", "email", "sms"],
+        },
+        intl: { defaultCountry: "US" },
+      }}
+    >
       <AuthContextInner>{children}</AuthContextInner>
     </PrivyProvider>
   );

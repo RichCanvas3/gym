@@ -1,3 +1,4 @@
+/// <reference path="./test-globals.d.ts" />
 import { describe, expect, it, vi } from "vitest";
 
 const d = process.env.CF_WORKERS === "1" ? describe : describe.skip;
@@ -31,11 +32,11 @@ d("strava-mcp", () => {
 
     env.STRAVA_CLIENT_ID = "1";
     env.STRAVA_CLIENT_SECRET = "2";
-    env.STRAVA_REFRESH_TOKEN = "3";
 
     await env.DB.prepare(
       `CREATE TABLE IF NOT EXISTS workouts (
         workout_id TEXT PRIMARY KEY,
+        scope_id TEXT,
         source TEXT,
         device TEXT,
         event_type TEXT,
@@ -50,11 +51,25 @@ d("strava-mcp", () => {
       )`,
     ).run();
     await env.DB.prepare(
-      `CREATE TABLE IF NOT EXISTS strava_sync_state (
-        id INTEGER PRIMARY KEY,
-        last_sync_at_iso TEXT
+      `CREATE TABLE IF NOT EXISTS strava_tokens (
+        telegram_user_id TEXT PRIMARY KEY,
+        refresh_token TEXT NOT NULL,
+        scope TEXT,
+        athlete_json TEXT,
+        updated_at_iso TEXT NOT NULL
       )`,
     ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS strava_sync_state_v2 (
+        scope_id TEXT PRIMARY KEY,
+        last_sync_at_iso TEXT NOT NULL
+      )`,
+    ).run();
+
+    const telegramUserId = "6105195555";
+    await env.DB.prepare(`INSERT OR REPLACE INTO strava_tokens (telegram_user_id, refresh_token, scope, athlete_json, updated_at_iso) VALUES (?,?,?,?,?)`)
+      .bind(telegramUserId, "refresh_demo", null, null, new Date().toISOString())
+      .run();
 
     const originalFetch = globalThis.fetch;
     vi.stubGlobal("fetch", async (input: any, init?: any) => {
@@ -82,11 +97,11 @@ d("strava-mcp", () => {
     });
 
     try {
-      const sync = await toolCall(SELF.fetch, "strava_sync", { lookbackDays: 30 });
+      const sync = await toolCall(SELF.fetch, "strava_sync", { telegramUserId, lookbackDays: 30 });
       expect(sync.ok).toBe(true);
       expect(sync.inserted).toBe(1);
 
-      const listed = await toolCall(SELF.fetch, "strava_list_workouts", { limit: 10 });
+      const listed = await toolCall(SELF.fetch, "strava_list_workouts", { telegramUserId, limit: 10 });
       expect(Array.isArray(listed.workouts)).toBe(true);
       expect(listed.workouts.length).toBe(1);
       expect(listed.workouts[0].workout_id).toBe("strava-123");

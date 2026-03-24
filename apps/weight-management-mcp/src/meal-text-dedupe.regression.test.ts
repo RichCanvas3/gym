@@ -74,7 +74,7 @@ d("weight-management-mcp", () => {
       )`,
     ).run();
 
-    const scope = { accountAddress: "acct_cust_casey" };
+    const scope = { telegramUserId: "6105195555" };
     const profile = await toolCall(SELF.fetch, "weight_profile_upsert", { scope, profile: {} });
     const sid = profile?.scope_id;
     expect(typeof sid).toBe("string");

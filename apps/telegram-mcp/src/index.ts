@@ -769,15 +769,31 @@ function createServer(env: Env) {
 
   server.tool(
     "telegram_list_chats",
-    "List chats seen by the webhook (from D1).",
-    { limit: z.number().int().positive().max(200).optional() },
+    "List chats seen by the webhook (from D1). Optional fromUserId filters chats to those with messages from that Telegram user id.",
+    { limit: z.number().int().positive().max(200).optional(), fromUserId: z.union([z.string().min(1), z.number().int()]).optional() },
     async (args) => {
-      const p = z.object({ limit: z.number().int().positive().max(200).optional() }).parse(args);
-      const res = await env.DB.prepare(
-        `SELECT chat_id, type, title, username, updated_at_iso FROM telegram_chats ORDER BY updated_at_iso DESC LIMIT ?`,
-      )
-        .bind(p.limit ?? 50)
-        .all();
+      const p = z
+        .object({
+          limit: z.number().int().positive().max(200).optional(),
+          fromUserId: z.union([z.string().min(1), z.number().int()]).optional(),
+        })
+        .parse(args);
+      const fromUserId = p.fromUserId !== undefined ? String(p.fromUserId) : null;
+      const res = fromUserId
+        ? await env.DB.prepare(
+            `SELECT chat_id, type, title, username, updated_at_iso
+             FROM telegram_chats
+             WHERE chat_id IN (SELECT DISTINCT chat_id FROM telegram_messages WHERE from_user_id = ?)
+             ORDER BY updated_at_iso DESC
+             LIMIT ?`,
+          )
+            .bind(fromUserId, p.limit ?? 50)
+            .all()
+        : await env.DB.prepare(
+            `SELECT chat_id, type, title, username, updated_at_iso FROM telegram_chats ORDER BY updated_at_iso DESC LIMIT ?`,
+          )
+            .bind(p.limit ?? 50)
+            .all();
       const chats = (res.results ?? []).map((r: any) => ({
         chatId: String(r.chat_id ?? ""),
         type: r.type ? String(r.type) : null,
@@ -794,6 +810,7 @@ function createServer(env: Env) {
     "List stored messages for a chat (from D1). Photo/image messages include image.url and image.imageUrl (public worker URL) when PUBLIC_BASE_URL is set. Optional includeImageBytes for base64.",
     {
       chatId: z.union([z.string().min(1), z.number().int()]),
+      fromUserId: z.union([z.string().min(1), z.number().int()]).optional(),
       limit: z.number().int().positive().max(200).optional(),
       includeImageUrls: z.boolean().optional(),
       includeImageBytes: z.boolean().optional(),
@@ -802,18 +819,25 @@ function createServer(env: Env) {
       const p = z
         .object({
           chatId: z.union([z.string().min(1), z.number().int()]),
+          fromUserId: z.union([z.string().min(1), z.number().int()]).optional(),
           limit: z.number().int().positive().max(200).optional(),
           includeImageUrls: z.boolean().optional(),
           includeImageBytes: z.boolean().optional(),
         })
         .parse(args);
       const chatId = String(p.chatId);
+      const fromUserId = p.fromUserId !== undefined ? String(p.fromUserId) : null;
       const includeUrls = p.includeImageUrls !== false;
       const includeBytes = p.includeImageBytes === true;
       const res = await env.DB.prepare(
-        `SELECT message_id, message_thread_id, from_user_id, date_unix, text, raw_json FROM telegram_messages WHERE chat_id = ? ORDER BY date_unix DESC LIMIT ?`,
+        `SELECT message_id, message_thread_id, from_user_id, date_unix, text, raw_json
+         FROM telegram_messages
+         WHERE chat_id = ?
+           AND (? IS NULL OR from_user_id = ?)
+         ORDER BY date_unix DESC
+         LIMIT ?`,
       )
-        .bind(chatId, p.limit ?? 50)
+        .bind(chatId, fromUserId, fromUserId, p.limit ?? 50)
         .all();
       const budget = { remaining: MAX_IMAGES_PER_RESPONSE };
       const rows = (res.results ?? []) as MessageRow[];
@@ -833,6 +857,7 @@ function createServer(env: Env) {
     {
       query: z.string().min(1),
       chatId: z.union([z.string().min(1), z.number().int()]).optional(),
+      fromUserId: z.union([z.string().min(1), z.number().int()]).optional(),
       limit: z.number().int().positive().max(100).optional(),
       includeImageUrls: z.boolean().optional(),
       includeImageBytes: z.boolean().optional(),
@@ -842,23 +867,33 @@ function createServer(env: Env) {
         .object({
           query: z.string().min(1),
           chatId: z.union([z.string().min(1), z.number().int()]).optional(),
+          fromUserId: z.union([z.string().min(1), z.number().int()]).optional(),
           limit: z.number().int().positive().max(100).optional(),
           includeImageUrls: z.boolean().optional(),
           includeImageBytes: z.boolean().optional(),
         })
         .parse(args);
       const q = `%${p.query}%`;
+      const fromUserId = p.fromUserId !== undefined ? String(p.fromUserId) : null;
       const includeUrls = p.includeImageUrls !== false;
       const includeBytes = p.includeImageBytes === true;
       const res = await env.DB.prepare(
         `SELECT chat_id, message_id, message_thread_id, from_user_id, date_unix, text, raw_json
          FROM telegram_messages
          WHERE (? IS NULL OR chat_id = ?)
+           AND (? IS NULL OR from_user_id = ?)
            AND text LIKE ?
          ORDER BY date_unix DESC
          LIMIT ?`,
       )
-        .bind(p.chatId ? String(p.chatId) : null, p.chatId ? String(p.chatId) : null, q, p.limit ?? 25)
+        .bind(
+          p.chatId ? String(p.chatId) : null,
+          p.chatId ? String(p.chatId) : null,
+          fromUserId,
+          fromUserId,
+          q,
+          p.limit ?? 25,
+        )
         .all();
       const budget = { remaining: MAX_IMAGES_PER_RESPONSE };
       const hits: Record<string, unknown>[] = [];

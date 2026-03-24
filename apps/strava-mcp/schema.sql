@@ -4,6 +4,7 @@ PRAGMA foreign_keys = ON;
 -- Stores synced activities as workouts
 CREATE TABLE IF NOT EXISTS workouts (
   workout_id TEXT PRIMARY KEY,
+  scope_id TEXT,
   source TEXT NOT NULL,
   device TEXT,
   event_type TEXT NOT NULL,
@@ -18,10 +19,18 @@ CREATE TABLE IF NOT EXISTS workouts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_workouts_ended_at ON workouts(ended_at_iso DESC);
+CREATE INDEX IF NOT EXISTS idx_workouts_scope_ended_at ON workouts(scope_id, ended_at_iso DESC);
 CREATE INDEX IF NOT EXISTS idx_workouts_activity_type ON workouts(activity_type);
 
-CREATE TABLE IF NOT EXISTS strava_sync_state (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
+CREATE TABLE IF NOT EXISTS strava_sync_state_v2 (
+  scope_id TEXT PRIMARY KEY,
   last_sync_at_iso TEXT NOT NULL
 );
-INSERT OR IGNORE INTO strava_sync_state (id, last_sync_at_iso) VALUES (1, '1970-01-01T00:00:00.000Z');
+
+CREATE TABLE IF NOT EXISTS strava_tokens (
+  telegram_user_id TEXT PRIMARY KEY,
+  refresh_token TEXT NOT NULL,
+  scope TEXT,
+  athlete_json TEXT,
+  updated_at_iso TEXT NOT NULL
+);

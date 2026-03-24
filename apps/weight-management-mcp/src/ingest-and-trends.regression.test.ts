@@ -61,8 +61,8 @@ d("weight-management-mcp ingestion + trends", () => {
       )`,
     ).run();
 
-    const scope = { accountAddress: "acct_cust_casey" };
-    const sid = "acct:acct_cust_casey";
+    const scope = { telegramUserId: "6105195555" };
+    const sid = "tg:6105195555";
     await env.DB.prepare(
       `INSERT INTO wm_food_entries (id, scope_id, at_ms, meal, text, calories, source, telegram_chat_id, telegram_message_id, analysis_id, image_url, created_at)
        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
@@ -115,7 +115,7 @@ d("weight-management-mcp ingestion + trends", () => {
     ).run();
 
     const out = await toolCall(SELF.fetch, "weight_ingest_telegram_message", {
-      scope: { accountAddress: "acct_cust_casey" },
+      scope: { telegramUserId: "6105195555" },
       tzName: "America/Denver",
       chatId: "-100",
       messageId: 300,
@@ -132,7 +132,7 @@ d("weight-management-mcp ingestion + trends", () => {
 
   it("buckets trend days by timezone and returns top foods", async () => {
     const { SELF, env } = await import("cloudflare:test");
-    const sid = "acct:acct_cust_casey";
+    const sid = "tg:6105195555";
 
     await env.DB.prepare(
       `CREATE TABLE IF NOT EXISTS wm_food_entries (
@@ -199,7 +199,7 @@ d("weight-management-mcp ingestion + trends", () => {
       .run();
 
     const out = await toolCall(SELF.fetch, "weight_meal_trends", {
-      scope: { accountAddress: "acct_cust_casey" },
+      scope: { telegramUserId: "6105195555" },
       tzName: "America/Denver",
       fromISO: "2026-03-21T00:00:00Z",
       toISO: "2026-03-23T00:00:00Z",
@@ -217,7 +217,7 @@ d("weight-management-mcp ingestion + trends", () => {
 
   it("day summary includes exercise_kcal and net_calories", async () => {
     const { SELF, env } = await import("cloudflare:test");
-    const sid = "acct:acct_cust_casey";
+    const sid = "tg:6105195555";
 
     await env.DB.prepare(
       `CREATE TABLE IF NOT EXISTS wm_weights (
@@ -335,7 +335,7 @@ d("weight-management-mcp ingestion + trends", () => {
       .bind("e", sid, dayStart + 2000, "strava", "strava-1", 250, dayStart + 2000)
       .run();
 
-    const out = await toolCall(SELF.fetch, "weight_day_summary", { scope: { accountAddress: "acct_cust_casey" }, dateISO: day });
+    const out = await toolCall(SELF.fetch, "weight_day_summary", { scope: { telegramUserId: "6105195555" }, dateISO: day });
     expect(out.ok).toBe(true);
     expect(out.totals.calories).toBe(600);
     expect(out.totals.exercise_kcal).toBe(250);

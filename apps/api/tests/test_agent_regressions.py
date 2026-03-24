@@ -46,7 +46,7 @@ async def test_food_past_week_summary(monkeypatch):
             message="what have i eaten in past week",
             session=Session(
                 timezone="America/Denver",
-                accountAddress="acct_cust_casey",
+                telegramUserId="6105195555",
             ),
         )
     )
@@ -69,6 +69,7 @@ async def test_workouts_past_few_days_summary(monkeypatch):
     async def fake_strava_call_json(tool_suffix: str, args: dict):
         calls["strava"].append((tool_suffix, args))
         assert tool_suffix == "strava_list_workouts"
+        assert args.get("telegramUserId") == "6105195555"
         return {
             "workouts": [
                 {
@@ -101,7 +102,7 @@ async def test_workouts_past_few_days_summary(monkeypatch):
             message="show me my workouts over last week",
             session=Session(
                 timezone="America/Denver",
-                accountAddress="acct_cust_casey",
+                telegramUserId="6105195555",
             ),
         )
     )
