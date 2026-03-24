@@ -242,6 +242,26 @@ async function upsertRefreshToken(env: Env, telegramUserId: string, refreshToken
     .run();
 }
 
+async function getConnectionStatus(env: Env, telegramUserId: string): Promise<{ connected: boolean; athlete: unknown | null; updatedAtISO: string | null }> {
+  const clean = String(telegramUserId ?? "").trim();
+  if (!clean) throw new Error("Missing telegramUserId");
+  const row = await env.DB.prepare(`SELECT refresh_token, athlete_json, updated_at_iso FROM strava_tokens WHERE telegram_user_id = ?`)
+    .bind(clean)
+    .first<{ refresh_token?: string; athlete_json?: string | null; updated_at_iso?: string | null }>();
+  const connected = Boolean(String(row?.refresh_token ?? "").trim());
+  let athlete: unknown | null = null;
+  const raw = row?.athlete_json;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      athlete = JSON.parse(raw);
+    } catch {
+      athlete = null;
+    }
+  }
+  const updatedAtISO = typeof row?.updated_at_iso === "string" && row.updated_at_iso.trim() ? row.updated_at_iso.trim() : null;
+  return { connected, athlete, updatedAtISO };
+}
+
 async function syncStrava(env: Env, telegramUserId: string, lookbackDays: number) {
   const scopeId = scopeIdForTelegramUserId(telegramUserId);
   const afterUnix = Math.floor(Date.now() / 1000) - Math.max(1, lookbackDays) * 24 * 60 * 60;
@@ -252,10 +272,17 @@ async function syncStrava(env: Env, telegramUserId: string, lookbackDays: number
   const ts = nowISO();
   for (const a of activities) {
     const row = stravaActivityToWorkoutRow(a);
-    const existing = await env.DB.prepare(`SELECT 1 FROM workouts WHERE workout_id = ? AND scope_id = ?`)
-      .bind(row.workout_id, scopeId)
-      .first();
-    if (existing) continue;
+    const existing = await env.DB.prepare(`SELECT workout_id, scope_id FROM workouts WHERE workout_id = ? LIMIT 1`)
+      .bind(row.workout_id)
+      .first<{ workout_id?: string; scope_id?: string | null }>();
+    if (existing && (existing as any).workout_id) {
+      // Backfill scope_id for older single-user rows.
+      const existingScope = typeof (existing as any).scope_id === "string" ? String((existing as any).scope_id) : null;
+      if (!existingScope) {
+        await env.DB.prepare(`UPDATE workouts SET scope_id = ? WHERE workout_id = ?`).bind(scopeId, row.workout_id).run();
+      }
+      continue;
+    }
     await env.DB.prepare(
       `INSERT INTO workouts (
         workout_id, scope_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
@@ -286,6 +313,13 @@ async function syncStrava(env: Env, telegramUserId: string, lookbackDays: number
 
 function createServer(env: Env) {
   const server = new McpServer({ name: "Strava MCP (D1)", version: "0.1.0" });
+
+  server.tool("strava_status", "Check whether Strava is connected for a telegramUserId.", { telegramUserId: z.string().min(1) }, async (args) => {
+    await ensureSchema(env);
+    const p = z.object({ telegramUserId: z.string().min(1) }).parse(args);
+    const st = await getConnectionStatus(env, p.telegramUserId);
+    return { content: [{ type: "text", text: jsonText({ ok: true, telegramUserId: p.telegramUserId, ...st }) }] };
+  });
 
   server.tool(
     "strava_connect",
@@ -354,6 +388,13 @@ function createServer(env: Env) {
       await ensureSchema(env);
       const p = z.object({ telegramUserId: z.string().min(1), limit: z.number().int().positive().max(200).optional() }).parse(args);
       const scopeId = scopeIdForTelegramUserId(p.telegramUserId);
+
+      // One-time migration assist: if there are no scoped rows yet, assume legacy rows belong to this scope.
+      const anyScoped = await env.DB.prepare(`SELECT 1 FROM workouts WHERE scope_id IS NOT NULL LIMIT 1`).first();
+      if (!anyScoped) {
+        await env.DB.prepare(`UPDATE workouts SET scope_id = ? WHERE scope_id IS NULL`).bind(scopeId).run();
+      }
+
       const res = await env.DB.prepare(
         `SELECT workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
          duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso

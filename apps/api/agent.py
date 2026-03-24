@@ -1466,7 +1466,7 @@ async def run(input: Input) -> Output:
     if msg == "__WEIGHT_PROFILE_GET__":
         tg_user_id = _session_telegram_user_id(input.session)
         if not tg_user_id:
-            return Output(answer="Missing telegramUserId.", citations=[], data={"error": "missing_telegram_user_id"})
+            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
         prof = await _weight_call_json("weight_profile_get", {"scope": {"telegramUserId": tg_user_id}})
         if prof is None:
             return Output(
@@ -1492,7 +1492,7 @@ async def run(input: Input) -> Output:
     if msg.startswith("__WEIGHT_PROFILE_UPSERT__:"):
         tg_user_id = _session_telegram_user_id(input.session)
         if not tg_user_id:
-            return Output(answer="Missing telegramUserId.", citations=[], data={"error": "missing_telegram_user_id"})
+            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
         try:
             payload = json.loads(msg.split(":", 1)[1].strip())
         except Exception:
@@ -2403,7 +2403,7 @@ async def run(input: Input) -> Output:
 
         tg_user_id = _session_telegram_user_id(input.session)
         if not tg_user_id:
-            return Output(answer="Missing telegramUserId.", citations=[], data={"error": "missing_telegram_user_id"})
+            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
         data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200})
         if data0 is None:
             answer = (

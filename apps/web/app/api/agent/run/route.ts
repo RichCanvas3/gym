@@ -35,7 +35,13 @@ export async function POST(req: Request) {
   const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
   sessionOut.accountAddress = auth.accountAddress;
   const telegramUserId = await telegramUserIdForPrivyDid(auth.did);
-  if (telegramUserId) sessionOut.telegramUserId = telegramUserId;
+  if (!telegramUserId) {
+    return NextResponse.json(
+      { error: "Telegram not linked for this Privy user (missing telegramUserId)." },
+      { status: 400 },
+    );
+  }
+  sessionOut.telegramUserId = telegramUserId;
   // Remove legacy/unsupported identity field (waiver flow removed).
   if ("waiver" in sessionOut) delete (sessionOut as any).waiver;
   const derivedThreadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;

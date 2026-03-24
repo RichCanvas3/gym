@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { useCart } from "@/components/cart/CartProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
@@ -44,13 +44,37 @@ function extractTelegramUserId(user: unknown): string | null {
 }
 
 export function AppHeader() {
-  const { authenticated, accountAddress, user, login, logout } = useAuth();
+  const { authenticated, accountAddress, user, login, logout, getAccessToken } = useAuth();
   const { lines, clear } = useCart();
   const { reservations, clearReservations } = useReservations();
 
   const cartCount = useMemo(() => lines.reduce((n, l) => n + (l.quantity || 0), 0), [lines]);
   const resCount = reservations.length;
   const telegramUserId = useMemo(() => extractTelegramUserId(user), [user]);
+  const [stravaConnected, setStravaConnected] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      if (!authenticated || !telegramUserId) {
+        if (!cancelled) setStravaConnected(null);
+        return;
+      }
+      try {
+        const tok = await getAccessToken();
+        const res = await fetch("/api/strava/status", { headers: { authorization: `Bearer ${tok}` } });
+        const j = await res.json().catch(() => ({}));
+        const connected = Boolean(j?.connected === true || j?.ok === true);
+        if (!cancelled) setStravaConnected(connected);
+      } catch {
+        if (!cancelled) setStravaConnected(null);
+      }
+    }
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated, telegramUserId, getAccessToken]);
 
   return (
     <div className="sticky top-0 z-20 border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-white/10 dark:bg-black/60">
@@ -115,7 +139,7 @@ export function AppHeader() {
               href="/strava/connect"
               className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 inline-flex items-center"
             >
-              Connect Strava
+              {stravaConnected ? "Strava connected" : "Connect Strava"}
             </Link>
           ) : null}
 
