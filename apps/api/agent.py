@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import uuid
+import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Optional
@@ -123,6 +124,60 @@ def _day_window_utc_from_local_date(date_iso: str, tz_name: str) -> tuple[str, s
     start_utc = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     end_utc = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return start_utc, end_utc
+
+
+_DATE_ISO_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+
+
+def _explicit_date_iso_from_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    m = _DATE_ISO_RE.search(text)
+    if not m:
+        return ""
+    try:
+        datetime.fromisoformat(m.group(1)).date()
+        return m.group(1)
+    except Exception:
+        return ""
+
+
+def _goal_integrations(bundle: dict[str, Any]) -> dict[str, Any]:
+    integrations = bundle.get("integrations")
+    if not isinstance(integrations, dict):
+        integrations = {}
+        bundle["integrations"] = integrations
+    return integrations
+
+
+def _set_last_date_context(bundle: dict[str, Any], date_iso: str, tz_name: str) -> None:
+    integrations = _goal_integrations(bundle)
+    integrations["lastDateContext"] = {"dateISO": date_iso, "tzName": tz_name, "setAtISO": _now_iso()}
+
+
+def _resolve_date_iso_with_context(msg: str, tz_name: str, bundle: dict[str, Any]) -> str:
+    tz = ZoneInfo(tz_name or "UTC")
+    explicit = _explicit_date_iso_from_text(msg)
+    if explicit:
+        return explicit
+    mlow = (msg or "").lower()
+    base = datetime.now(tz=tz).date()
+    if "yesterday" in mlow:
+        return (base - timedelta(days=1)).isoformat()
+    if "today" in mlow:
+        ctx = _goal_integrations(bundle).get("lastDateContext")
+        if isinstance(ctx, dict):
+            d = ctx.get("dateISO")
+            set_at = ctx.get("setAtISO")
+            if isinstance(d, str) and d.strip() and isinstance(set_at, str) and set_at.strip():
+                try:
+                    ts = datetime.fromisoformat(set_at.replace("Z", "+00:00"))
+                    if datetime.now(timezone.utc) - ts.astimezone(timezone.utc) < timedelta(minutes=30):
+                        return d.strip()
+                except Exception:
+                    pass
+        return base.isoformat()
+    return base.isoformat()
 
 
 def _tomorrow_date_iso(tz_name: str) -> str:
@@ -1893,11 +1948,8 @@ async def run(input: Input) -> Output:
             return Output(answer=answer, citations=[], uiActions=[])
 
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
-        tz = ZoneInfo(tz_name or "UTC")
-        day_local = datetime.now(tz=tz).date()
-        if "yesterday" in mlow:
-            day_local = day_local - timedelta(days=1)
-        date_iso = day_local.isoformat()
+        date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
+        _set_last_date_context(base_goal_bundle, date_iso, tz_name)
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         data0 = await _weight_call_json("weight_list_food", {"scope": scope, "fromISO": from_iso, "toISO": to_iso, "limit": 500})
@@ -1986,9 +2038,75 @@ async def run(input: Input) -> Output:
         return Output(
             answer=answer,
             citations=[],
-            goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+            goalBundle=base_goal_bundle,
             data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "count": len(food_items), "foodItems": food_items},
         )
+
+    # Deterministic: daily calories (intake / exercise burn / net) for "today" or an explicit date.
+    if (not msg.startswith("__")) and any(k in mlow for k in ["calorie", "calories", "net calories", "total calories"]) and any(
+        k in mlow for k in ["today", "yesterday"]
+    ):
+        scope = _weight_scope_from_session(input.session)
+        if not scope:
+            answer = "I can summarize calories, but I need you signed in with Telegram."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], uiActions=[])
+
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
+        _set_last_date_context(base_goal_bundle, date_iso, tz_name)
+
+        day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
+        totals = day0.get("totals") if isinstance(day0, dict) else None
+        totals = totals if isinstance(totals, dict) else {}
+        intake_kcal = float(totals.get("calories") or 0) if isinstance(totals.get("calories"), (int, float)) else 0.0
+        ex_kcal = float(totals.get("exercise_kcal") or 0) if isinstance(totals.get("exercise_kcal"), (int, float)) else 0.0
+        net_kcal = float(totals.get("net_calories") or (intake_kcal - ex_kcal)) if isinstance(totals.get("net_calories"), (int, float)) else (intake_kcal - ex_kcal)
+
+        # Also show workouts list for that date (from Strava), even if burn is missing.
+        tg_user_id = _session_telegram_user_id(input.session)
+        workouts_today: list[dict[str, Any]] = []
+        if tg_user_id:
+            str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            workouts = str0.get("workouts") if isinstance(str0, dict) else None
+            wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
+            tz = ZoneInfo(tz_name or "UTC")
+
+            def _parse_iso(s: Any) -> Optional[datetime]:
+                if not isinstance(s, str) or not s.strip():
+                    return None
+                try:
+                    return datetime.fromisoformat(s.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
+                except Exception:
+                    return None
+
+            for w in wlist:
+                started = _parse_iso(w.get("started_at_iso")) or _parse_iso(w.get("ended_at_iso"))
+                if not started:
+                    continue
+                if started.astimezone(tz).date().isoformat() != date_iso:
+                    continue
+                workouts_today.append(w)
+
+        lines = [
+            f"Daily calories ({date_iso}, {tz_name}):",
+            f"- Intake: **{int(round(intake_kcal))} kcal**",
+            f"- Exercise burn: **{int(round(ex_kcal))} kcal**",
+            f"- Net (intake − exercise): **{int(round(net_kcal))} kcal**",
+        ]
+        if workouts_today:
+            lines.append("\nWorkouts:")
+            for w in workouts_today[:6]:
+                typ = str(w.get("activity_type") or "Workout").strip() or "Workout"
+                lines.append(f"- {typ}")
+
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], goalBundle=base_goal_bundle, data={"asOfISO": _now_iso(), "dateISO": date_iso, "totals": totals})
 
     # Deterministic: today's food + exercise summary (consistent intake + spent + net).
     if (
@@ -2007,7 +2125,8 @@ async def run(input: Input) -> Output:
 
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
-        date_iso = datetime.now(tz=tz).date().isoformat()
+        date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
+        _set_last_date_context(base_goal_bundle, date_iso, tz_name)
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         # Intake (food)
@@ -2109,7 +2228,7 @@ async def run(input: Input) -> Output:
         return Output(
             answer=answer,
             citations=[],
-            goalBundle=base_goal_bundle if had_session_goal_bundle else None,
+            goalBundle=base_goal_bundle,
             data={
                 "asOfISO": _now_iso(),
                 "dateISO": date_iso,
@@ -2139,7 +2258,8 @@ async def run(input: Input) -> Output:
 
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
-        date_iso = datetime.now(tz=tz).date().isoformat()
+        date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
+        _set_last_date_context(base_goal_bundle, date_iso, tz_name)
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         # Pull profile for TDEE inputs (age/sex/height/activity_level).
@@ -2294,7 +2414,8 @@ async def run(input: Input) -> Output:
     if (not msg.startswith("__")) and ("today" in mlow) and any(k in mlow for k in ["workout", "workouts", "exercise", "exercises"]):
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
-        date_iso = datetime.now(tz=tz).date().isoformat()
+        date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
+        _set_last_date_context(base_goal_bundle, date_iso, tz_name)
 
         tg_user_id = _session_telegram_user_id(input.session)
         if not tg_user_id:
@@ -2376,7 +2497,7 @@ async def run(input: Input) -> Output:
         if thread_id:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", answer)
-        return Output(answer=answer, citations=[], data={"asOfISO": _now_iso(), "dateISO": date_iso, "count": len(today_workouts)})
+        return Output(answer=answer, citations=[], goalBundle=base_goal_bundle, data={"asOfISO": _now_iso(), "dateISO": date_iso, "count": len(today_workouts)})
 
     # Deterministic: workouts summary (past few days / last week).
     if (
