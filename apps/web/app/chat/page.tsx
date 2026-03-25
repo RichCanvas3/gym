@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
 import { useAuth } from "@/components/auth/AuthProvider";
@@ -29,6 +29,7 @@ type SkillsApiResponse = {
 
 const GOAL_BUNDLE_STORAGE_KEY = "climb_gym_goal_bundle_v1";
 const CHAT_THREADS_STORAGE_KEY = "climb_gym_chat_threads_v1";
+const CHAT_THREAD_NONCE_STORAGE_KEY = "climb_gym_chat_thread_nonce_v1";
 
 type SuggestedCartItem = {
   sku: string;
@@ -61,10 +62,32 @@ export default function ChatPage() {
     "sedentary" | "light" | "moderate" | "very_active" | ""
   >("");
 
-  const threadId = accountAddress ? `thr_${accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}` : "thr_anon";
+  const [threadNonce, setThreadNonce] = useState("0");
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const didInitialScrollRef = useRef(false);
+
+  const threadId = useMemo(() => {
+    const safeAddr = accountAddress ? accountAddress.replace(/[^a-zA-Z0-9_]/g, "_") : "anon";
+    const nonce = (threadNonce || "0").trim() || "0";
+    return `thr_${safeAddr}_${nonce}`;
+  }, [accountAddress, threadNonce]);
   const [hydrated, setHydrated] = useState(false);
   const showLoading = !ready;
   const showLoginGate = Boolean(ready) && !authenticated;
+
+  useEffect(() => {
+    try {
+      const safeAddr = accountAddress ? accountAddress.replace(/[^a-zA-Z0-9_]/g, "_") : "anon";
+      const raw = window.localStorage.getItem(CHAT_THREAD_NONCE_STORAGE_KEY);
+      const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+      const map: Record<string, unknown> = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+      const existing = typeof map[safeAddr] === "string" ? String(map[safeAddr]) : "";
+      setThreadNonce(existing.trim() || "0");
+    } catch {
+      setThreadNonce("0");
+    }
+    didInitialScrollRef.current = false;
+  }, [accountAddress]);
 
   useEffect(() => {
     try {
@@ -294,7 +317,57 @@ export default function ChatPage() {
     }
   }, [messages, threadId, hydrated]);
 
+  useEffect(() => {
+    if (!hydrated) return;
+    if (!messages.length) return;
+    if (didInitialScrollRef.current) return;
+    didInitialScrollRef.current = true;
+    // Scroll the page so the latest message is visible after refresh.
+    requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" }));
+  }, [hydrated, messages.length]);
+
   const canSend = useMemo(() => input.trim().length > 0 && !busy, [input, busy]);
+
+  function clearChat() {
+    const safeAddr = accountAddress ? accountAddress.replace(/[^a-zA-Z0-9_]/g, "_") : "anon";
+    const prevTid = threadId || "thr_demo";
+    const nextNonce = Date.now().toString(36);
+    try {
+      const raw = window.localStorage.getItem(CHAT_THREAD_NONCE_STORAGE_KEY);
+      const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+      const map: Record<string, unknown> = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+      map[safeAddr] = nextNonce;
+      window.localStorage.setItem(CHAT_THREAD_NONCE_STORAGE_KEY, JSON.stringify(map));
+    } catch {
+      // ignore
+    }
+    try {
+      const raw = window.localStorage.getItem(CHAT_THREADS_STORAGE_KEY);
+      const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+      const map: Record<string, unknown> = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+      delete map[prevTid];
+      window.localStorage.setItem(CHAT_THREADS_STORAGE_KEY, JSON.stringify(map));
+    } catch {
+      // ignore
+    }
+    try {
+      const raw = window.localStorage.getItem(GOAL_BUNDLE_STORAGE_KEY);
+      const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+      const map: Record<string, unknown> = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+      delete map[prevTid];
+      window.localStorage.setItem(GOAL_BUNDLE_STORAGE_KEY, JSON.stringify(map));
+    } catch {
+      // ignore
+    }
+    setInput("");
+    setMessages([]);
+    setLastSuggestions(null);
+    setSkillsOpen(false);
+    setSkills(null);
+    setSkillsError(null);
+    setBusy(false);
+    setThreadNonce(nextNonce);
+  }
 
   async function send() {
     if (!canSend) return;
@@ -431,6 +504,12 @@ export default function ChatPage() {
             <h1 className="text-2xl font-semibold tracking-tight">Erie Rec Center Copilot</h1>
             <div className="flex items-center gap-2">
               <button
+                onClick={() => clearChat()}
+                className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
+              >
+                Clear
+              </button>
+              <button
                 onClick={() => void toggleSkills()}
                 className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
               >
@@ -510,6 +589,7 @@ export default function ChatPage() {
                 ) : null}
               </div>
             ))}
+            <div ref={bottomRef} />
           </div>
         </main>
 
