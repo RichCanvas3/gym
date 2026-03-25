@@ -12,6 +12,8 @@ type Status =
   | { kind: "not_connected"; detail: unknown }
   | { kind: "error"; error: string; detail?: unknown; hint?: unknown };
 
+type ErrMeta = { __detail__?: unknown; __hint__?: unknown };
+
 export default function GoogleCalendarConnectClient() {
   const { ready, authenticated, getAccessToken, login } = useAuth();
   const sp = useSearchParams();
@@ -27,12 +29,13 @@ export default function GoogleCalendarConnectClient() {
       headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
       body: JSON.stringify({}),
     });
-    const json = (await res.json().catch(() => ({}))) as any;
+    const json = (await res.json().catch(() => ({}))) as unknown;
+    const j = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
     if (!res.ok) {
-      const msg = typeof json?.error === "string" ? json.error : JSON.stringify(json).slice(0, 200);
+      const msg = typeof j?.error === "string" ? String(j.error) : JSON.stringify(json).slice(0, 200);
       throw new Error(msg || `HTTP ${res.status}`);
     }
-    const url = typeof json?.url === "string" ? json.url.trim() : "";
+    const url = typeof j?.url === "string" ? String(j.url).trim() : "";
     if (!url) throw new Error("Missing oauth url");
     window.location.href = url;
   }
@@ -47,25 +50,39 @@ export default function GoogleCalendarConnectClient() {
         const tok = await getAccessToken();
         if (!tok) throw new Error("Missing Privy access token");
         const res = await fetch("/api/googlecalendar/status", { headers: { authorization: `Bearer ${tok}` } });
-        const json = await res.json().catch(() => ({}));
+        const json = (await res.json().catch(() => ({}))) as unknown;
+        const j = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
         if (!res.ok) {
-          const err = typeof (json as any)?.error === "string" ? String((json as any).error) : "";
-          const detail = (json as any)?.detail;
-          const hint = (json as any)?.hint;
+          const err = typeof j?.error === "string" ? String(j.error) : "";
+          const detail = j?.detail;
+          const hint = j?.hint;
           const msg = err || `HTTP ${res.status}`;
           const extra = detail ? `\n${String(detail)}` : "";
           const extraHint = hint ? `\nHint: ${String(hint)}` : "";
           const e = new Error(`${msg}${extra}${extraHint}`.trim());
-          (e as any).__detail__ = detail;
-          (e as any).__hint__ = hint;
+          (e as Error & ErrMeta).__detail__ = detail;
+          (e as Error & ErrMeta).__hint__ = hint;
           throw e;
         }
-        if (json?.connected === true) setStatus({ kind: "connected", detail: json });
+        if (j?.connected === true) setStatus({ kind: "connected", detail: j });
         else setStatus({ kind: "not_connected", detail: json });
+
+        // Best-effort: auto-sync events after a successful connect redirect.
+        if (j?.connected === true && connectedHint) {
+          try {
+            await fetch("/api/googlecalendar/sync", {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
+              body: JSON.stringify({}),
+            });
+          } catch {
+            // ignore
+          }
+        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e ?? "");
-        const detail = (e as any)?.__detail__;
-        const hint = (e as any)?.__hint__;
+        const detail = (e as ErrMeta)?.__detail__;
+        const hint = (e as ErrMeta)?.__hint__;
         setStatus({ kind: "error", error: msg, ...(detail !== undefined ? { detail } : {}), ...(hint !== undefined ? { hint } : {}) });
       }
     }

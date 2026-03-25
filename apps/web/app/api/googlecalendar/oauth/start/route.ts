@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requirePrivyAuth } from "../../../_lib/privy";
+import { requirePrivyAuth, telegramUserIdForPrivyDid } from "../../../_lib/privy";
 
 type McpServerCfg = { url?: string; headers?: Record<string, string> };
 
@@ -39,10 +39,11 @@ function googleCalendarBaseUrl(): string {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function buildOauthStartUrl(accountAddress: string): string {
+function buildOauthStartUrl(accountAddress: string, telegramUserId: string | null): string {
   const base = googleCalendarBaseUrl();
   const u = new URL(`${base}/oauth/start`);
   u.searchParams.set("accountAddress", accountAddress);
+  if (telegramUserId && telegramUserId.trim()) u.searchParams.set("telegramUserId", telegramUserId.trim());
   return u.toString();
 }
 
@@ -50,13 +51,15 @@ export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
-  return NextResponse.json({ ok: true, url: buildOauthStartUrl(auth.accountAddress) });
+  const tg = await telegramUserIdForPrivyDid(auth.did);
+  return NextResponse.json({ ok: true, url: buildOauthStartUrl(auth.accountAddress, tg) });
 }
 
 // Browser navigations can't attach Authorization headers; keep GET for debugging only.
 export async function GET(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
-  return NextResponse.redirect(buildOauthStartUrl(auth.accountAddress), 302);
+  const tg = await telegramUserIdForPrivyDid(auth.did);
+  return NextResponse.redirect(buildOauthStartUrl(auth.accountAddress, tg), 302);
 }
 

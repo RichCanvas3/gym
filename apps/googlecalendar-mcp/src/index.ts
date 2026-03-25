@@ -59,6 +59,7 @@ async function ensureEventCacheTables(env: Env): Promise<void> {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS google_calendar_events (
       account_address TEXT NOT NULL,
+      telegram_user_id TEXT,
       calendar_id TEXT NOT NULL,
       event_id TEXT NOT NULL,
       start_iso TEXT,
@@ -75,6 +76,9 @@ async function ensureEventCacheTables(env: Env): Promise<void> {
   ).run();
   await env.DB.prepare(
     `CREATE INDEX IF NOT EXISTS idx_google_calendar_events_start ON google_calendar_events(account_address, start_ms)`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_google_calendar_events_tg_start ON google_calendar_events(telegram_user_id, start_ms)`,
   ).run();
 }
 
@@ -133,6 +137,28 @@ function bytesToB64(bytes: Uint8Array): string {
   let s = "";
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
   return btoa(s);
+}
+
+async function ensureSchema(env: Env): Promise<void> {
+  // Best-effort lightweight migrations. D1/SQLite doesn't support ADD COLUMN IF NOT EXISTS.
+  const stmts = [
+    `CREATE TABLE IF NOT EXISTS google_oauth_states (state TEXT PRIMARY KEY, account_address TEXT NOT NULL, telegram_user_id TEXT, created_at_iso TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS idx_google_oauth_states_created ON google_oauth_states(created_at_iso)`,
+    `CREATE TABLE IF NOT EXISTS google_calendar_connections (account_address TEXT PRIMARY KEY, telegram_user_id TEXT, google_sub TEXT, google_email TEXT, refresh_token_enc TEXT NOT NULL, scope TEXT, token_type TEXT, access_token TEXT, expiry_date_ms INTEGER, created_at_iso TEXT NOT NULL, updated_at_iso TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS idx_google_calendar_connections_tg ON google_calendar_connections(telegram_user_id)`,
+    // Add columns to existing tables if they predate telegram support.
+    `ALTER TABLE google_oauth_states ADD COLUMN telegram_user_id TEXT`,
+    `ALTER TABLE google_calendar_connections ADD COLUMN telegram_user_id TEXT`,
+    `ALTER TABLE google_calendar_events ADD COLUMN telegram_user_id TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_google_calendar_events_tg_start ON google_calendar_events(telegram_user_id, start_ms)`,
+  ];
+  for (const sql of stmts) {
+    try {
+      await env.DB.prepare(sql).run();
+    } catch {
+      // ignore (already exists / cannot alter)
+    }
+  }
 }
 
 async function encryptToken(env: Env, plaintext: string): Promise<string> {
@@ -236,6 +262,36 @@ async function getAccessTokenForAccount(env: Env, accountAddress: string): Promi
   return newAccess;
 }
 
+async function accountAddressForTelegramUserId(env: Env, telegramUserId: string): Promise<string> {
+  const tg = String(telegramUserId ?? "").trim();
+  if (!tg) throw new Error("Missing telegramUserId");
+  const row = await env.DB.prepare(
+    `SELECT account_address FROM google_calendar_connections WHERE telegram_user_id = ? LIMIT 1`,
+  )
+    .bind(tg)
+    .first<{ account_address: string }>();
+  const acct = row?.account_address ? String(row.account_address) : "";
+  if (!acct) throw new Error("No Google Calendar connection for telegramUserId");
+  return acct;
+}
+
+async function resolveAccountAddress(env: Env, args: { accountAddress?: string; telegramUserId?: string }): Promise<{ accountAddress: string; telegramUserId: string | null }> {
+  const acct = (args.accountAddress ?? "").trim();
+  const tg = (args.telegramUserId ?? "").trim();
+  if (acct) {
+    const row = await env.DB.prepare(`SELECT telegram_user_id FROM google_calendar_connections WHERE account_address = ? LIMIT 1`)
+      .bind(acct)
+      .first<{ telegram_user_id: string | null }>();
+    const tg2 = row?.telegram_user_id ? String(row.telegram_user_id) : "";
+    return { accountAddress: acct, telegramUserId: tg2 || null };
+  }
+  if (tg) {
+    const accountAddress = await accountAddressForTelegramUserId(env, tg);
+    return { accountAddress, telegramUserId: tg };
+  }
+  throw new Error("Provide accountAddress or telegramUserId");
+}
+
 function createServer(env: Env) {
   const server = new McpServer({ name: "Google Calendar MCP", version: "0.1.0" });
 
@@ -246,13 +302,16 @@ function createServer(env: Env) {
   server.tool(
     "googlecalendar_get_connection_status",
     "Check whether an accountAddress has connected Google Calendar.",
-    { accountAddress: z.string().min(3) },
+    { accountAddress: z.string().min(3).optional(), telegramUserId: z.string().min(3).optional() },
     async (args) => {
-      const p = z.object({ accountAddress: z.string().min(3) }).parse(args);
+      await ensureSchema(env);
+      const p = z.object({ accountAddress: z.string().min(3).optional(), telegramUserId: z.string().min(3).optional() }).parse(args);
+      const resolved = await resolveAccountAddress(env, { accountAddress: p.accountAddress, telegramUserId: p.telegramUserId }).catch(() => null);
+      const accountAddress = resolved?.accountAddress ?? (p.accountAddress ?? "").trim();
       const row = await env.DB.prepare(
-        `SELECT account_address, google_email, google_sub, scope, updated_at_iso FROM google_calendar_connections WHERE account_address = ? LIMIT 1`,
+        `SELECT account_address, telegram_user_id, google_email, google_sub, scope, updated_at_iso FROM google_calendar_connections WHERE account_address = ? LIMIT 1`,
       )
-        .bind(p.accountAddress)
+        .bind(accountAddress)
         .first();
       const connected = Boolean(row);
       return {
@@ -261,7 +320,8 @@ function createServer(env: Env) {
             type: "text",
             text: jsonText({
               connected,
-              accountAddress: p.accountAddress,
+              accountAddress: accountAddress || null,
+              telegramUserId: row ? (String((row as any).telegram_user_id ?? "") || null) : null,
               googleEmail: row ? ((row as any).google_email ? String((row as any).google_email) : null) : null,
               googleSub: row ? ((row as any).google_sub ? String((row as any).google_sub) : null) : null,
               scope: row ? ((row as any).scope ? String((row as any).scope) : null) : null,
@@ -304,10 +364,12 @@ function createServer(env: Env) {
   server.tool(
     "googlecalendar_list_calendars",
     "List the user's calendars (id, summary). Use this to find the calendar id for a named calendar like 'myclaw' so you can set TARGET_CALENDAR_ID.",
-    { accountAddress: z.string().min(3) },
+    { accountAddress: z.string().min(3).optional(), telegramUserId: z.string().min(3).optional() },
     async (args) => {
-      const p = z.object({ accountAddress: z.string().min(3) }).parse(args);
-      const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
+      await ensureSchema(env);
+      const p = z.object({ accountAddress: z.string().min(3).optional(), telegramUserId: z.string().min(3).optional() }).parse(args);
+      const resolved = await resolveAccountAddress(env, { accountAddress: p.accountAddress, telegramUserId: p.telegramUserId });
+      const accessToken = await getAccessTokenForAccount(env, resolved.accountAddress);
       const res = await fetch("https://www.googleapis.com/calendar/v3/users/me/calendarList", {
         headers: { authorization: `Bearer ${accessToken}` },
       });
@@ -322,23 +384,27 @@ function createServer(env: Env) {
     "googlecalendar_list_events",
     "List events on the target calendar (primary, or TARGET_CALENDAR_ID if set, e.g. myclaw) in a time window.",
     {
-      accountAddress: z.string().min(3),
+      accountAddress: z.string().min(3).optional(),
+      telegramUserId: z.string().min(3).optional(),
       timeMinISO: z.string().min(10),
       timeMaxISO: z.string().min(10),
       q: z.string().optional(),
       maxResults: z.number().int().positive().max(50).optional(),
     },
     async (args) => {
+      await ensureSchema(env);
       const p = z
         .object({
-          accountAddress: z.string().min(3),
+          accountAddress: z.string().min(3).optional(),
+          telegramUserId: z.string().min(3).optional(),
           timeMinISO: z.string().min(10),
           timeMaxISO: z.string().min(10),
           q: z.string().optional(),
           maxResults: z.number().int().positive().max(50).optional(),
         })
         .parse(args);
-      const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
+      const resolved = await resolveAccountAddress(env, { accountAddress: p.accountAddress, telegramUserId: p.telegramUserId });
+      const accessToken = await getAccessTokenForAccount(env, resolved.accountAddress);
       const calendarId = calendarIdForApiPath(getTargetCalendarId(env));
       const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`);
       url.searchParams.set("timeMin", p.timeMinISO);
@@ -358,7 +424,8 @@ function createServer(env: Env) {
     "googlecalendar_sync_events",
     "Fetch events from Google and upsert them into D1 for cached retrieval.",
     {
-      accountAddress: z.string().min(3),
+      accountAddress: z.string().min(3).optional(),
+      telegramUserId: z.string().min(3).optional(),
       timeMinISO: z.string().min(10),
       timeMaxISO: z.string().min(10),
       q: z.string().optional(),
@@ -367,15 +434,18 @@ function createServer(env: Env) {
     async (args) => {
       const p = z
         .object({
-          accountAddress: z.string().min(3),
+          accountAddress: z.string().min(3).optional(),
+          telegramUserId: z.string().min(3).optional(),
           timeMinISO: z.string().min(10),
           timeMaxISO: z.string().min(10),
           q: z.string().optional(),
           maxResults: z.number().int().positive().max(2500).optional(),
         })
         .parse(args);
+      await ensureSchema(env);
       await ensureEventCacheTables(env);
-      const accessToken = await getAccessTokenForAccount(env, p.accountAddress);
+      const resolved = await resolveAccountAddress(env, { accountAddress: p.accountAddress, telegramUserId: p.telegramUserId });
+      const accessToken = await getAccessTokenForAccount(env, resolved.accountAddress);
       const calendarIdRaw = getTargetCalendarId(env);
       const calendarId = calendarIdForApiPath(calendarIdRaw);
       const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`);
@@ -400,12 +470,13 @@ function createServer(env: Env) {
         const endMs = isoToMs(endIso);
         await env.DB.prepare(
           `INSERT INTO google_calendar_events (
-            account_address, calendar_id, event_id,
+            account_address, telegram_user_id, calendar_id, event_id,
             start_iso, end_iso, start_ms, end_ms,
             summary, description, status,
             updated_at_iso, raw_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(account_address, calendar_id, event_id) DO UPDATE SET
+            telegram_user_id=excluded.telegram_user_id,
             start_iso=excluded.start_iso,
             end_iso=excluded.end_iso,
             start_ms=excluded.start_ms,
@@ -417,7 +488,8 @@ function createServer(env: Env) {
             raw_json=excluded.raw_json`,
         )
           .bind(
-            p.accountAddress,
+            resolved.accountAddress,
+            resolved.telegramUserId,
             calendarIdRaw,
             eventId,
             startIso,
@@ -441,7 +513,8 @@ function createServer(env: Env) {
     "googlecalendar_list_events_cached",
     "List cached events from D1 (populated via googlecalendar_sync_events).",
     {
-      accountAddress: z.string().min(3),
+      accountAddress: z.string().min(3).optional(),
+      telegramUserId: z.string().min(3).optional(),
       timeMinISO: z.string().min(10),
       timeMaxISO: z.string().min(10),
       q: z.string().optional(),
@@ -450,13 +523,15 @@ function createServer(env: Env) {
     async (args) => {
       const p = z
         .object({
-          accountAddress: z.string().min(3),
+          accountAddress: z.string().min(3).optional(),
+          telegramUserId: z.string().min(3).optional(),
           timeMinISO: z.string().min(10),
           timeMaxISO: z.string().min(10),
           q: z.string().optional(),
           maxResults: z.number().int().positive().max(200).optional(),
         })
         .parse(args);
+      await ensureSchema(env);
       await ensureEventCacheTables(env);
       const calendarIdRaw = getTargetCalendarId(env);
       const t0 = Date.parse(p.timeMinISO);
@@ -464,20 +539,38 @@ function createServer(env: Env) {
       const minMs = Number.isFinite(t0) ? t0 : 0;
       const maxMs = Number.isFinite(t1) ? t1 : Date.now() + 365 * 24 * 3600 * 1000;
       const q = (p.q ?? "").trim().toLowerCase();
-      const res = await env.DB.prepare(
-        `SELECT event_id, start_iso, end_iso, start_ms, end_ms, summary, description, status, raw_json
-         FROM google_calendar_events
-         WHERE account_address = ?
-           AND calendar_id = ?
-           AND start_ms IS NOT NULL
-           AND start_ms >= ?
-           AND start_ms < ?
-         ORDER BY start_ms ASC
-         LIMIT ?`,
-      )
-        .bind(p.accountAddress, calendarIdRaw, minMs, maxMs, p.maxResults ?? 50)
-        .all();
-      let events = (res.results ?? []) as any[];
+      let eventsRes: any;
+      if (p.telegramUserId && p.telegramUserId.trim()) {
+        eventsRes = await env.DB.prepare(
+          `SELECT event_id, start_iso, end_iso, start_ms, end_ms, summary, description, status, raw_json
+           FROM google_calendar_events
+           WHERE telegram_user_id = ?
+             AND calendar_id = ?
+             AND start_ms IS NOT NULL
+             AND start_ms >= ?
+             AND start_ms < ?
+           ORDER BY start_ms ASC
+           LIMIT ?`,
+        )
+          .bind(p.telegramUserId.trim(), calendarIdRaw, minMs, maxMs, p.maxResults ?? 50)
+          .all();
+      } else {
+        const resolved = await resolveAccountAddress(env, { accountAddress: p.accountAddress, telegramUserId: undefined });
+        eventsRes = await env.DB.prepare(
+          `SELECT event_id, start_iso, end_iso, start_ms, end_ms, summary, description, status, raw_json
+           FROM google_calendar_events
+           WHERE account_address = ?
+             AND calendar_id = ?
+             AND start_ms IS NOT NULL
+             AND start_ms >= ?
+             AND start_ms < ?
+           ORDER BY start_ms ASC
+           LIMIT ?`,
+        )
+          .bind(resolved.accountAddress, calendarIdRaw, minMs, maxMs, p.maxResults ?? 50)
+          .all();
+      }
+      let events = (eventsRes.results ?? []) as any[];
       if (q) {
         events = events.filter((e) => String(e?.summary ?? "").toLowerCase().includes(q) || String(e?.description ?? "").toLowerCase().includes(q));
       }
@@ -610,14 +703,16 @@ async function handleOAuthStart(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const accountAddress = (url.searchParams.get("accountAddress") ?? "").trim();
   if (accountAddress.length < 3) return new Response("Missing accountAddress", { status: 400 });
+  const telegramUserId = (url.searchParams.get("telegramUserId") ?? "").trim() || null;
 
   const clientId = (env.GOOGLE_CLIENT_ID ?? "").trim();
   const redirectUri = (env.OAUTH_REDIRECT_URL ?? "").trim();
   if (!clientId || !redirectUri) return new Response("Missing GOOGLE_CLIENT_ID or OAUTH_REDIRECT_URL", { status: 500 });
 
   const state = `st_${crypto.randomUUID()}`;
-  await env.DB.prepare(`INSERT INTO google_oauth_states (state, account_address, created_at_iso) VALUES (?, ?, ?)`)
-    .bind(state, accountAddress, nowISO())
+  await ensureSchema(env);
+  await env.DB.prepare(`INSERT INTO google_oauth_states (state, account_address, telegram_user_id, created_at_iso) VALUES (?, ?, ?, ?)`)
+    .bind(state, accountAddress, telegramUserId, nowISO())
     .run();
 
   const scopes = [
@@ -645,9 +740,13 @@ async function handleOAuthCallback(request: Request, env: Env): Promise<Response
   const state = (url.searchParams.get("state") ?? "").trim();
   if (!code || !state) return new Response("Missing code/state", { status: 400 });
 
-  const st = await env.DB.prepare(`SELECT account_address FROM google_oauth_states WHERE state = ? LIMIT 1`).bind(state).first();
+  await ensureSchema(env);
+  const st = await env.DB.prepare(`SELECT account_address, telegram_user_id FROM google_oauth_states WHERE state = ? LIMIT 1`)
+    .bind(state)
+    .first();
   if (!st) return new Response("Invalid state", { status: 400 });
   const accountAddress = String((st as any).account_address ?? "");
+  const telegramUserId = (st as any).telegram_user_id ? String((st as any).telegram_user_id) : null;
 
   const token = await googleTokenExchange(env, code);
   const refresh = (token.refresh_token ?? "").trim();
@@ -671,9 +770,10 @@ async function handleOAuthCallback(request: Request, env: Env): Promise<Response
   const ts = nowISO();
   await env.DB.prepare(
     `INSERT INTO google_calendar_connections (
-      account_address, google_sub, google_email, refresh_token_enc, scope, token_type, access_token, expiry_date_ms, created_at_iso, updated_at_iso
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      account_address, telegram_user_id, google_sub, google_email, refresh_token_enc, scope, token_type, access_token, expiry_date_ms, created_at_iso, updated_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(account_address) DO UPDATE SET
+      telegram_user_id=excluded.telegram_user_id,
       google_sub=excluded.google_sub,
       google_email=excluded.google_email,
       refresh_token_enc=excluded.refresh_token_enc,
@@ -685,6 +785,7 @@ async function handleOAuthCallback(request: Request, env: Env): Promise<Response
   )
     .bind(
       accountAddress,
+      telegramUserId,
       sub,
       email,
       enc,

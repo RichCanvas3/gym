@@ -8,6 +8,11 @@ export type Env = {
   SYNC_TZ_NAME?: string;
   SYNC_LOOKBACK_DAYS?: string;
 
+  // Optional: Google Calendar cache sync (uses googlecalendar-mcp).
+  GCAL_SYNC_ENABLED?: string;
+  GCAL_SYNC_LOOKBACK_DAYS?: string;
+  GCAL_SYNC_LOOKAHEAD_DAYS?: string;
+
   // Optional: GraphDB sync (FitnessCore KB graph). Enabled when GRAPHDB_SYNC_ENABLED=1.
   GRAPHDB_SYNC_ENABLED?: string;
   GRAPHDB_CONTEXT_BASE?: string;
@@ -22,6 +27,7 @@ export type Env = {
   TELEGRAM_MCP: Service;
   WEIGHT_MCP: Service;
   STRAVA_MCP: Service;
+  GOOGLECAL_MCP: Service;
 
   // Optional: LLM kcal estimation during GraphDB sync
   OPENAI_API_KEY?: string;
@@ -142,6 +148,48 @@ function fmtWorkoutLine(wk: any): string {
 function truthy(s: string | undefined): boolean {
   const v = (s ?? "").trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
+}
+
+function safeDays(s: string | undefined, fallback: number): number {
+  const n = Number(String(s ?? "").trim());
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback;
+}
+
+async function syncGoogleCalendar(env: Env) {
+  const apiKey = (env.MCP_API_KEY ?? "").trim() || undefined;
+  if (!truthy(env.GCAL_SYNC_ENABLED)) return { ok: true, skipped: true };
+
+  const lookbackDays = safeDays(env.GCAL_SYNC_LOOKBACK_DAYS, 30);
+  const lookaheadDays = safeDays(env.GCAL_SYNC_LOOKAHEAD_DAYS, 90);
+  const now = Date.now();
+  const timeMinISO = new Date(now - lookbackDays * 24 * 3600 * 1000).toISOString();
+  const timeMaxISO = new Date(now + lookaheadDays * 24 * 3600 * 1000).toISOString();
+
+  const idsOut = await mcpCall(env.TELEGRAM_MCP, apiKey, "telegram_list_unique_user_ids", { limit: 200 });
+  const raw: unknown[] = Array.isArray((idsOut as any)?.userIds) ? ((idsOut as any).userIds as unknown[]) : [];
+  const ids: string[] = raw
+    .map((x) => String(x ?? "").trim())
+    .filter((s): s is string => Boolean(s && s.trim()))
+    .filter(plausibleTelegramUserId);
+  const tgUserIds = Array.from(new Set(ids));
+
+  let syncedUsers = 0;
+  const errors: Array<{ telegramUserId: string; error: string }> = [];
+  for (const tgUserId of tgUserIds) {
+    try {
+      await mcpCall(env.GOOGLECAL_MCP, apiKey, "googlecalendar_sync_events", {
+        telegramUserId: tgUserId,
+        timeMinISO,
+        timeMaxISO,
+        maxResults: 2500,
+      });
+      syncedUsers += 1;
+    } catch (e) {
+      errors.push({ telegramUserId: tgUserId, error: String((e as any)?.message ?? e) });
+    }
+  }
+
+  return { ok: errors.length === 0, asOfISO: nowISO(), timeMinISO, timeMaxISO, totalUsers: tgUserIds.length, syncedUsers, errors: errors.slice(0, 5) };
 }
 
 function b64(s: string): string {
@@ -654,8 +702,9 @@ async function runCron(env: Env) {
   const t0 = Date.now();
   const tg = await syncTelegram(env).catch((e) => ({ ok: false, error: String((e as any)?.message ?? e) }));
   const st = await syncStrava(env).catch((e) => ({ ok: false, error: String((e as any)?.message ?? e) }));
+  const gc = await syncGoogleCalendar(env).catch((e) => ({ ok: false, error: String((e as any)?.message ?? e) }));
   const kb = await syncFitnesscoreGraphDb(env).catch((e) => ({ ok: false, error: String((e as any)?.message ?? e) }));
-  return { ok: true, asOfISO: nowISO(), ms: Date.now() - t0, telegram: tg, strava: st, graphdb: kb };
+  return { ok: true, asOfISO: nowISO(), ms: Date.now() - t0, telegram: tg, strava: st, googlecalendar: gc, graphdb: kb };
 }
 
 export default {

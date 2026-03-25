@@ -40,6 +40,17 @@ type GymClass = {
   };
 };
 
+type GoogleEvent = {
+  event_id: string;
+  start_iso?: string | null;
+  end_iso?: string | null;
+  start_ms?: number | null;
+  end_ms?: number | null;
+  summary?: string | null;
+  description?: string | null;
+  status?: string | null;
+};
+
 function startOfDayISO(d: Date) {
   const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0));
   return x.toISOString().slice(0, 10);
@@ -71,6 +82,15 @@ function formatMonthDay(isoDate: string) {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
 }
 
+function formatEventWhen(startIso: string | null | undefined) {
+  const s = (startIso ?? "").trim();
+  if (!s) return "";
+  if (!s.includes("T")) return s;
+  const d = new Date(s);
+  if (!Number.isFinite(d.getTime())) return s;
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(d);
+}
+
 type Filters = {
   type: "all" | "group" | "private";
   skill: "all" | "beginner" | "intermediate" | "advanced";
@@ -87,6 +107,8 @@ function CalendarInner() {
   const [classes, setClasses] = useState<GymClass[]>([]);
   const [classAsOfISO, setClassAsOfISO] = useState<string>("");
   const [weatherErr, setWeatherErr] = useState<string>("");
+  const [privateEvents, setPrivateEvents] = useState<GoogleEvent[]>([]);
+  const [privateEventsErr, setPrivateEventsErr] = useState<string>("");
   const [reserveBusyId, setReserveBusyId] = useState<string>("");
   const [reserveMsg, setReserveMsg] = useState<string>("");
   const [clientTz, setClientTz] = useState<string>("America/Denver");
@@ -199,7 +221,34 @@ function CalendarInner() {
     return () => {
       cancelled = true;
     };
-  }, [weekStartISO, authenticated, getAccessToken, clientTz]);
+  }, [weekStartISO, authenticated, getAccessToken, clientTz, logout]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      if (!authenticated) return;
+      setPrivateEventsErr("");
+      const tok = await getAccessToken();
+      if (!tok) return;
+      const res = await fetch(`/api/googlecalendar/events/week?start=${encodeURIComponent(weekStartISO)}`, {
+        cache: "no-store",
+        headers: { authorization: `Bearer ${tok}` },
+      });
+      const json = (await res.json().catch(() => ({}))) as unknown;
+      const j = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+      if (!res.ok) {
+        if (!cancelled) setPrivateEventsErr(String(j?.error ?? j?.detail ?? "Private calendar fetch failed."));
+        if (res.status === 401) logout();
+        return;
+      }
+      const events = Array.isArray(j?.events) ? (j.events as GoogleEvent[]) : [];
+      if (!cancelled) setPrivateEvents(events);
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [weekStartISO, authenticated, getAccessToken, logout]);
 
   const reservationsByClassId = useMemo(() => {
     const map = new Map<string, string>();
@@ -392,6 +441,38 @@ function CalendarInner() {
                 Reserved
               </button>
             </div>
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-sm font-medium">Private calendar (Google)</div>
+            <Link
+              href="/googlecalendar/connect"
+              className="text-xs font-medium text-zinc-700 underline underline-offset-4 dark:text-zinc-300"
+            >
+              Connect / status
+            </Link>
+          </div>
+          {privateEventsErr ? <div className="mt-2 text-xs text-red-600 dark:text-red-400">{privateEventsErr}</div> : null}
+          <div className="mt-3 flex flex-col gap-2">
+            {privateEvents.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-zinc-200 p-3 text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-500">
+                No cached events for this week yet. (Connect triggers a sync; cron also syncs periodically.)
+              </div>
+            ) : (
+              privateEvents.slice(0, 20).map((e) => (
+                <div key={e.event_id} className="rounded-xl border border-zinc-200 p-3 text-xs dark:border-white/10">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0 truncate font-medium">{String(e.summary ?? "Untitled")}</div>
+                    <div className="shrink-0 text-[11px] text-zinc-600 dark:text-zinc-400">{formatEventWhen(e.start_iso ?? null)}</div>
+                  </div>
+                  {e.description ? (
+                    <div className="mt-1 line-clamp-2 text-[11px] text-zinc-600 dark:text-zinc-400">{String(e.description)}</div>
+                  ) : null}
+                </div>
+              ))
+            )}
           </div>
         </section>
 
