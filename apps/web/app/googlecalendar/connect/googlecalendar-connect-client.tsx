@@ -10,7 +10,7 @@ type Status =
   | { kind: "loading" }
   | { kind: "connected"; detail: unknown }
   | { kind: "not_connected"; detail: unknown }
-  | { kind: "error"; error: string };
+  | { kind: "error"; error: string; detail?: unknown; hint?: unknown };
 
 export default function GoogleCalendarConnectClient() {
   const { ready, authenticated, getAccessToken, login } = useAuth();
@@ -31,13 +31,24 @@ export default function GoogleCalendarConnectClient() {
         const res = await fetch("/api/googlecalendar/status", { headers: { authorization: `Bearer ${tok}` } });
         const json = await res.json().catch(() => ({}));
         if (!res.ok) {
-          const msg = typeof json?.error === "string" ? json.error : JSON.stringify(json).slice(0, 300);
-          throw new Error(msg || `HTTP ${res.status}`);
+          const err = typeof (json as any)?.error === "string" ? String((json as any).error) : "";
+          const detail = (json as any)?.detail;
+          const hint = (json as any)?.hint;
+          const msg = err || `HTTP ${res.status}`;
+          const extra = detail ? `\n${String(detail)}` : "";
+          const extraHint = hint ? `\nHint: ${String(hint)}` : "";
+          const e = new Error(`${msg}${extra}${extraHint}`.trim());
+          (e as any).__detail__ = detail;
+          (e as any).__hint__ = hint;
+          throw e;
         }
         if (json?.connected === true) setStatus({ kind: "connected", detail: json });
         else setStatus({ kind: "not_connected", detail: json });
       } catch (e) {
-        setStatus({ kind: "error", error: e instanceof Error ? e.message : String(e ?? "") });
+        const msg = e instanceof Error ? e.message : String(e ?? "");
+        const detail = (e as any)?.__detail__;
+        const hint = (e as any)?.__hint__;
+        setStatus({ kind: "error", error: msg, ...(detail !== undefined ? { detail } : {}), ...(hint !== undefined ? { hint } : {}) });
       }
     }
 
@@ -102,6 +113,14 @@ export default function GoogleCalendarConnectClient() {
           <div className="mt-2">
             <div className="font-semibold text-red-700 dark:text-red-400">Error</div>
             <div className="mt-1 font-mono text-[11px] text-zinc-700 dark:text-zinc-300">{status.error}</div>
+            <button
+              onClick={() => {
+                window.location.href = "/api/googlecalendar/oauth/start";
+              }}
+              className="mt-3 h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
+            >
+              Try connect anyway
+            </button>
           </div>
         ) : null}
       </div>
