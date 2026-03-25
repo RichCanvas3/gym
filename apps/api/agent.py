@@ -689,6 +689,29 @@ def _fmt_local_time_from_iso(iso: str, tz_name: str) -> str:
         return s
 
 
+def _gcal_local_date_time(start_iso: str, tz_name: str) -> tuple[str, str]:
+    """
+    Returns (local_date_iso, time_label).
+    - dateTime -> ("YYYY-MM-DD", "H:MM AM/PM")
+    - all-day date -> ("YYYY-MM-DD", "all-day")
+    """
+    s = str(start_iso or "").strip()
+    if not s:
+        return "", ""
+    # all-day events store just YYYY-MM-DD
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        return s, "all-day"
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        tz = ZoneInfo(tz_name or "UTC")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(tz)
+        return local.date().isoformat(), local.strftime("%-I:%M %p")
+    except Exception:
+        return "", ""
+
+
 def _looks_like_gcal_events_query(mlow: str) -> bool:
     s = (mlow or "").strip()
     if not s:
@@ -1844,13 +1867,16 @@ async def run(input: Input) -> Output:
                     safe.append({"role": role, "content": content})
         return Output(answer="", citations=[], data={"messages": safe})
 
-    # Google Calendar (private): list events for today/tomorrow/yesterday.
-    if (not msg.startswith("__")) and _looks_like_gcal_events_query(mlow) and any(k in mlow for k in ["today", "tomorrow", "yesterday", "events"]):
+    # Google Calendar (private): list events for a day or a period window (week/month).
+    if (not msg.startswith("__")) and _looks_like_gcal_events_query(mlow) and ("event" in mlow or "events" in mlow):
         tz_name = (input.session.timezone if input.session and isinstance(input.session.timezone, str) else "") or "America/Denver"
         tz = ZoneInfo(tz_name or "UTC")
-        date_iso = _explicit_date_iso_from_text(msg)
         base = datetime.now(tz=tz).date()
-        if not date_iso:
+        explicit_date = _explicit_date_iso_from_text(msg)
+        wants_day = bool(explicit_date) or any(k in mlow for k in ["today", "tomorrow", "yesterday"])
+        wants_period = ("month" in mlow) or ("week" in mlow) or ("last month" in mlow) or ("this month" in mlow) or ("last week" in mlow) or ("this week" in mlow)
+        date_iso = explicit_date
+        if wants_day and not date_iso:
             if "yesterday" in mlow:
                 date_iso = (base - timedelta(days=1)).isoformat()
             elif "tomorrow" in mlow:
@@ -1880,36 +1906,56 @@ async def run(input: Input) -> Output:
                 data={"ok": False, "error": "googlecalendar_not_connected", "status": status},
             )
 
-        t0, t1 = _day_window_utc_from_local_date(date_iso, tz_name)
-        await _googlecalendar_call_json(
-            "googlecalendar_sync_events",
-            {"accountAddress": acct, "timeMinISO": t0, "timeMaxISO": t1, "maxResults": 2500},
-        )
-        cached = await _googlecalendar_call_json(
-            "googlecalendar_list_events_cached",
-            {"accountAddress": acct, "timeMinISO": t0, "timeMaxISO": t1, "maxResults": 200},
-        )
+        label = ""
+        if wants_period and not wants_day:
+            t0, t1, label = _resolve_period_window_utc(msg, tz_name)
+        else:
+            if not date_iso:
+                date_iso = base.isoformat()
+            t0, t1 = _day_window_utc_from_local_date(date_iso, tz_name)
+            label = date_iso
+
+        await _googlecalendar_call_json("googlecalendar_sync_events", {"accountAddress": acct, "timeMinISO": t0, "timeMaxISO": t1, "maxResults": 2500})
+        cached = await _googlecalendar_call_json("googlecalendar_list_events_cached", {"accountAddress": acct, "timeMinISO": t0, "timeMaxISO": t1, "maxResults": 500})
         events = cached.get("events") if isinstance(cached, dict) else None
         items: list[dict[str, Any]] = [e for e in events if isinstance(e, dict)] if isinstance(events, list) else []
         if not items:
-            answer = f"No Google Calendar events found for {date_iso} ({tz_name})."
+            answer = f"No Google Calendar events found for {label} ({tz_name})."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
-            return Output(answer=answer, citations=[], data={"ok": True, "dateISO": date_iso, "tzName": tz_name, "cached": cached})
+            return Output(answer=answer, citations=[], data={"ok": True, "label": label, "tzName": tz_name, "cached": cached})
 
-        lines = [f"Google Calendar events for {date_iso} ({tz_name}):"]
-        for e in items[:25]:
+        # Group by local date for period views.
+        by_day: dict[str, list[str]] = {}
+        for e in items:
             summary = str(e.get("summary") or "Untitled").strip()
             start_iso = str(e.get("start_iso") or e.get("startISO") or "").strip()
-            when = _fmt_local_time_from_iso(start_iso, tz_name) if start_iso else ""
-            lines.append(f"- {when + ' — ' if when else ''}{summary}")
+            d, tlabel = _gcal_local_date_time(start_iso, tz_name) if start_iso else ("", "")
+            if not d:
+                d = "unknown-date"
+            prefix = f"{tlabel} — " if tlabel and tlabel != "all-day" else ("all-day — " if tlabel == "all-day" else "")
+            by_day.setdefault(d, []).append(f"- {prefix}{summary}".rstrip())
+
+        lines = [f"Google Calendar events for {label} ({tz_name}):"]
+        shown = 0
+        for day in sorted(by_day.keys()):
+            lines.append(f"\n{day}:")
+            for ln in by_day[day][:50]:
+                lines.append(ln)
+                shown += 1
+                if shown >= 60:
+                    break
+            if shown >= 60:
+                break
+        if shown < len(items):
+            lines.append(f"\n(Showing {shown} of {len(items)} events)")
 
         answer = "\n".join(lines).strip()
         if thread_id:
             await _memory_append(thread_id, "user", msg)
             await _memory_append(thread_id, "assistant", answer)
-        return Output(answer=answer, citations=[], data={"ok": True, "dateISO": date_iso, "tzName": tz_name, "cached": cached})
+        return Output(answer=answer, citations=[], data={"ok": True, "label": label, "tzName": tz_name, "cached": cached})
 
     # UI helper: get current weight-management profile for this user.
     if msg == "__WEIGHT_PROFILE_GET__":

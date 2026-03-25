@@ -51,6 +51,10 @@ type GoogleEvent = {
   status?: string | null;
 };
 
+type CalendarItem =
+  | { kind: "class"; c: GymClass }
+  | { kind: "gcal"; e: GoogleEvent };
+
 type PrivateEventsMeta = {
   start?: string;
   end?: string;
@@ -98,6 +102,23 @@ function formatEventWhen(startIso: string | null | undefined) {
   const d = new Date(s);
   if (!Number.isFinite(d.getTime())) return s;
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(d);
+}
+
+function gcalDateKey(startIso: string | null | undefined) {
+  const s = (startIso ?? "").trim();
+  if (!s) return "";
+  if (!s.includes("T") && /^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s);
+  const ms = d.getTime();
+  if (!Number.isFinite(ms)) return "";
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function gcalTimeLabel(startIso: string | null | undefined) {
+  const s = (startIso ?? "").trim();
+  if (!s) return "";
+  if (!s.includes("T") && /^\d{4}-\d{2}-\d{2}$/.test(s)) return "All-day";
+  return formatLocalTime(s);
 }
 
 type Filters = {
@@ -289,21 +310,38 @@ function CalendarInner() {
     return out;
   }, [classes, filters, reservationsByClassId]);
 
+  const showPrivateCalendar = filters.type !== "group";
+
   const grouped = useMemo(() => {
-    const map = new Map<string, GymClass[]>();
+    const map = new Map<string, CalendarItem[]>();
     for (const d of weekDates) map.set(d, []);
     for (const c of filteredClasses) {
       const d = new Date(c.startTimeISO);
       const key = d.toISOString().slice(0, 10);
       const arr = map.get(key);
-      if (arr) arr.push(c);
+      if (arr) arr.push({ kind: "class", c });
+    }
+    if (showPrivateCalendar) {
+      for (const e of privateEvents) {
+        const key = gcalDateKey(e.start_iso ?? null);
+        const arr = map.get(key);
+        if (arr) arr.push({ kind: "gcal", e });
+      }
+    }
+    function itemStartMs(it: CalendarItem): number {
+      if (it.kind === "class") {
+        const ms = Date.parse(it.c.startTimeISO);
+        return Number.isFinite(ms) ? ms : 0;
+      }
+      const ms = typeof it.e.start_ms === "number" ? it.e.start_ms : Date.parse(String(it.e.start_iso ?? ""));
+      return Number.isFinite(ms) ? ms : 0;
     }
     for (const [k, arr] of map.entries()) {
-      arr.sort((a, b) => Date.parse(a.startTimeISO) - Date.parse(b.startTimeISO));
+      arr.sort((a, b) => itemStartMs(a) - itemStartMs(b));
       map.set(k, arr);
     }
     return [...map.entries()];
-  }, [filteredClasses, weekDates]);
+  }, [filteredClasses, weekDates, privateEvents, showPrivateCalendar]);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-black dark:text-zinc-50">
@@ -465,42 +503,44 @@ function CalendarInner() {
           </div>
         </section>
 
-        <section className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
-          <div className="flex items-center justify-between gap-3">
-            <div className="text-sm font-medium">Private calendar (Google)</div>
-            <Link
-              href="/googlecalendar/connect"
-              className="text-xs font-medium text-zinc-700 underline underline-offset-4 dark:text-zinc-300"
-            >
-              Connect / status
-            </Link>
-          </div>
-          <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-500">
-            Window: {privateEventsMeta.start ?? weekStartISO} → {privateEventsMeta.end ?? addDaysISO(weekStartISO, 7)} •{" "}
-            {privateEventsMeta.calendarId ? `calendarId=${privateEventsMeta.calendarId}` : "calendarId=? (check MCP config)"} •{" "}
-            {privateEventsMeta.asOfISO ? `as-of=${privateEventsMeta.asOfISO}` : ""}
-          </div>
-          {privateEventsErr ? <div className="mt-2 text-xs text-red-600 dark:text-red-400">{privateEventsErr}</div> : null}
-          <div className="mt-3 flex flex-col gap-2">
-            {privateEvents.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-zinc-200 p-3 text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-500">
-                No cached events for this week yet. (Connect triggers a sync; cron also syncs periodically.)
-              </div>
-            ) : (
-              privateEvents.slice(0, 20).map((e) => (
-                <div key={e.event_id} className="rounded-xl border border-zinc-200 p-3 text-xs dark:border-white/10">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0 truncate font-medium">{String(e.summary ?? "Untitled")}</div>
-                    <div className="shrink-0 text-[11px] text-zinc-600 dark:text-zinc-400">{formatEventWhen(e.start_iso ?? null)}</div>
-                  </div>
-                  {e.description ? (
-                    <div className="mt-1 line-clamp-2 text-[11px] text-zinc-600 dark:text-zinc-400">{String(e.description)}</div>
-                  ) : null}
+        {showPrivateCalendar ? (
+          <section className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-white/10 dark:bg-zinc-950">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-medium">Private calendar (Google)</div>
+              <Link
+                href="/googlecalendar/connect"
+                className="text-xs font-medium text-zinc-700 underline underline-offset-4 dark:text-zinc-300"
+              >
+                Connect / status
+              </Link>
+            </div>
+            <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-500">
+              Window: {privateEventsMeta.start ?? weekStartISO} → {privateEventsMeta.end ?? addDaysISO(weekStartISO, 7)} •{" "}
+              {privateEventsMeta.calendarId ? `calendarId=${privateEventsMeta.calendarId}` : "calendarId=? (check MCP config)"} •{" "}
+              {privateEventsMeta.asOfISO ? `as-of=${privateEventsMeta.asOfISO}` : ""}
+            </div>
+            {privateEventsErr ? <div className="mt-2 text-xs text-red-600 dark:text-red-400">{privateEventsErr}</div> : null}
+            <div className="mt-3 flex flex-col gap-2">
+              {privateEvents.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-zinc-200 p-3 text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-500">
+                  No cached events for this week yet. (Connect triggers a sync; cron also syncs periodically.)
                 </div>
-              ))
-            )}
-          </div>
-        </section>
+              ) : (
+                privateEvents.slice(0, 20).map((e) => (
+                  <div key={e.event_id} className="rounded-xl border border-zinc-200 p-3 text-xs dark:border-white/10">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 truncate font-medium">{String(e.summary ?? "Untitled")}</div>
+                      <div className="shrink-0 text-[11px] text-zinc-600 dark:text-zinc-400">{formatEventWhen(e.start_iso ?? null)}</div>
+                    </div>
+                    {e.description ? (
+                      <div className="mt-1 line-clamp-2 text-[11px] text-zinc-600 dark:text-zinc-400">{String(e.description)}</div>
+                    ) : null}
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+        ) : null}
 
         <main className="flex flex-col gap-4">
           {grouped.length === 0 ? (
@@ -528,7 +568,29 @@ function CalendarInner() {
                           —
                         </div>
                       ) : (
-                        items.map((c) => {
+                        items.map((it) => {
+                          if (it.kind === "gcal") {
+                            const when = gcalTimeLabel(it.e.start_iso ?? null);
+                            return (
+                              <div
+                                key={`gcal:${it.e.event_id}`}
+                                className="rounded-xl border border-sky-200 bg-sky-50 p-2 text-xs dark:border-sky-400/20 dark:bg-sky-400/10"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div className="flex items-center gap-1 text-[11px] font-medium text-sky-900 dark:text-sky-200">
+                                    <CalendarDays className="h-3.5 w-3.5" aria-hidden="true" />
+                                    Google
+                                  </div>
+                                  <div className="text-[11px] text-zinc-700 dark:text-zinc-300">{when}</div>
+                                </div>
+                                <div className="mt-1 break-words text-xs font-semibold leading-snug text-sky-950 dark:text-sky-100">
+                                  {String(it.e.summary ?? "Untitled")}
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          const c = it.c;
                           const isOutdoor = Boolean(c.isOutdoor);
                           const reservedId = reservationsByClassId.get(c.id);
                           const wf = c.weatherForecast;
