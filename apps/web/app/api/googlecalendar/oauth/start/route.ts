@@ -39,13 +39,24 @@ function googleCalendarBaseUrl(): string {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET(req: Request) {
+function buildOauthStartUrl(accountAddress: string): string {
+  const base = googleCalendarBaseUrl();
+  const u = new URL(`${base}/oauth/start`);
+  u.searchParams.set("accountAddress", accountAddress);
+  return u.toString();
+}
+
+export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
-  const base = googleCalendarBaseUrl();
-  const u = new URL(`${base}/oauth/start`);
-  u.searchParams.set("accountAddress", auth.accountAddress);
-  return NextResponse.redirect(u.toString(), 302);
+  return NextResponse.json({ ok: true, url: buildOauthStartUrl(auth.accountAddress) });
+}
+
+// Browser navigations can't attach Authorization headers; keep GET for debugging only.
+export async function GET(req: Request) {
+  const auth = await requirePrivyAuth(req);
+  if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+  return NextResponse.redirect(buildOauthStartUrl(auth.accountAddress), 302);
 }
 

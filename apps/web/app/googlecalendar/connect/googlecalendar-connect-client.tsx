@@ -19,6 +19,24 @@ export default function GoogleCalendarConnectClient() {
 
   const connectedHint = (sp?.get("googleCalendar") ?? "").trim() === "connected";
 
+  async function startOauth() {
+    const tok = await getAccessToken();
+    if (!tok) throw new Error("Missing Privy access token");
+    const res = await fetch("/api/googlecalendar/oauth/start", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
+      body: JSON.stringify({}),
+    });
+    const json = (await res.json().catch(() => ({}))) as any;
+    if (!res.ok) {
+      const msg = typeof json?.error === "string" ? json.error : JSON.stringify(json).slice(0, 200);
+      throw new Error(msg || `HTTP ${res.status}`);
+    }
+    const url = typeof json?.url === "string" ? json.url.trim() : "";
+    if (!url) throw new Error("Missing oauth url");
+    window.location.href = url;
+  }
+
   useEffect(() => {
     if (!ready) return;
     if (!authenticated) return;
@@ -98,9 +116,7 @@ export default function GoogleCalendarConnectClient() {
             <div className="text-zinc-600 dark:text-zinc-400">Not connected.</div>
             <button
               onClick={async () => {
-                const tok = await getAccessToken();
-                if (!tok) return;
-                window.location.href = "/api/googlecalendar/oauth/start";
+                await startOauth();
               }}
               className="mt-3 h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
             >
@@ -114,9 +130,7 @@ export default function GoogleCalendarConnectClient() {
             <div className="font-semibold text-red-700 dark:text-red-400">Error</div>
             <div className="mt-1 font-mono text-[11px] text-zinc-700 dark:text-zinc-300">{status.error}</div>
             <button
-              onClick={() => {
-                window.location.href = "/api/googlecalendar/oauth/start";
-              }}
+              onClick={async () => startOauth()}
               className="mt-3 h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
             >
               Try connect anyway
