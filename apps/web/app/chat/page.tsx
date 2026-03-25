@@ -437,6 +437,12 @@ export default function ChatPage() {
                 Skills
               </button>
               <Link
+                href="/googlecalendar/connect"
+                className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
+              >
+                Calendar
+              </Link>
+              <Link
                 href="/cart"
                 className="h-10 rounded-xl border border-zinc-200 px-3 text-sm font-medium leading-10 dark:border-white/10"
               >

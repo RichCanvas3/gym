@@ -52,6 +52,7 @@ export function AppHeader() {
   const resCount = reservations.length;
   const telegramUserId = useMemo(() => extractTelegramUserId(user), [user]);
   const [stravaConnected, setStravaConnected] = useState<boolean | null>(null);
+  const [googleCalendarConnected, setGoogleCalendarConnected] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -75,6 +76,29 @@ export function AppHeader() {
       cancelled = true;
     };
   }, [authenticated, telegramUserId, getAccessToken]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      if (!authenticated) {
+        if (!cancelled) setGoogleCalendarConnected(null);
+        return;
+      }
+      try {
+        const tok = await getAccessToken();
+        const res = await fetch("/api/googlecalendar/status", { headers: { authorization: `Bearer ${tok}` } });
+        const j = await res.json().catch(() => ({}));
+        const connected = Boolean(j?.connected === true || j?.ok === true);
+        if (!cancelled) setGoogleCalendarConnected(connected);
+      } catch {
+        if (!cancelled) setGoogleCalendarConnected(null);
+      }
+    }
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated, getAccessToken]);
 
   return (
     <div className="sticky top-0 z-20 border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-white/10 dark:bg-black/60">
@@ -135,12 +159,20 @@ export function AppHeader() {
           </div>
 
           {authenticated ? (
-            <Link
-              href="/strava/connect"
-              className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 inline-flex items-center"
-            >
-              {stravaConnected ? "Strava connected" : "Connect Strava"}
-            </Link>
+            <div className="flex items-center gap-2">
+              <Link
+                href="/strava/connect"
+                className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 inline-flex items-center"
+              >
+                {stravaConnected ? "Strava connected" : "Connect Strava"}
+              </Link>
+              <Link
+                href="/googlecalendar/connect"
+                className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 inline-flex items-center"
+              >
+                {googleCalendarConnected ? "GCal connected" : "Connect GCal"}
+              </Link>
+            </div>
           ) : null}
 
           <button
