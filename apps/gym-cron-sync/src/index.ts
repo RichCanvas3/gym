@@ -63,7 +63,13 @@ async function mcpCall(service: Service, apiKey: string | undefined, tool: strin
   });
   const msg = await readSseJson(res);
   const text = msg?.result?.content?.[0]?.text;
-  return typeof text === "string" ? JSON.parse(text) : msg;
+  if (typeof text !== "string") return msg;
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Some tools return plain-text errors in content[0].text.
+    return { ok: false, tool, text, raw: msg };
+  }
 }
 
 function asString(v: unknown): string {

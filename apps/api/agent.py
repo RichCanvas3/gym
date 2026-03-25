@@ -626,6 +626,30 @@ async def _weight_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[
         return None
 
 
+async def _googlecalendar_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    mcp_tools = await load_mcp_tools_from_env()
+    tool = next(
+        (
+            t
+            for t in mcp_tools
+            if isinstance(getattr(t, "name", None), str)
+            and (
+                t.name == f"googlecalendar_{tool_suffix}"
+                or t.name.endswith(f"_{tool_suffix}")
+                or t.name == tool_suffix
+            )
+        ),
+        None,
+    )
+    if not tool:
+        return None
+    try:
+        raw = await tool.ainvoke(args if isinstance(args, dict) else {})
+        return _tool_raw_to_json(raw)
+    except Exception:
+        return None
+
+
 async def _telegram_call_json(tool_suffix: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
     mcp_tools = await load_mcp_tools_from_env()
     tool = next(
@@ -648,6 +672,32 @@ async def _telegram_call_json(tool_suffix: str, args: dict[str, Any]) -> Optiona
         return _tool_raw_to_json(raw)
     except Exception:
         return None
+
+
+def _fmt_local_time_from_iso(iso: str, tz_name: str) -> str:
+    s = str(iso or "").strip()
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        tz = ZoneInfo(tz_name or "UTC")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(tz)
+        return local.strftime("%-I:%M %p")
+    except Exception:
+        return s
+
+
+def _looks_like_gcal_events_query(mlow: str) -> bool:
+    s = (mlow or "").strip()
+    if not s:
+        return False
+    if "google" in s or "gcal" in s or "private calendar" in s:
+        return True
+    if "calendar" in s and "event" in s:
+        return True
+    return False
 
 
 async def _memory_append(thread_id: str, role: str, content: str) -> None:
@@ -953,7 +1003,7 @@ def build_system_prompt() -> str:
             "- Use dayLabel/activity for whatever fits the domain (e.g. sprint name + task, week + deliverable, date + habit). Fill startTimeISO/endTimeISO when the user’s timezone and timing are known so calendar MCP can run.",
             "- Slash commands: `/goal status` dumps the bundle; `/goal tick` completes the next incomplete checklist item; `/goal tick N` or `/goal tick <substring>` matches row or label. `/goal set …` → merge into primaryGoal / focus via GoalBundleJSON.",
             "- Execution: when the user asks to put “this” or “the plan” on a calendar, use the checklist you or GoalBundle already defined—call Google Calendar MCP (e.g. googlecalendar_create_event) per item with the user’s accountAddress; don’t demand unrelated generic “event details”.",
-            "- If Calendar MCP isn’t connected, explain and point to /oauth/start?accountAddress=<their address>.",
+            "- If Google Calendar isn’t connected, tell them to use the web app’s `/googlecalendar/connect` page (requires Privy login).",
             "- Other integrations (email, class booking, scheduling, gym catalog) are tools toward the user’s stated outcomes—pick what fits their ask, not a fixed playbook.",
             "",
             "Keep responses concise and actionable.",
@@ -1793,6 +1843,73 @@ async def run(input: Input) -> Output:
                 if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
                     safe.append({"role": role, "content": content})
         return Output(answer="", citations=[], data={"messages": safe})
+
+    # Google Calendar (private): list events for today/tomorrow/yesterday.
+    if (not msg.startswith("__")) and _looks_like_gcal_events_query(mlow) and any(k in mlow for k in ["today", "tomorrow", "yesterday", "events"]):
+        tz_name = (input.session.timezone if input.session and isinstance(input.session.timezone, str) else "") or "America/Denver"
+        tz = ZoneInfo(tz_name or "UTC")
+        date_iso = _explicit_date_iso_from_text(msg)
+        base = datetime.now(tz=tz).date()
+        if not date_iso:
+            if "yesterday" in mlow:
+                date_iso = (base - timedelta(days=1)).isoformat()
+            elif "tomorrow" in mlow:
+                date_iso = (base + timedelta(days=1)).isoformat()
+            else:
+                date_iso = base.isoformat()
+
+        acct = _session_account_address(input.session)
+        if not acct:
+            return Output(answer="I need you signed in (Privy) to look up your private calendar.", citations=[], data={"error": "missing_account_address"})
+
+        status = await _googlecalendar_call_json("googlecalendar_get_connection_status", {"accountAddress": acct})
+        if status is None:
+            return Output(
+                answer="Google Calendar tools aren’t enabled for this chat deployment yet.",
+                citations=[],
+                data={
+                    "ok": False,
+                    "error": "googlecalendar_tools_not_configured",
+                    "hint": "Add googlecalendar to MCP_SERVERS_JSON and include googlecalendar_* tools in MCP_TOOL_ALLOWLIST for the LangGraph deployment.",
+                },
+            )
+        if not isinstance(status, dict) or not bool(status.get("connected")):
+            return Output(
+                answer="Your Google Calendar isn’t connected in this app yet. Use `/googlecalendar/connect`, then ask again.",
+                citations=[],
+                data={"ok": False, "error": "googlecalendar_not_connected", "status": status},
+            )
+
+        t0, t1 = _day_window_utc_from_local_date(date_iso, tz_name)
+        await _googlecalendar_call_json(
+            "googlecalendar_sync_events",
+            {"accountAddress": acct, "timeMinISO": t0, "timeMaxISO": t1, "maxResults": 2500},
+        )
+        cached = await _googlecalendar_call_json(
+            "googlecalendar_list_events_cached",
+            {"accountAddress": acct, "timeMinISO": t0, "timeMaxISO": t1, "maxResults": 200},
+        )
+        events = cached.get("events") if isinstance(cached, dict) else None
+        items: list[dict[str, Any]] = [e for e in events if isinstance(e, dict)] if isinstance(events, list) else []
+        if not items:
+            answer = f"No Google Calendar events found for {date_iso} ({tz_name})."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"ok": True, "dateISO": date_iso, "tzName": tz_name, "cached": cached})
+
+        lines = [f"Google Calendar events for {date_iso} ({tz_name}):"]
+        for e in items[:25]:
+            summary = str(e.get("summary") or "Untitled").strip()
+            start_iso = str(e.get("start_iso") or e.get("startISO") or "").strip()
+            when = _fmt_local_time_from_iso(start_iso, tz_name) if start_iso else ""
+            lines.append(f"- {when + ' — ' if when else ''}{summary}")
+
+        answer = "\n".join(lines).strip()
+        if thread_id:
+            await _memory_append(thread_id, "user", msg)
+            await _memory_append(thread_id, "assistant", answer)
+        return Output(answer=answer, citations=[], data={"ok": True, "dateISO": date_iso, "tzName": tz_name, "cached": cached})
 
     # UI helper: get current weight-management profile for this user.
     if msg == "__WEIGHT_PROFILE_GET__":

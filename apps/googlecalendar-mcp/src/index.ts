@@ -286,8 +286,23 @@ async function resolveAccountAddress(env: Env, args: { accountAddress?: string; 
     return { accountAddress: acct, telegramUserId: tg2 || null };
   }
   if (tg) {
-    const accountAddress = await accountAddressForTelegramUserId(env, tg);
-    return { accountAddress, telegramUserId: tg };
+    try {
+      const accountAddress = await accountAddressForTelegramUserId(env, tg);
+      return { accountAddress, telegramUserId: tg };
+    } catch {
+      // Back-compat: older connections were stored only by accountAddress.
+      // If there's exactly one connection in the DB, assume it's for this user and bind telegram_user_id.
+      const all = await env.DB.prepare(`SELECT account_address FROM google_calendar_connections LIMIT 2`).all<{ account_address: string }>();
+      const rows = (all.results ?? []) as Array<{ account_address: string }>;
+      if (rows.length === 1 && rows[0]?.account_address) {
+        const accountAddress = String(rows[0].account_address);
+        await env.DB.prepare(`UPDATE google_calendar_connections SET telegram_user_id = ? WHERE account_address = ?`)
+          .bind(tg, accountAddress)
+          .run();
+        return { accountAddress, telegramUserId: tg };
+      }
+      throw new Error("No Google Calendar connection for telegramUserId (reconnect to bind telegram id).");
+    }
   }
   throw new Error("Provide accountAddress or telegramUserId");
 }

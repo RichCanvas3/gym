@@ -51,6 +51,15 @@ type GoogleEvent = {
   status?: string | null;
 };
 
+type PrivateEventsMeta = {
+  start?: string;
+  end?: string;
+  timeMinISO?: string;
+  timeMaxISO?: string;
+  calendarId?: string;
+  asOfISO?: string;
+};
+
 function startOfDayISO(d: Date) {
   const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0));
   return x.toISOString().slice(0, 10);
@@ -109,6 +118,7 @@ function CalendarInner() {
   const [weatherErr, setWeatherErr] = useState<string>("");
   const [privateEvents, setPrivateEvents] = useState<GoogleEvent[]>([]);
   const [privateEventsErr, setPrivateEventsErr] = useState<string>("");
+  const [privateEventsMeta, setPrivateEventsMeta] = useState<PrivateEventsMeta>({});
   const [reserveBusyId, setReserveBusyId] = useState<string>("");
   const [reserveMsg, setReserveMsg] = useState<string>("");
   const [clientTz, setClientTz] = useState<string>("America/Denver");
@@ -242,7 +252,18 @@ function CalendarInner() {
         return;
       }
       const events = Array.isArray(j?.events) ? (j.events as GoogleEvent[]) : [];
-      if (!cancelled) setPrivateEvents(events);
+      const meta: PrivateEventsMeta = {
+        start: typeof j?.start === "string" ? String(j.start) : undefined,
+        end: typeof j?.end === "string" ? String(j.end) : undefined,
+        timeMinISO: typeof j?.timeMinISO === "string" ? String(j.timeMinISO) : undefined,
+        timeMaxISO: typeof j?.timeMaxISO === "string" ? String(j.timeMaxISO) : undefined,
+        calendarId: typeof j?.calendarId === "string" ? String(j.calendarId) : undefined,
+        asOfISO: typeof j?.asOfISO === "string" ? String(j.asOfISO) : undefined,
+      };
+      if (!cancelled) {
+        setPrivateEvents(events);
+        setPrivateEventsMeta(meta);
+      }
     }
     void load();
     return () => {
@@ -453,6 +474,11 @@ function CalendarInner() {
             >
               Connect / status
             </Link>
+          </div>
+          <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-500">
+            Window: {privateEventsMeta.start ?? weekStartISO} → {privateEventsMeta.end ?? addDaysISO(weekStartISO, 7)} •{" "}
+            {privateEventsMeta.calendarId ? `calendarId=${privateEventsMeta.calendarId}` : "calendarId=? (check MCP config)"} •{" "}
+            {privateEventsMeta.asOfISO ? `as-of=${privateEventsMeta.asOfISO}` : ""}
           </div>
           {privateEventsErr ? <div className="mt-2 text-xs text-red-600 dark:text-red-400">{privateEventsErr}</div> : null}
           <div className="mt-3 flex flex-col gap-2">
