@@ -68,7 +68,7 @@ export function AppHeader() {
         const tok = await getAccessToken();
         const res = await fetch("/api/strava/status", { headers: { authorization: `Bearer ${tok}` } });
         const j = await res.json().catch(() => ({}));
-        const connected = Boolean(j?.connected === true || j?.ok === true);
+        const connected = Boolean(j?.connected === true);
         if (!cancelled) setStravaConnected(connected);
       } catch {
         if (!cancelled) setStravaConnected(null);
@@ -91,7 +91,7 @@ export function AppHeader() {
         const tok = await getAccessToken();
         const res = await fetch("/api/googlecalendar/status", { headers: { authorization: `Bearer ${tok}` } });
         const j = await res.json().catch(() => ({}));
-        const connected = Boolean(j?.connected === true || j?.ok === true);
+        const connected = Boolean(j?.connected === true);
         if (!cancelled) setGoogleCalendarConnected(connected);
       } catch {
         if (!cancelled) setGoogleCalendarConnected(null);
@@ -118,9 +118,9 @@ export function AppHeader() {
         const res = await fetch("/api/telegram/status", { headers: { authorization: `Bearer ${tok}` } });
         const j = (await res.json().catch(() => ({}))) as unknown;
         const rec = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
-        const connected = Boolean(rec.linked === true || rec.ok === true);
+        const connected = rec.linked === true;
         const v = rec.telegramUserId;
-        const tg = typeof v === "string" && v.trim() ? v.trim() : null;
+        const tg = connected && typeof v === "string" && v.trim() ? v.trim() : null;
         if (!cancelled) {
           setTelegramConnected(connected);
           setTelegramLinkedUserId(tg);
