@@ -53,6 +53,20 @@ function scopeIdForTelegramUserId(telegramUserId: string): string {
   return `tg:${clean}`;
 }
 
+function scopeIdForAccountAddress(accountAddress: string): string {
+  const clean = String(accountAddress ?? "").trim();
+  if (!clean) throw new Error("Missing accountAddress");
+  return clean;
+}
+
+function requireIdentity(args: { accountAddress?: string | null; telegramUserId?: string | null }): { kind: "account" | "telegram"; accountAddress?: string; telegramUserId?: string; scopeId: string } {
+  const acct = typeof args.accountAddress === "string" ? args.accountAddress.trim() : "";
+  if (acct) return { kind: "account", accountAddress: acct, scopeId: scopeIdForAccountAddress(acct) };
+  const tg = typeof args.telegramUserId === "string" ? args.telegramUserId.trim() : "";
+  if (tg) return { kind: "telegram", telegramUserId: tg, scopeId: scopeIdForTelegramUserId(tg) };
+  throw new Error("Missing identity: provide accountAddress or telegramUserId");
+}
+
 async function ensureSchema(env: Env): Promise<void> {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS workouts (
@@ -78,6 +92,16 @@ async function ensureSchema(env: Env): Promise<void> {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS strava_tokens (
       telegram_user_id TEXT PRIMARY KEY,
+      refresh_token TEXT NOT NULL,
+      scope TEXT,
+      athlete_json TEXT,
+      updated_at_iso TEXT NOT NULL
+    )`,
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS strava_tokens_v2 (
+      account_address TEXT PRIMARY KEY,
       refresh_token TEXT NOT NULL,
       scope TEXT,
       athlete_json TEXT,
@@ -218,36 +242,61 @@ async function setLastSync(env: Env, scopeId: string) {
     .run();
 }
 
-async function getRefreshTokenForTelegramUserId(env: Env, telegramUserId: string): Promise<string> {
-  const clean = String(telegramUserId ?? "").trim();
-  if (!clean) throw new Error("Missing telegramUserId");
-  const row = await env.DB.prepare(`SELECT refresh_token FROM strava_tokens WHERE telegram_user_id = ?`).bind(clean).first<{
-    refresh_token?: string;
-  }>();
+async function getRefreshToken(env: Env, id: { kind: "account"; accountAddress: string } | { kind: "telegram"; telegramUserId: string }): Promise<string> {
+  if (id.kind === "account") {
+    const row = await env.DB.prepare(`SELECT refresh_token FROM strava_tokens_v2 WHERE account_address = ?`)
+      .bind(id.accountAddress)
+      .first<{ refresh_token?: string }>();
+    const rt = String(row?.refresh_token ?? "").trim();
+    if (!rt) throw new Error("Strava not connected for this accountAddress");
+    return rt;
+  }
+  const row = await env.DB.prepare(`SELECT refresh_token FROM strava_tokens WHERE telegram_user_id = ?`)
+    .bind(id.telegramUserId)
+    .first<{ refresh_token?: string }>();
   const rt = String(row?.refresh_token ?? "").trim();
   if (!rt) throw new Error("Strava not connected for this telegramUserId");
   return rt;
 }
 
-async function upsertRefreshToken(env: Env, telegramUserId: string, refreshToken: string, scope: string | null, athlete: unknown) {
-  const clean = String(telegramUserId ?? "").trim();
+async function upsertRefreshToken(
+  env: Env,
+  id: { kind: "account"; accountAddress: string } | { kind: "telegram"; telegramUserId: string },
+  refreshToken: string,
+  scope: string | null,
+  athlete: unknown,
+) {
   const rt = String(refreshToken ?? "").trim();
-  if (!clean) throw new Error("Missing telegramUserId");
   if (!rt) throw new Error("Missing refreshToken");
+  if (id.kind === "account") {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO strava_tokens_v2 (account_address, refresh_token, scope, athlete_json, updated_at_iso)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+      .bind(id.accountAddress, rt, scope, athlete ? JSON.stringify(athlete) : null, nowISO())
+      .run();
+    return;
+  }
   await env.DB.prepare(
     `INSERT OR REPLACE INTO strava_tokens (telegram_user_id, refresh_token, scope, athlete_json, updated_at_iso)
      VALUES (?, ?, ?, ?, ?)`,
   )
-    .bind(clean, rt, scope, athlete ? JSON.stringify(athlete) : null, nowISO())
+    .bind(id.telegramUserId, rt, scope, athlete ? JSON.stringify(athlete) : null, nowISO())
     .run();
 }
 
-async function getConnectionStatus(env: Env, telegramUserId: string): Promise<{ connected: boolean; athlete: unknown | null; updatedAtISO: string | null }> {
-  const clean = String(telegramUserId ?? "").trim();
-  if (!clean) throw new Error("Missing telegramUserId");
-  const row = await env.DB.prepare(`SELECT refresh_token, athlete_json, updated_at_iso FROM strava_tokens WHERE telegram_user_id = ?`)
-    .bind(clean)
-    .first<{ refresh_token?: string; athlete_json?: string | null; updated_at_iso?: string | null }>();
+async function getConnectionStatus(
+  env: Env,
+  id: { kind: "account"; accountAddress: string } | { kind: "telegram"; telegramUserId: string },
+): Promise<{ connected: boolean; athlete: unknown | null; updatedAtISO: string | null }> {
+  const row =
+    id.kind === "account"
+      ? await env.DB.prepare(`SELECT refresh_token, athlete_json, updated_at_iso FROM strava_tokens_v2 WHERE account_address = ?`)
+          .bind(id.accountAddress)
+          .first<{ refresh_token?: string; athlete_json?: string | null; updated_at_iso?: string | null }>()
+      : await env.DB.prepare(`SELECT refresh_token, athlete_json, updated_at_iso FROM strava_tokens WHERE telegram_user_id = ?`)
+          .bind(id.telegramUserId)
+          .first<{ refresh_token?: string; athlete_json?: string | null; updated_at_iso?: string | null }>();
   const connected = Boolean(String(row?.refresh_token ?? "").trim());
   let athlete: unknown | null = null;
   const raw = row?.athlete_json;
@@ -262,10 +311,10 @@ async function getConnectionStatus(env: Env, telegramUserId: string): Promise<{ 
   return { connected, athlete, updatedAtISO };
 }
 
-async function syncStrava(env: Env, telegramUserId: string, lookbackDays: number) {
-  const scopeId = scopeIdForTelegramUserId(telegramUserId);
+async function syncStrava(env: Env, id: { kind: "account"; accountAddress: string; scopeId: string } | { kind: "telegram"; telegramUserId: string; scopeId: string }, lookbackDays: number) {
+  const scopeId = id.scopeId;
   const afterUnix = Math.floor(Date.now() / 1000) - Math.max(1, lookbackDays) * 24 * 60 * 60;
-  const refreshToken = await getRefreshTokenForTelegramUserId(env, telegramUserId);
+  const refreshToken = await getRefreshToken(env, id.kind === "account" ? { kind: "account", accountAddress: id.accountAddress } : { kind: "telegram", telegramUserId: id.telegramUserId });
   const accessToken = await refreshStravaAccessToken(env, refreshToken);
   const activities = await fetchStravaActivities(accessToken, afterUnix);
   let inserted = 0;
@@ -314,29 +363,43 @@ async function syncStrava(env: Env, telegramUserId: string, lookbackDays: number
 function createServer(env: Env) {
   const server = new McpServer({ name: "Strava MCP (D1)", version: "0.1.0" });
 
-  server.tool("strava_status", "Check whether Strava is connected for a telegramUserId.", { telegramUserId: z.string().min(1) }, async (args) => {
+  const IdentityArgs = z
+    .object({ accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional() })
+    .refine((v) => Boolean((v.accountAddress ?? "").trim() || (v.telegramUserId ?? "").trim()), {
+      message: "Provide accountAddress or telegramUserId",
+    });
+
+  server.tool("strava_status", "Check whether Strava is connected.", { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional() }, async (args) => {
     await ensureSchema(env);
-    const p = z.object({ telegramUserId: z.string().min(1) }).parse(args);
-    const st = await getConnectionStatus(env, p.telegramUserId);
-    return { content: [{ type: "text", text: jsonText({ ok: true, telegramUserId: p.telegramUserId, ...st }) }] };
+    const p = IdentityArgs.parse(args);
+    const id = requireIdentity(p);
+    const st = await getConnectionStatus(env, id.kind === "account" ? { kind: "account", accountAddress: id.accountAddress! } : { kind: "telegram", telegramUserId: id.telegramUserId! });
+    return { content: [{ type: "text", text: jsonText({ ok: true, ...("accountAddress" in id ? { accountAddress: id.accountAddress } : {}), ...("telegramUserId" in id ? { telegramUserId: id.telegramUserId } : {}), ...st }) }] };
   });
 
   server.tool(
     "strava_connect",
-    "Exchange Strava OAuth code and store refresh token for a telegramUserId.",
-    { telegramUserId: z.string().min(1), code: z.string().min(1), redirectUri: z.string().url() },
+    "Exchange Strava OAuth code and store refresh token.",
+    { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional(), code: z.string().min(1), redirectUri: z.string().url() },
     async (args) => {
       await ensureSchema(env);
-      const p = z.object({ telegramUserId: z.string().min(1), code: z.string().min(1), redirectUri: z.string().url() }).parse(args);
+      const p = IdentityArgs.extend({ code: z.string().min(1), redirectUri: z.string().url() }).parse(args);
+      const id = requireIdentity(p);
       const tok = await exchangeStravaAuthCode(env, p.code, p.redirectUri);
-      await upsertRefreshToken(env, p.telegramUserId, String(tok.refresh_token), typeof tok.scope === "string" ? tok.scope : null, tok.athlete);
+      await upsertRefreshToken(
+        env,
+        id.kind === "account" ? { kind: "account", accountAddress: id.accountAddress! } : { kind: "telegram", telegramUserId: id.telegramUserId! },
+        String(tok.refresh_token),
+        typeof tok.scope === "string" ? tok.scope : null,
+        tok.athlete,
+      );
       return {
         content: [
           {
             type: "text",
             text: jsonText({
               ok: true,
-              telegramUserId: p.telegramUserId,
+              ...(id.kind === "account" ? { accountAddress: id.accountAddress } : { telegramUserId: id.telegramUserId }),
               scope: tok.scope ?? null,
               expiresAt: tok.expires_at ?? null,
               athlete: tok.athlete ?? null,
@@ -349,32 +412,32 @@ function createServer(env: Env) {
 
   server.tool(
     "strava_get_me",
-    "Fetch Strava athlete profile for a telegramUserId (requires Strava connected).",
-    { telegramUserId: z.string().min(1) },
+    "Fetch Strava athlete profile (requires Strava connected).",
+    { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional() },
     async (args) => {
       await ensureSchema(env);
-      const p = z.object({ telegramUserId: z.string().min(1) }).parse(args);
-      const refreshToken = await getRefreshTokenForTelegramUserId(env, p.telegramUserId);
+      const p = IdentityArgs.parse(args);
+      const id = requireIdentity(p);
+      const refreshToken = await getRefreshToken(env, id.kind === "account" ? { kind: "account", accountAddress: id.accountAddress! } : { kind: "telegram", telegramUserId: id.telegramUserId! });
       const accessToken = await refreshStravaAccessToken(env, refreshToken);
       const athlete = await fetchStravaAthlete(accessToken);
-      return { content: [{ type: "text", text: jsonText({ ok: true, telegramUserId: p.telegramUserId, athlete }) }] };
+      return { content: [{ type: "text", text: jsonText({ ok: true, ...(id.kind === "account" ? { accountAddress: id.accountAddress } : { telegramUserId: id.telegramUserId }), athlete }) }] };
     },
   );
 
   server.tool(
     "strava_sync",
     "Sync recent Strava activities into D1 workouts table.",
-    { telegramUserId: z.string().min(1), lookbackDays: z.number().int().positive().max(365).optional() },
+    { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional(), lookbackDays: z.number().int().positive().max(365).optional() },
     async (args) => {
       await ensureSchema(env);
-      const p = z
-        .object({ telegramUserId: z.string().min(1), lookbackDays: z.number().int().positive().max(365).optional() })
-        .parse(args);
-      const result = await syncStrava(env, p.telegramUserId, p.lookbackDays ?? 30);
-      const last = await getLastSync(env, scopeIdForTelegramUserId(p.telegramUserId));
+      const p = IdentityArgs.extend({ lookbackDays: z.number().int().positive().max(365).optional() }).parse(args);
+      const id = requireIdentity(p);
+      const result = await syncStrava(env, id as any, p.lookbackDays ?? 30);
+      const last = await getLastSync(env, id.scopeId);
       return {
         content: [
-          { type: "text", text: jsonText({ ...result, telegramUserId: p.telegramUserId, lastSyncAtISO: last?.toISOString() ?? null }) },
+          { type: "text", text: jsonText({ ...result, ...(id.kind === "account" ? { accountAddress: id.accountAddress } : { telegramUserId: id.telegramUserId }), lastSyncAtISO: last?.toISOString() ?? null }) },
         ],
       };
     },
@@ -383,11 +446,12 @@ function createServer(env: Env) {
   server.tool(
     "strava_list_workouts",
     "List synced workouts (most recent first).",
-    { telegramUserId: z.string().min(1), limit: z.number().int().positive().max(200).optional() },
+    { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional(), limit: z.number().int().positive().max(200).optional() },
     async (args) => {
       await ensureSchema(env);
-      const p = z.object({ telegramUserId: z.string().min(1), limit: z.number().int().positive().max(200).optional() }).parse(args);
-      const scopeId = scopeIdForTelegramUserId(p.telegramUserId);
+      const p = IdentityArgs.extend({ limit: z.number().int().positive().max(200).optional() }).parse(args);
+      const id = requireIdentity(p);
+      const scopeId = id.scopeId;
 
       // One-time migration assist: if there are no scoped rows yet, assume legacy rows belong to this scope.
       const anyScoped = await env.DB.prepare(`SELECT 1 FROM workouts WHERE scope_id IS NOT NULL LIMIT 1`).first();
@@ -402,18 +466,19 @@ function createServer(env: Env) {
       )
         .bind(scopeId, p.limit ?? 50)
         .all();
-      return { content: [{ type: "text", text: jsonText({ ok: true, telegramUserId: p.telegramUserId, workouts: res.results ?? [] }) }] };
+      return { content: [{ type: "text", text: jsonText({ ok: true, ...(id.kind === "account" ? { accountAddress: id.accountAddress } : { telegramUserId: id.telegramUserId }), workouts: res.results ?? [] }) }] };
     },
   );
 
   server.tool(
     "strava_get_workout",
     "Get a single synced workout by workoutId (e.g. strava-123).",
-    { telegramUserId: z.string().min(1), workoutId: z.string().min(1) },
+    { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional(), workoutId: z.string().min(1) },
     async (args) => {
       await ensureSchema(env);
-      const p = z.object({ telegramUserId: z.string().min(1), workoutId: z.string().min(1) }).parse(args);
-      const scopeId = scopeIdForTelegramUserId(p.telegramUserId);
+      const p = IdentityArgs.extend({ workoutId: z.string().min(1) }).parse(args);
+      const id = requireIdentity(p);
+      const scopeId = id.scopeId;
       const row = await env.DB.prepare(
         `SELECT workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
          duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
@@ -421,14 +486,15 @@ function createServer(env: Env) {
       )
         .bind(p.workoutId, scopeId)
         .first();
-      return { content: [{ type: "text", text: jsonText({ ok: true, telegramUserId: p.telegramUserId, workout: row ?? null }) }] };
+      return { content: [{ type: "text", text: jsonText({ ok: true, ...(id.kind === "account" ? { accountAddress: id.accountAddress } : { telegramUserId: id.telegramUserId }), workout: row ?? null }) }] };
     },
   );
 
-  server.tool("strava_latest_workout", "Get most recent workout for a telegramUserId.", { telegramUserId: z.string().min(1) }, async (args) => {
+  server.tool("strava_latest_workout", "Get most recent workout.", { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional() }, async (args) => {
     await ensureSchema(env);
-    const p = z.object({ telegramUserId: z.string().min(1) }).parse(args);
-    const scopeId = scopeIdForTelegramUserId(p.telegramUserId);
+    const p = IdentityArgs.parse(args);
+    const id = requireIdentity(p);
+    const scopeId = id.scopeId;
     const row = await env.DB.prepare(
       `SELECT workout_id, source, device, event_type, activity_type, started_at_iso, ended_at_iso,
        duration_seconds, distance_meters, active_energy_kcal, metadata_json, created_at_iso
@@ -436,7 +502,7 @@ function createServer(env: Env) {
     )
       .bind(scopeId)
       .first();
-    return { content: [{ type: "text", text: jsonText({ ok: true, telegramUserId: p.telegramUserId, workout: row ?? null }) }] };
+    return { content: [{ type: "text", text: jsonText({ ok: true, ...(id.kind === "account" ? { accountAddress: id.accountAddress } : { telegramUserId: id.telegramUserId }), workout: row ?? null }) }] };
   });
 
   return server;

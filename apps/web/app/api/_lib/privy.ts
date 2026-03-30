@@ -85,13 +85,15 @@ export async function requirePrivyAuth(req: Request): Promise<PrivyAuthOk | Priv
     let verified: unknown;
     try {
       // Current Privy SDK shape (per docs): verifyAccessToken({ access_token })
-      verified = await (privy as any).utils().auth().verifyAccessToken({ access_token: accessToken });
-    } catch (e) {
+      const p = privy as unknown as { utils: () => { auth: () => { verifyAccessToken: (arg: unknown) => Promise<unknown> } } };
+      verified = await p.utils().auth().verifyAccessToken({ access_token: accessToken });
+    } catch {
       try {
         // Back-compat: some versions accepted verifyAccessToken(accessToken)
-        verified = await (privy as any).utils().auth().verifyAccessToken(accessToken);
+        const p = privy as unknown as { utils: () => { auth: () => { verifyAccessToken: (arg: unknown) => Promise<unknown> } } };
+        verified = await p.utils().auth().verifyAccessToken(accessToken);
       } catch (e2) {
-        const verifyAuthToken = (privy as any).verifyAuthToken as UnknownAsyncFn | undefined;
+        const verifyAuthToken = (privy as unknown as { verifyAuthToken?: UnknownAsyncFn }).verifyAuthToken;
         if (typeof verifyAuthToken === "function") {
           verified = await verifyAuthToken.call(privy, accessToken);
         } else {
@@ -137,7 +139,7 @@ function extractTelegramUserIdFromPrivyUser(user: unknown): string | null {
     const acc = a as Record<string, unknown>;
     const type = typeof acc.type === "string" ? acc.type : "";
     if (type !== "telegram") continue;
-    const candidates: unknown[] = [acc.telegram_user_id, (acc as any).telegramUserId, (acc as any).telegram_userId];
+    const candidates: unknown[] = [acc.telegram_user_id, (acc as Record<string, unknown>).telegramUserId, (acc as Record<string, unknown>).telegram_userId];
     for (const c of candidates) {
       if (typeof c === "string" && c.trim()) return c.trim();
       if (typeof c === "number" && Number.isFinite(c)) return String(c);

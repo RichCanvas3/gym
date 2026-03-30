@@ -22,17 +22,18 @@ function extractTelegramUserId(user: unknown): string | null {
     if (typeof c === "number" && Number.isFinite(c)) return String(c);
   }
 
-  const linked = (u.linkedAccounts ?? (u as any).linked_accounts) as unknown;
+  const linked = (u.linkedAccounts ?? (u as Record<string, unknown>).linked_accounts) as unknown;
   if (Array.isArray(linked)) {
     for (const a of linked) {
       if (!a || typeof a !== "object") continue;
       const acc = a as Record<string, unknown>;
-      const type = typeof acc.type === "string" ? acc.type : typeof (acc as any).accountType === "string" ? (acc as any).accountType : "";
+      const accountType = (acc as Record<string, unknown>).accountType;
+      const type = typeof acc.type === "string" ? acc.type : typeof accountType === "string" ? accountType : "";
       if (type !== "telegram") continue;
       const idCandidates: unknown[] = [
         acc.telegram_user_id,
-        (acc as any).telegramUserId,
-        (acc as any).telegram_userId,
+        (acc as Record<string, unknown>).telegramUserId,
+        (acc as Record<string, unknown>).telegram_userId,
       ];
       for (const c of idCandidates) {
         if (typeof c === "string" && c.trim()) return c.trim();
@@ -53,11 +54,13 @@ export function AppHeader() {
   const telegramUserId = useMemo(() => extractTelegramUserId(user), [user]);
   const [stravaConnected, setStravaConnected] = useState<boolean | null>(null);
   const [googleCalendarConnected, setGoogleCalendarConnected] = useState<boolean | null>(null);
+  const [telegramConnected, setTelegramConnected] = useState<boolean | null>(null);
+  const [telegramLinkedUserId, setTelegramLinkedUserId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     async function run() {
-      if (!authenticated || !telegramUserId) {
+      if (!authenticated) {
         if (!cancelled) setStravaConnected(null);
         return;
       }
@@ -75,7 +78,7 @@ export function AppHeader() {
     return () => {
       cancelled = true;
     };
-  }, [authenticated, telegramUserId, getAccessToken]);
+  }, [authenticated, getAccessToken]);
 
   useEffect(() => {
     let cancelled = false;
@@ -92,6 +95,41 @@ export function AppHeader() {
         if (!cancelled) setGoogleCalendarConnected(connected);
       } catch {
         if (!cancelled) setGoogleCalendarConnected(null);
+      }
+    }
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated, getAccessToken]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      if (!authenticated) {
+        if (!cancelled) {
+          setTelegramConnected(null);
+          setTelegramLinkedUserId(null);
+        }
+        return;
+      }
+      try {
+        const tok = await getAccessToken();
+        const res = await fetch("/api/telegram/status", { headers: { authorization: `Bearer ${tok}` } });
+        const j = (await res.json().catch(() => ({}))) as unknown;
+        const rec = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
+        const connected = Boolean(rec.linked === true || rec.ok === true);
+        const v = rec.telegramUserId;
+        const tg = typeof v === "string" && v.trim() ? v.trim() : null;
+        if (!cancelled) {
+          setTelegramConnected(connected);
+          setTelegramLinkedUserId(tg);
+        }
+      } catch {
+        if (!cancelled) {
+          setTelegramConnected(null);
+          setTelegramLinkedUserId(null);
+        }
       }
     }
     void run();
@@ -145,7 +183,11 @@ export function AppHeader() {
                 <div className="truncate font-semibold">Signed in</div>
                 <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">{accountAddress}</div>
                 <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">
-                  {telegramUserId ? `tg:${telegramUserId}` : "tg:(not linked)"}
+                  {telegramLinkedUserId
+                    ? `tg:${telegramLinkedUserId}`
+                    : telegramUserId
+                      ? `tg:${telegramUserId}`
+                      : "tg:(not linked)"}
                 </div>
               </div>
             ) : (
@@ -171,6 +213,12 @@ export function AppHeader() {
                 className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 inline-flex items-center"
               >
                 {googleCalendarConnected ? "GCal connected" : "Connect GCal"}
+              </Link>
+              <Link
+                href="/telegram/connect"
+                className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 inline-flex items-center"
+              >
+                {telegramConnected ? "Telegram connected" : "Connect Telegram"}
               </Link>
             </div>
           ) : null}

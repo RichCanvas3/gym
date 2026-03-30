@@ -170,8 +170,9 @@ export default function ChatPage() {
           }),
         });
         if (!res.ok) {
-          const j = ((await res.json().catch(() => ({}))) as any) ?? {};
-          const msg = typeof j?.error === "string" ? j.error : typeof j?.detail === "string" ? j.detail : "Unauthorized";
+          const j = (await res.json().catch(() => ({}))) as unknown;
+          const r = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
+          const msg = typeof r.error === "string" ? r.error : typeof r.detail === "string" ? r.detail : "Unauthorized";
           if (!cancelled) {
             setMessages([{ role: "assistant", text: msg }]);
             loadedAny = true;
@@ -179,15 +180,17 @@ export default function ChatPage() {
           if (res.status === 401) logout();
           return;
         }
-        const json = (await res.json().catch(() => ({}))) as any;
-        const data = json?.data;
-        const msgs = data?.messages;
+        const json = (await res.json().catch(() => ({}))) as unknown;
+        const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+        const data = rec.data && typeof rec.data === "object" ? (rec.data as Record<string, unknown>) : {};
+        const msgs = data.messages;
         if (Array.isArray(msgs)) {
           const out: ChatMessage[] = [];
           for (const m of msgs) {
             if (!m || typeof m !== "object") continue;
-            const role = (m as any).role;
-            const content = (m as any).content;
+            const mr = m as Record<string, unknown>;
+            const role = mr.role;
+            const content = mr.content;
             if ((role === "user" || role === "assistant") && typeof content === "string" && content.trim()) {
               out.push({ role, text: content });
             }
@@ -245,40 +248,47 @@ export default function ChatPage() {
           }),
         });
         if (!res.ok) {
-          const j = ((await res.json().catch(() => ({}))) as any) ?? {};
-          const msg = typeof j?.error === "string" ? j.error : typeof j?.detail === "string" ? j.detail : "Profile load failed.";
+          const j = (await res.json().catch(() => ({}))) as unknown;
+          const r = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
+          const msg = typeof r.error === "string" ? r.error : typeof r.detail === "string" ? r.detail : "Profile load failed.";
           setProfileError(msg);
           setProfileMissing(true);
           if (res.status === 401) logout();
           return;
         }
-        const json = (await res.json().catch(() => ({}))) as any;
-        const ok = json?.data?.ok;
+        const json = (await res.json().catch(() => ({}))) as unknown;
+        const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+        const data = rec.data && typeof rec.data === "object" ? (rec.data as Record<string, unknown>) : {};
+        const ok = data.ok;
         if (ok === false) {
-          setProfileError(String(json?.data?.error ?? json?.data?.hint ?? "Profile load failed."));
+          const err = data.error ?? data.hint ?? "Profile load failed.";
+          setProfileError(typeof err === "string" ? err : String(err));
           setProfileMissing(true);
           return;
         }
-        const prof = json?.data?.profile;
-        const age = typeof prof?.age === "number" ? String(prof.age) : typeof prof?.age === "string" ? prof.age : "";
-        const sex = prof?.sex === "male" || prof?.sex === "female" || prof?.sex === "other" ? prof.sex : "";
-        const heightIn = typeof prof?.height_in === "number" ? String(prof.height_in) : typeof prof?.height_in === "string" ? prof.height_in : "";
+        const prof = data.profile && typeof data.profile === "object" ? (data.profile as Record<string, unknown>) : {};
+        const age = typeof prof.age === "number" ? String(prof.age) : typeof prof.age === "string" ? prof.age : "";
+        const sex = prof.sex === "male" || prof.sex === "female" || prof.sex === "other" ? prof.sex : "";
+        const heightIn = typeof prof.height_in === "number" ? String(prof.height_in) : typeof prof.height_in === "string" ? prof.height_in : "";
         const weightLb =
-          typeof prof?.weight_lb === "number"
+          typeof prof.weight_lb === "number"
             ? String(prof.weight_lb)
-            : typeof prof?.weight_lb === "string"
+            : typeof prof.weight_lb === "string"
               ? prof.weight_lb
-              : typeof prof?.weightLb === "number"
+              : typeof prof.weightLb === "number"
                 ? String(prof.weightLb)
-                : typeof prof?.weightLb === "string"
+                : typeof prof.weightLb === "string"
                   ? prof.weightLb
                   : "";
-        const bodyShape = prof?.body_shape === "lean" || prof?.body_shape === "average" || prof?.body_shape === "stocky" || prof?.body_shape === "athletic" ? prof.body_shape : "";
+        const bodyShape =
+          prof.body_shape === "lean" || prof.body_shape === "average" || prof.body_shape === "stocky" || prof.body_shape === "athletic"
+            ? prof.body_shape
+            : "";
         const activityLevel =
-          prof?.activity_level === "sedentary" ||
-          prof?.activity_level === "light" ||
-          prof?.activity_level === "moderate" ||
-          prof?.activity_level === "very_active"
+          prof.activity_level === "sedentary" ||
+          prof.activity_level === "light" ||
+          prof.activity_level === "moderate" ||
+          prof.activity_level === "very_active"
             ? prof.activity_level
             : "";
         if (!cancelled) {
@@ -606,7 +616,10 @@ export default function ChatPage() {
               />
               <select
                 value={profileSex}
-                onChange={(e) => setProfileSex(e.target.value as any)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "" || v === "male" || v === "female" || v === "other") setProfileSex(v);
+                }}
                 className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
               >
                 <option value="">Sex</option>
@@ -628,7 +641,10 @@ export default function ChatPage() {
               />
               <select
                 value={profileActivityLevel}
-                onChange={(e) => setProfileActivityLevel(e.target.value as any)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "" || v === "sedentary" || v === "light" || v === "moderate" || v === "very_active") setProfileActivityLevel(v);
+                }}
                 className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
               >
                 <option value="">Activity level</option>
@@ -639,7 +655,10 @@ export default function ChatPage() {
               </select>
               <select
                 value={profileBodyShape}
-                onChange={(e) => setProfileBodyShape(e.target.value as any)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "" || v === "lean" || v === "average" || v === "athletic" || v === "stocky") setProfileBodyShape(v);
+                }}
                 className="h-10 rounded-xl border border-amber-200 bg-white px-3 text-sm outline-none dark:border-amber-500/30 dark:bg-zinc-950"
               >
                 <option value="">Body shape (optional)</option>
@@ -695,9 +714,12 @@ export default function ChatPage() {
                         },
                       }),
                     });
-                    const j2 = (await res2.json().catch(() => ({}))) as any;
-                    if (j2?.data?.ok === false) {
-                      setProfileError(String(j2?.data?.error ?? j2?.data?.hint ?? "Profile save failed."));
+                    const j2 = (await res2.json().catch(() => ({}))) as unknown;
+                    const rec = j2 && typeof j2 === "object" ? (j2 as Record<string, unknown>) : {};
+                    const data = rec.data && typeof rec.data === "object" ? (rec.data as Record<string, unknown>) : {};
+                    if (data.ok === false) {
+                      const err = data.error ?? data.hint ?? "Profile save failed.";
+                      setProfileError(typeof err === "string" ? err : String(err));
                       setProfileMissing(true);
                     } else {
                       setProfileMissing(false);
@@ -795,7 +817,13 @@ function extractMealImages(data: unknown): string[] | undefined {
   for (const x of items) {
     if (!x || typeof x !== "object") continue;
     const o = x as Record<string, unknown>;
-    const url = typeof o.image_url === "string" ? o.image_url.trim() : typeof (o as any).imageUrl === "string" ? String((o as any).imageUrl).trim() : "";
+    const imgUrl = (o as Record<string, unknown>).imageUrl;
+    const url =
+      typeof o.image_url === "string"
+        ? o.image_url.trim()
+        : typeof imgUrl === "string"
+          ? imgUrl.trim()
+          : "";
     if (!url || !(url.startsWith("http://") || url.startsWith("https://"))) continue;
     if (seen.has(url)) continue;
     seen.add(url);

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requirePrivyAuth, telegramUserIdForPrivyDid } from "../../../_lib/privy";
+import { requirePrivyAuth } from "../../../_lib/privy";
 import { mcpToolCall } from "../../../_lib/mcp";
 
 export const runtime = "nodejs";
@@ -18,24 +18,27 @@ export async function POST(req: Request) {
   const code = typeof body?.code === "string" ? body.code.trim() : "";
   if (!code) return NextResponse.json({ error: "Missing code" }, { status: 400 });
 
-  const tgUserId = await telegramUserIdForPrivyDid(auth.did);
-  if (!tgUserId) return NextResponse.json({ error: "Telegram not linked for this Privy user." }, { status: 400 });
-
   const url = new URL(req.url);
   const redirectUri =
     typeof body?.redirectUri === "string" && body.redirectUri.trim()
       ? body.redirectUri.trim()
       : `${url.origin}/strava/connect`;
 
-  const out = await mcpToolCall("strava", "strava_connect", { telegramUserId: tgUserId, code, redirectUri });
+  const out = await mcpToolCall("strava", "strava_connect", { accountAddress: auth.accountAddress, code, redirectUri });
+  const outRec = out && typeof out === "object" ? (out as Record<string, unknown>) : {};
 
   // Best-effort: also attach Strava athlete profile to gym-core for this user.
-  // Canonical user id design decision: use tg:<telegramUserId> as the core canonicalAddress.
   try {
-    const athlete = out?.athlete;
-    const athleteId = athlete && typeof athlete === "object" && athlete !== null && "id" in athlete ? String((athlete as any).id) : "";
+    const athlete = outRec.athlete;
+    const athleteId =
+      athlete && typeof athlete === "object" && athlete !== null
+        ? (() => {
+            const id = (athlete as Record<string, unknown>).id;
+            return typeof id === "string" || typeof id === "number" ? String(id) : "";
+          })()
+        : "";
     await mcpToolCall("core", "core_upsert_external_profile", {
-      canonicalAddress: `tg:${tgUserId}`,
+      canonicalAddress: auth.accountAddress,
       provider: "strava",
       ...(athleteId ? { externalUserId: athleteId } : {}),
       profile: athlete ?? null,

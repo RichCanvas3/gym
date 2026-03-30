@@ -413,6 +413,32 @@ function createServer(env: Env) {
     },
   );
 
+  server.tool(
+    "core_get_external_id_for_account",
+    "Lookup an external provider user id for a canonicalAddress (e.g. telegram user id for this Privy account).",
+    { canonicalAddress: AccountAddress, provider: z.string().min(1) },
+    async (args) => {
+      await ensureSchema(env.DB);
+      const p = z.object({ canonicalAddress: AccountAddress, provider: z.string().min(1) }).parse(args);
+      const canonical = canonicalizeAddress(p.canonicalAddress);
+      const provider = p.provider.trim().toLowerCase();
+      const acc = await env.DB.prepare(`SELECT account_id FROM accounts WHERE canonical_address = ? LIMIT 1`).bind(canonical).first<{
+        account_id?: string;
+      }>();
+      const accountId = acc?.account_id ? String((acc as any).account_id) : "";
+      if (!accountId) {
+        return { content: [{ type: "text", text: jsonText({ ok: true, canonicalAddress: canonical, provider, externalUserId: null }) }] };
+      }
+      const row = await env.DB.prepare(
+        `SELECT external_user_id FROM account_external_identities WHERE account_id = ? AND provider = ? LIMIT 1`,
+      )
+        .bind(accountId, provider)
+        .first<{ external_user_id?: string }>();
+      const externalUserId = row?.external_user_id ? String((row as any).external_user_id) : null;
+      return { content: [{ type: "text", text: jsonText({ ok: true, canonicalAddress: canonical, provider, externalUserId }) }] };
+    },
+  );
+
   server.tool("core_list_instructors", "List instructors.", {}, async () => {
     const res = await env.DB.prepare(
       `

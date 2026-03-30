@@ -11,6 +11,8 @@ export type Env = {
   DB: D1Database;
   MEDIA_TOKEN_RESOLVER: DurableObjectNamespace;
   TELEGRAM_BOT_TOKEN?: string;
+  /** Bot username (without @). If unset, we’ll call getMe to discover it when needed. */
+  TELEGRAM_BOT_USERNAME?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   MCP_SESSION_ID?: string; // set from mcp-session-id header for subscribe + pending flush
   /** Base URL of this worker (no trailing slash), e.g. https://gym-telegram-mcp.xxx.workers.dev — required for public image URLs in message JSON */
@@ -27,6 +29,31 @@ function nowISO() {
 
 function jsonText(obj: unknown) {
   return JSON.stringify(obj, null, 2);
+}
+
+async function ensureSchema(env: Env): Promise<void> {
+  // These tables also exist in schema.sql; create idempotently for safety.
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS telegram_oauth_states (
+      state TEXT PRIMARY KEY,
+      account_address TEXT NOT NULL,
+      created_at_iso TEXT NOT NULL
+    )`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_telegram_oauth_states_created ON telegram_oauth_states(created_at_iso DESC)`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS telegram_account_links (
+      account_address TEXT PRIMARY KEY,
+      telegram_user_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      linked_at_iso TEXT NOT NULL
+    )`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_account_links_tg_user ON telegram_account_links(telegram_user_id)`,
+  ).run();
 }
 
 async function requireApiKey(request: Request, env: Env) {
@@ -53,6 +80,61 @@ async function tgCall(env: Env, method: string, payload: unknown) {
     throw new Error(`Telegram ${method} failed: ${JSON.stringify(json)}`);
   }
   return json;
+}
+
+function base64Url(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.byteLength; i++) s += String.fromCharCode(bytes[i]!);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function newConnectState(): string {
+  const b = new Uint8Array(32);
+  crypto.getRandomValues(b);
+  return base64Url(b);
+}
+
+async function resolveBotUsername(env: Env): Promise<string> {
+  const fromEnv = String(env.TELEGRAM_BOT_USERNAME ?? "").trim().replace(/^@/, "");
+  if (fromEnv) return fromEnv;
+  const me = await tgCall(env, "getMe", {});
+  const uname = String(me?.result?.username ?? "").trim().replace(/^@/, "");
+  if (!uname) throw new Error("Missing TELEGRAM_BOT_USERNAME (and getMe returned no username)");
+  return uname;
+}
+
+async function createConnectState(env: Env, accountAddress: string): Promise<{ ok: true; accountAddress: string; state: string; startUrl: string }> {
+  const acct = String(accountAddress ?? "").trim();
+  if (!acct) throw new Error("Missing accountAddress");
+  await ensureSchema(env);
+  const state = newConnectState();
+  const ts = nowISO();
+  await env.DB.prepare(`INSERT INTO telegram_oauth_states (state, account_address, created_at_iso) VALUES (?, ?, ?)`)
+    .bind(state, acct, ts)
+    .run();
+  const botUsername = await resolveBotUsername(env);
+  const startUrl = `https://t.me/${encodeURIComponent(botUsername)}?start=${encodeURIComponent(state)}`;
+  return { ok: true, accountAddress: acct, state, startUrl };
+}
+
+async function getAccountLink(env: Env, accountAddress: string): Promise<{ ok: true; linked: boolean; accountAddress: string; telegramUserId: string | null; chatId: string | null; linkedAtISO: string | null }> {
+  const acct = String(accountAddress ?? "").trim();
+  if (!acct) throw new Error("Missing accountAddress");
+  await ensureSchema(env);
+  const row = await env.DB.prepare(
+    `SELECT telegram_user_id, chat_id, linked_at_iso FROM telegram_account_links WHERE account_address = ? LIMIT 1`,
+  )
+    .bind(acct)
+    .first<{ telegram_user_id: string; chat_id: string; linked_at_iso: string }>();
+  if (!row) return { ok: true, linked: false, accountAddress: acct, telegramUserId: null, chatId: null, linkedAtISO: null };
+  return {
+    ok: true,
+    linked: true,
+    accountAddress: acct,
+    telegramUserId: String((row as any).telegram_user_id ?? "").trim() || null,
+    chatId: String((row as any).chat_id ?? "").trim() || null,
+    linkedAtISO: String((row as any).linked_at_iso ?? "").trim() || null,
+  };
 }
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -462,6 +544,42 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
     await insertMessage(env, msg);
     chatId = String(msg.chat?.id ?? "");
     title = msg.chat?.title ? String(msg.chat.title) : null;
+    // "Connect Telegram": user taps https://t.me/<bot>?start=<state> then Telegram sends "/start <state>"
+    const txt = typeof msg?.text === "string" ? msg.text.trim() : "";
+    if (txt.startsWith("/start")) {
+      const parts = txt.split(/\s+/).filter(Boolean);
+      const token = parts.length >= 2 ? String(parts[1] ?? "").trim() : "";
+      const fromId = numOrNull(msg?.from?.id);
+      const chatId2 = String(msg.chat?.id ?? "").trim();
+      if (token && fromId != null && chatId2) {
+        try {
+          await ensureSchema(env);
+          const st = await env.DB.prepare(
+            `SELECT account_address FROM telegram_oauth_states WHERE state = ? LIMIT 1`,
+          )
+            .bind(token)
+            .first<{ account_address: string }>();
+          const acct = st?.account_address ? String((st as any).account_address).trim() : "";
+          if (acct) {
+            const ts = nowISO();
+            await env.DB.prepare(
+              `INSERT OR REPLACE INTO telegram_account_links (account_address, telegram_user_id, chat_id, linked_at_iso)
+               VALUES (?, ?, ?, ?)`,
+            )
+              .bind(acct, String(fromId), chatId2, ts)
+              .run();
+            await env.DB.prepare(`DELETE FROM telegram_oauth_states WHERE state = ?`).bind(token).run();
+            await tgCall(env, "sendMessage", {
+              chat_id: chatId2,
+              text: "Connected. You can go back to the app now.",
+            });
+            console.log(`[telegram-mcp] link: connected account_address=${acct} telegram_user_id=${fromId} chat_id=${chatId2}`);
+          }
+        } catch (e) {
+          console.warn("[telegram-mcp] link: failed to link from /start", e);
+        }
+      }
+    }
     const hasPhoto = Array.isArray(msg?.photo) && msg.photo.length > 0;
     const hasImageDoc =
       msg?.document &&
@@ -570,6 +688,9 @@ function createServer(env: Env) {
     { capabilities: { resources: { listChanged: true, subscribe: true } } },
   );
 
+  // Ensure newer tables exist even if schema.sql wasn't applied yet.
+  void ensureSchema(env);
+
   const listChats = async () => {
     const res = await env.DB.prepare(
       `SELECT chat_id, type, title FROM telegram_chats ORDER BY updated_at_iso DESC LIMIT 100`,
@@ -653,6 +774,55 @@ function createServer(env: Env) {
   server.tool("telegram_ping", "Health check", {}, async () => {
     return { content: [{ type: "text", text: jsonText({ ok: true, asOfISO: nowISO() }) }] };
   });
+
+  server.tool(
+    "telegram_link_start",
+    "Start Telegram linking for an accountAddress (returns https://t.me/<bot>?start=<state>).",
+    { accountAddress: z.string().min(1) },
+    async (args) => {
+      const p = z.object({ accountAddress: z.string().min(1) }).parse(args);
+      const out = await createConnectState(env, p.accountAddress);
+      return { content: [{ type: "text", text: jsonText(out) }] };
+    },
+  );
+
+  server.tool(
+    "telegram_link_status",
+    "Get Telegram link status for an accountAddress (telegram user id + chat id).",
+    { accountAddress: z.string().min(1) },
+    async (args) => {
+      const p = z.object({ accountAddress: z.string().min(1) }).parse(args);
+      const st = await getAccountLink(env, p.accountAddress);
+      return { content: [{ type: "text", text: jsonText(st) }] };
+    },
+  );
+
+  server.tool(
+    "telegram_send_message_to_account",
+    "Send a Telegram message to a linked accountAddress.",
+    { accountAddress: z.string().min(1), text: z.string().min(1), parseMode: z.enum(["MarkdownV2", "HTML"]).optional(), disableNotification: z.boolean().optional() },
+    async (args) => {
+      const p = z
+        .object({
+          accountAddress: z.string().min(1),
+          text: z.string().min(1),
+          parseMode: z.enum(["MarkdownV2", "HTML"]).optional(),
+          disableNotification: z.boolean().optional(),
+        })
+        .parse(args);
+      const link = await getAccountLink(env, p.accountAddress);
+      if (!link.linked || !link.chatId) {
+        return { content: [{ type: "text", text: jsonText({ ok: false, error: "Telegram not linked for this accountAddress" }) }] };
+      }
+      const res = await tgCall(env, "sendMessage", {
+        chat_id: link.chatId,
+        text: p.text,
+        parse_mode: p.parseMode,
+        disable_notification: p.disableNotification,
+      });
+      return { content: [{ type: "text", text: jsonText({ ok: true, accountAddress: p.accountAddress, chatId: link.chatId, result: res }) }] };
+    },
+  );
 
   server.tool(
     "telegram_set_webhook",

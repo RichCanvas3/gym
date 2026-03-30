@@ -37,7 +37,7 @@ async function readSseJson(res: Response): Promise<unknown> {
   return JSON.parse(m[1]);
 }
 
-export async function mcpToolCall(serverName: string, toolName: string, args: Record<string, unknown>): Promise<any> {
+export async function mcpToolCall(serverName: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {
   const servers = parseMcpServersJson();
   const cfg = servers[serverName];
   const url = String(cfg?.url ?? "").trim();
@@ -55,7 +55,11 @@ export async function mcpToolCall(serverName: string, toolName: string, args: Re
 
   const ct = res.headers.get("content-type") ?? "";
   const msg = ct.includes("application/json") ? await res.json() : await readSseJson(res);
-  const text = (msg as any)?.result?.content?.[0]?.text;
+  const rec = msg && typeof msg === "object" ? (msg as Record<string, unknown>) : {};
+  const result = rec.result && typeof rec.result === "object" ? (rec.result as Record<string, unknown>) : {};
+  const content = Array.isArray(result.content) ? (result.content as unknown[]) : [];
+  const first = content[0] && typeof content[0] === "object" ? (content[0] as Record<string, unknown>) : {};
+  const text = first.text;
   if (typeof text !== "string") return msg;
   try {
     return JSON.parse(text);

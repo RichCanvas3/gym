@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { requirePrivyAuth, telegramUserIdForPrivyDid } from "../../_lib/privy";
+import { mcpToolCall } from "../../_lib/mcp";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,21 +35,23 @@ export async function POST(req: Request) {
 
   const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
   sessionOut.accountAddress = auth.accountAddress;
-  const telegramUserId = await telegramUserIdForPrivyDid(auth.did);
+  let telegramUserId = await telegramUserIdForPrivyDid(auth.did);
   if (!telegramUserId) {
-    return NextResponse.json(
-      { error: "Telegram not linked for this Privy user (missing telegramUserId)." },
-      { status: 400 },
-    );
+    try {
+      const st = await mcpToolCall("telegram", "telegram_link_status", { accountAddress: auth.accountAddress });
+      const rec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
+      const v = rec.telegramUserId;
+      telegramUserId = typeof v === "string" && v.trim() ? v.trim() : null;
+    } catch {
+      // ok: Telegram is optional (user can connect later)
+    }
   }
-  sessionOut.telegramUserId = telegramUserId;
+  if (telegramUserId) sessionOut.telegramUserId = telegramUserId;
   // Remove legacy/unsupported identity field (waiver flow removed).
-  if ("waiver" in sessionOut) delete (sessionOut as any).waiver;
+  if ("waiver" in sessionOut) delete sessionOut["waiver"];
   const derivedThreadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;
-  const threadId =
-    typeof (sessionOut as any).threadId === "string" && String((sessionOut as any).threadId).trim()
-      ? String((sessionOut as any).threadId)
-      : derivedThreadId;
+  const threadIdRaw = sessionOut["threadId"];
+  const threadId = typeof threadIdRaw === "string" && threadIdRaw.trim() ? threadIdRaw : derivedThreadId;
   sessionOut.threadId = threadId;
 
   const url = `${deploymentUrl.replace(/\/$/, "")}/runs/wait`;

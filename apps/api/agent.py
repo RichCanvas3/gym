@@ -439,6 +439,12 @@ def _fitnesscore_graph_iri_for_telegram_user_id(telegram_user_id: str) -> str:
     return f"{base}/{quote(f'tg:{tg}', safe='')}"
 
 
+def _fitnesscore_graph_iri_for_account_address(account_address: str) -> str:
+    base = _fitnesscore_graph_context_base()
+    acct = (account_address or "").strip()
+    return f"{base}/{quote(acct, safe='')}"
+
+
 def _sparql_iso_dt(iso: str) -> str:
     s = str(iso or "").strip()
     return s.replace("+00:00", "Z")
@@ -1244,8 +1250,19 @@ def _parse_weight_from_text(text: str) -> tuple[Optional[float], Optional[float]
 
 
 def _weight_scope_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
+    acct = _session_account_address(session)
     tg_user_id = _session_telegram_user_id(session)
+    if acct:
+        return {"accountAddress": acct, **({"telegramUserId": tg_user_id} if tg_user_id else {})}
     return {"telegramUserId": tg_user_id} if tg_user_id else None
+
+
+def _strava_identity_from_session(session: Optional["Session"]) -> dict[str, Any]:
+    acct = _session_account_address(session)
+    if acct:
+        return {"accountAddress": acct}
+    tg_user_id = _session_telegram_user_id(session)
+    return {"telegramUserId": tg_user_id} if tg_user_id else {}
 
 
 async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1798,17 +1815,28 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     )
 
     class FitnessSnapshotArgs(BaseModel):
-        telegramUserId: str = Field(min_length=3, description="Telegram numeric user id as string (used as weight-management scope id).")
+        accountAddress: Optional[str] = Field(
+            default=None,
+            description="Preferred canonical id (Privy accountAddress), e.g. acct:privy_... (used as scope id).",
+        )
+        telegramUserId: Optional[str] = Field(
+            default=None,
+            description="Back-compat Telegram numeric user id as string (used as weight-management scope id).",
+        )
         dateISO: Optional[str] = Field(default=None, description="Local date (YYYY-MM-DD). Defaults to today in tzName.")
         tzName: Optional[str] = Field(default="America/Denver", description="IANA timezone name for date defaulting.")
 
-    async def fitness_snapshot(telegramUserId: str, dateISO: Optional[str] = None, tzName: str = "America/Denver") -> str:
+    async def fitness_snapshot(accountAddress: Optional[str] = None, telegramUserId: Optional[str] = None, dateISO: Optional[str] = None, tzName: str = "America/Denver") -> str:
         tz = ZoneInfo(tzName or "UTC")
         if not dateISO or not isinstance(dateISO, str) or not dateISO.strip():
             dateISO = datetime.now(tz=tz).date().isoformat()
-        scope = {"telegramUserId": telegramUserId.strip()}
+        acct = str(accountAddress or "").strip()
+        tg = str(telegramUserId or "").strip()
+        if not acct and not tg:
+            raise ValueError("Provide accountAddress (preferred) or telegramUserId")
+        scope = {"accountAddress": acct, **({"telegramUserId": tg} if tg else {})} if acct else {"telegramUserId": tg}
         day = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": dateISO, "tzName": tzName}) or {}
-        workout = await _strava_call_json("strava_latest_workout", {"telegramUserId": telegramUserId.strip()}) or {}
+        workout = await _strava_call_json("strava_latest_workout", {"accountAddress": acct} if acct else {"telegramUserId": tg}) or {}
         return json.dumps(
             {
                 "asOfISO": _now_iso(),
@@ -1821,7 +1849,7 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 
     fitness_snapshot_tool = StructuredTool.from_function(
         name="fitness_snapshot",
-        description="Return a combined snapshot: today's weight-management day summary (scoped by telegramUserId) + latest Strava workout.",
+        description="Return a combined snapshot: day's weight-management summary (scoped by accountAddress) + latest Strava workout.",
         coroutine=fitness_snapshot,
         args_schema=FitnessSnapshotArgs,
     )
@@ -1959,6 +1987,7 @@ async def run(input: Input) -> Output:
 
     # UI helper: get current weight-management profile for this user.
     if msg == "__WEIGHT_PROFILE_GET__":
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
         if not tg_user_id:
             return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
@@ -2418,9 +2447,10 @@ async def run(input: Input) -> Output:
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         items: list[dict[str, Any]] = []
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
-        if _fitnesscore_use_graphdb() and tg_user_id:
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2594,14 +2624,15 @@ SELECT ?t ?desc ?cal ?p ?c ?f WHERE {{
 
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
-        graph_mode = _fitnesscore_use_graphdb() and bool(tg_user_id)
+        graph_mode = _fitnesscore_use_graphdb() and bool(acct or tg_user_id)
         g_intake_kcal = 0.0
         g_ex_kcal = 0.0
         workouts_today: list[dict[str, Any]] = []
 
         if graph_mode:
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2683,7 +2714,7 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
 
         # If we didn't get workouts from GraphDB, fall back to Strava list for display.
         if (not workouts_today) and tg_user_id and not (_fitnesscore_graphdb_only() and graph_mode):
-            str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            str0 = await _strava_call_json("strava_list_workouts", {**_strava_identity_from_session(input.session), "limit": 200}) or {}
             workouts = str0.get("workouts") if isinstance(str0, dict) else None
             wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
             tz = ZoneInfo(tz_name or "UTC")
@@ -2777,10 +2808,11 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
         _set_last_date_context(base_goal_bundle, date_iso, tz_name)
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
         ex_out = 0.0
-        if _fitnesscore_use_graphdb() and tg_user_id:
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2805,16 +2837,19 @@ SELECT (SUM(?k) AS ?exerciseKcal) (COUNT(?w) AS ?workouts) WHERE {{
                     except Exception:
                         ex_out = 0.0
 
-        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and tg_user_id):
+        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and (acct or tg_user_id)):
             day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
             totals = day0.get("totals") if isinstance(day0, dict) else None
             totals = totals if isinstance(totals, dict) else {}
             ex_kcal = totals.get("exercise_kcal")
             ex_out = float(ex_kcal) if isinstance(ex_kcal, (int, float)) else 0.0
 
-        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and tg_user_id):
-            if tg_user_id:
-                str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and (acct or tg_user_id)):
+            if acct or tg_user_id:
+                str0 = await _strava_call_json(
+                    "strava_list_workouts",
+                    {"accountAddress": acct, "limit": 200} if acct else {"telegramUserId": tg_user_id, "limit": 200},
+                ) or {}
                 workouts = str0.get("workouts") if isinstance(str0, dict) else None
                 wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
                 tz = ZoneInfo(tz_name or "UTC")
@@ -2884,11 +2919,12 @@ SELECT (SUM(?k) AS ?exerciseKcal) (COUNT(?w) AS ?workouts) WHERE {{
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         intake = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
 
         # Prefer GraphDB for intake (food)
-        if _fitnesscore_use_graphdb() and tg_user_id:
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q_food = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2947,15 +2983,16 @@ SELECT ?cal ?p ?c ?f WHERE {{
             latest_kg = float(lb_from_text) * 0.45359237
 
         # Exercise (today) - prefer GraphDB, fallback Strava MCP
-        if not tg_user_id:
-            answer = "I can list workouts, but I need you signed in with Telegram."
+        acct = _session_account_address(input.session)
+        if not (acct or tg_user_id):
+            answer = "I can list workouts, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
         wlist: list[dict[str, Any]] = []
         if _fitnesscore_use_graphdb():
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q_w = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2987,7 +3024,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
                 )
 
         if not wlist:
-            str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            str0 = await _strava_call_json("strava_list_workouts", {**_strava_identity_from_session(input.session), "limit": 200}) or {}
             workouts = str0.get("workouts") if isinstance(str0, dict) else None
             wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
@@ -3101,8 +3138,8 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
 
         # Intake (food) - prefer GraphDB
         intake_kcal = 0.0
-        if _fitnesscore_use_graphdb() and tg_user_id:
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q_in = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3153,15 +3190,16 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
             assumed_weight = True
 
         # Exercise (today) - prefer GraphDB, fallback Strava
-        if not tg_user_id:
-            answer = "I can list workouts, but I need you signed in with Telegram."
+        acct = _session_account_address(input.session)
+        if not (acct or tg_user_id):
+            answer = "I can list workouts, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
         wlist: list[dict[str, Any]] = []
         if _fitnesscore_use_graphdb():
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q_w = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3193,7 +3231,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
                 )
 
         if not wlist:
-            str0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            str0 = await _strava_call_json("strava_list_workouts", {**_strava_identity_from_session(input.session), "limit": 200}) or {}
             workouts = str0.get("workouts") if isinstance(str0, dict) else None
             wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
@@ -3313,9 +3351,10 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         date_iso = _resolve_date_iso_with_context(msg, tz_name, base_goal_bundle)
         _set_last_date_context(base_goal_bundle, date_iso, tz_name)
 
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
-        if not tg_user_id:
-            answer = "I can list workouts, but I need you signed in with Telegram."
+        if not (acct or tg_user_id):
+            answer = "I can list workouts, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -3323,7 +3362,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         today_workouts: list[dict[str, Any]] = []
         if _fitnesscore_use_graphdb():
             from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3357,7 +3396,7 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
 
         # Fallback: Strava MCP
         if not today_workouts:
-            data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200}) or {}
+            data0 = await _strava_call_json("strava_list_workouts", {**_strava_identity_from_session(input.session), "limit": 200}) or {}
             workouts = data0.get("workouts") if isinstance(data0, dict) else None
             wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
 
@@ -3446,12 +3485,13 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
         days = 7 if ("week" in mlow or "7" in mlow) else 3
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
 
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
-        if not tg_user_id:
-            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
+        if not (acct or tg_user_id):
+            return Output(answer="I need you signed in to do that.", citations=[], data={"error": "missing_identity"})
 
         if _fitnesscore_use_graphdb():
-            g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3507,7 +3547,7 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters WHERE {{
                     data={"asOfISO": _now_iso(), "count": len(rows), "days": days},
                 )
 
-        data0 = await _strava_call_json("strava_list_workouts", {"telegramUserId": tg_user_id, "limit": 200})
+        data0 = await _strava_call_json("strava_list_workouts", {**_strava_identity_from_session(input.session), "limit": 200})
         if data0 is None:
             answer = (
                 "Strava MCP isn't connected in this deployment, so I can't fetch your workout list. "
@@ -3603,9 +3643,10 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters WHERE {{
     # Deterministic: metric totals for a week/month window (GraphDB).
     if fitness_intent == "fitness_metric_period":
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        acct = _session_account_address(input.session)
         tg_user_id = _session_telegram_user_id(input.session)
-        if not tg_user_id:
-            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
+        if not (acct or tg_user_id):
+            return Output(answer="I need you signed in to do that.", citations=[], data={"error": "missing_identity"})
 
         from_iso, to_iso, label = _resolve_period_window_utc(msg, tz_name)
         mlow2 = (msg or "").lower()
@@ -3617,7 +3658,7 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters WHERE {{
         wants_exercise_kcal = any(k in mlow2 for k in ["exercise", "workout", "burn", "burned", "spent", "calories out"])
         wants_net = "net" in mlow2
 
-        g = _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
 
         # Workout count
         workouts_n = 0

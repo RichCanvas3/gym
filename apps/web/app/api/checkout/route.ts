@@ -30,8 +30,9 @@ export async function POST(req: Request) {
       : undefined;
   const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
   sessionOut.accountAddress = auth.accountAddress;
-  if ("waiver" in sessionOut) delete (sessionOut as any).waiver;
-  if (typeof (sessionOut as any).threadId !== "string" || !String((sessionOut as any).threadId).trim()) {
+  if ("waiver" in sessionOut) delete sessionOut["waiver"];
+  const threadIdRaw = sessionOut["threadId"];
+  if (typeof threadIdRaw !== "string" || !threadIdRaw.trim()) {
     sessionOut.threadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;
   }
 

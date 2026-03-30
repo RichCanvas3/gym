@@ -102,7 +102,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       appId={appId}
       config={{
         loginMethodsAndOrder: {
-          primary: ["google", "telegram", "email", "sms"],
+          // Wallet methods are specific wallet entries (e.g. "metamask"), not "wallet".
+          primary: ["metamask", "google", "telegram", "email", "sms"],
         },
         intl: { defaultCountry: "US" },
       }}

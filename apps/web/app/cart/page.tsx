@@ -40,12 +40,15 @@ export default function CartPage() {
 
   function extractEmail(u: unknown): string {
     if (!u || typeof u !== "object") return "";
-    const o = u as any;
-    const e1 = typeof o?.email?.address === "string" ? o.email.address : "";
+    const o = u as Record<string, unknown>;
+    const email = o.email && typeof o.email === "object" ? (o.email as Record<string, unknown>) : null;
+    const google = o.google && typeof o.google === "object" ? (o.google as Record<string, unknown>) : null;
+    const apple = o.apple && typeof o.apple === "object" ? (o.apple as Record<string, unknown>) : null;
+    const e1 = typeof email?.address === "string" ? String(email.address) : "";
     if (e1.trim()) return e1.trim();
-    const e2 = typeof o?.google?.email === "string" ? o.google.email : "";
+    const e2 = typeof google?.email === "string" ? String(google.email) : "";
     if (e2.trim()) return e2.trim();
-    const e3 = typeof o?.apple?.email === "string" ? o.apple.email : "";
+    const e3 = typeof apple?.email === "string" ? String(apple.email) : "";
     if (e3.trim()) return e3.trim();
     return "";
   }

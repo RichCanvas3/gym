@@ -29,6 +29,7 @@ export async function POST(req: Request) {
     timeMaxISO,
     maxResults: 2500,
   });
-  return NextResponse.json({ ok: true, timeMinISO, timeMaxISO, ...out });
+  const extra = out && typeof out === "object" ? (out as Record<string, unknown>) : { raw: out };
+  return NextResponse.json({ ok: true, timeMinISO, timeMaxISO, ...extra });
 }
 

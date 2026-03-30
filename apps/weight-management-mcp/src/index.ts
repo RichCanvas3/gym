@@ -21,7 +21,10 @@ export interface Env {
 }
 
 type Scope = {
-  telegramUserId: string;
+  /** Preferred canonical id (Privy canonical accountAddress), e.g. acct:privy_... */
+  accountAddress?: string;
+  /** Back-compat: Telegram numeric user id as string (e.g. "6105195555"). */
+  telegramUserId?: string;
 };
 
 type JsonRpcRequest = {
@@ -149,7 +152,11 @@ function nowMs(): number {
 }
 
 function scopeId(scope: Scope): string {
-  return `tg:${scope.telegramUserId}`;
+  const acct = typeof scope.accountAddress === "string" ? scope.accountAddress.trim() : "";
+  if (acct) return acct;
+  const tg = typeof scope.telegramUserId === "string" ? scope.telegramUserId.trim() : "";
+  if (!tg) throw new Error("Missing scope.accountAddress or scope.telegramUserId");
+  return `tg:${tg}`;
 }
 
 async function migrateScopeId(env: Env, fromScopeId: string, toScopeId: string): Promise<{ ok: true; migrated: boolean; fromScopeId: string; toScopeId: string; tablesUpdated: number }> {
@@ -179,14 +186,14 @@ async function migrateScopeId(env: Env, fromScopeId: string, toScopeId: string):
 
 async function maybeAutoMigrateLegacyAcctScope(env: Env, toScopeId: string): Promise<{ migrated: boolean; fromScopeId: string | null }> {
   const sid = String(toScopeId ?? "").trim();
-  if (!sid.startsWith("tg:")) return { migrated: false, fromScopeId: null };
+  if (!sid.startsWith("acct:")) return { migrated: false, fromScopeId: null };
 
   // If we already have scoped rows, do nothing.
   const anyScoped = await env.DB.prepare(`SELECT 1 FROM wm_food_entries WHERE scope_id=?1 LIMIT 1`).bind(sid).first();
   if (anyScoped) return { migrated: false, fromScopeId: null };
 
-  // If there is exactly one legacy acct:* scope present, assume it belongs to this single-user deployment and migrate.
-  const legacy = await env.DB.prepare(`SELECT DISTINCT scope_id FROM wm_food_entries WHERE scope_id LIKE 'acct:%' LIMIT 3`).all<{ scope_id: string }>();
+  // Single-user migration assist: if there is exactly one tg:* scope present, migrate it to acct:*.
+  const legacy = await env.DB.prepare(`SELECT DISTINCT scope_id FROM wm_food_entries WHERE scope_id LIKE 'tg:%' LIMIT 3`).all<{ scope_id: string }>();
   const ids = (legacy.results ?? []).map((r: any) => String(r?.scope_id ?? "").trim()).filter(Boolean);
   const uniq = Array.from(new Set(ids));
   if (uniq.length !== 1) return { migrated: false, fromScopeId: null };
@@ -391,16 +398,20 @@ async function fetchHttpUrlAsDataUrl(url: string, env: Env): Promise<string> {
 
 function parseScope(params: Record<string, unknown>): Scope {
   const s = isRecord(params.scope) ? (params.scope as Record<string, unknown>) : {};
+  const accountAddress =
+    typeof (s as any).accountAddress === "string"
+      ? String((s as any).accountAddress).trim()
+      : typeof (s as any).canonicalAddress === "string"
+        ? String((s as any).canonicalAddress).trim()
+        : "";
   const telegramUserId =
     typeof (s as any).telegramUserId === "string"
       ? String((s as any).telegramUserId).trim()
       : typeof (s as any).telegram_user_id === "string"
         ? String((s as any).telegram_user_id).trim()
         : "";
-  if (!telegramUserId) throw new Error("Missing scope.telegramUserId");
-  return {
-    telegramUserId,
-  };
+  if (!accountAddress && !telegramUserId) throw new Error("Missing scope.accountAddress (preferred) or scope.telegramUserId");
+  return { ...(accountAddress ? { accountAddress } : {}), ...(telegramUserId ? { telegramUserId } : {}) };
 }
 
 function parseAtMs(v: unknown): number {
@@ -823,9 +834,10 @@ function toolList() {
   const scopeSchema = {
     type: "object",
     properties: {
+      accountAddress: { type: "string", description: "Preferred canonical id (Privy accountAddress), e.g. 'acct:privy_...'." },
       telegramUserId: { type: "string", description: "Telegram numeric user id as string (e.g. '6105195555')." },
     },
-    required: ["telegramUserId"],
+    anyOf: [{ required: ["accountAddress"] }, { required: ["telegramUserId"] }],
   };
 
   return [

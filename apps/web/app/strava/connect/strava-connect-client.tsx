@@ -9,7 +9,7 @@ type Status =
   | { kind: "idle" }
   | { kind: "redirecting" }
   | { kind: "exchanging" }
-  | { kind: "ok"; detail: any }
+  | { kind: "ok"; detail: unknown }
   | { kind: "error"; error: string };
 
 export default function StravaConnectClient() {
@@ -103,7 +103,8 @@ export default function StravaConnectClient() {
         } catch {
           // ignore
         }
-        setStatus({ kind: "error", error: String((e as any)?.message ?? e) });
+        const msg = e instanceof Error ? e.message : String(e ?? "");
+        setStatus({ kind: "error", error: msg });
       }
     }
 

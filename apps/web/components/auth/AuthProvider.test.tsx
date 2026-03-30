@@ -33,7 +33,7 @@ describe("AuthProvider", () => {
 
     vi.stubEnv("NEXT_PUBLIC_PRIVY_APP_ID", "app_test");
     const subtle = { digest: vi.fn(async () => new Uint8Array([1, 2, 3]).buffer) };
-    const prev = (globalThis.crypto as any)?.subtle;
+    const prev = (globalThis.crypto as Crypto & { subtle?: unknown }).subtle;
     Object.defineProperty(globalThis.crypto, "subtle", { value: subtle, configurable: true });
 
     render(

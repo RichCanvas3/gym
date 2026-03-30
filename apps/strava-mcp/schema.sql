@@ -34,3 +34,12 @@ CREATE TABLE IF NOT EXISTS strava_tokens (
   athlete_json TEXT,
   updated_at_iso TEXT NOT NULL
 );
+
+-- Preferred: key connections by Privy canonical account address (accountAddress).
+CREATE TABLE IF NOT EXISTS strava_tokens_v2 (
+  account_address TEXT PRIMARY KEY,
+  refresh_token TEXT NOT NULL,
+  scope TEXT,
+  athlete_json TEXT,
+  updated_at_iso TEXT NOT NULL
+);

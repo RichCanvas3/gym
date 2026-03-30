@@ -37,6 +37,7 @@ export async function GET(req: Request) {
     timeMaxISO,
     maxResults: 200,
   });
-  return NextResponse.json({ ok: true, start, end, timeMinISO, timeMaxISO, ...out });
+  const extra = out && typeof out === "object" ? (out as Record<string, unknown>) : { raw: out };
+  return NextResponse.json({ ok: true, start, end, timeMinISO, timeMaxISO, ...extra });
 }
 

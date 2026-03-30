@@ -63,3 +63,21 @@ CREATE TABLE IF NOT EXISTS telegram_media_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_telegram_media_expires ON telegram_media_tokens(expires_at_iso);
 
+-- Account linking ("Connect Telegram"): maps Privy canonical accountAddress to Telegram user/chat
+CREATE TABLE IF NOT EXISTS telegram_oauth_states (
+  state TEXT PRIMARY KEY,
+  account_address TEXT NOT NULL,
+  created_at_iso TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_oauth_states_created ON telegram_oauth_states(created_at_iso DESC);
+
+CREATE TABLE IF NOT EXISTS telegram_account_links (
+  account_address TEXT PRIMARY KEY,
+  telegram_user_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  linked_at_iso TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_account_links_tg_user ON telegram_account_links(telegram_user_id);
+
