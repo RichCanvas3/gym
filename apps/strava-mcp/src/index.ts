@@ -378,6 +378,36 @@ function createServer(env: Env) {
   });
 
   server.tool(
+    "strava_disconnect",
+    "Disconnect Strava for an account (deletes stored refresh token).",
+    { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional() },
+    async (args) => {
+      await ensureSchema(env);
+      const p = IdentityArgs.parse(args);
+      const id = requireIdentity(p);
+      const ts = nowISO();
+      if (id.kind === "account" && id.accountAddress) {
+        await env.DB.prepare(`DELETE FROM strava_tokens_v2 WHERE account_address = ?`).bind(id.accountAddress).run();
+      } else if (id.kind === "telegram" && id.telegramUserId) {
+        await env.DB.prepare(`DELETE FROM strava_tokens WHERE telegram_user_id = ?`).bind(id.telegramUserId).run();
+      }
+      await env.DB.prepare(`DELETE FROM strava_sync_state_v2 WHERE scope_id = ?`).bind(id.scopeId).run();
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText({
+              ok: true,
+              disconnectedAtISO: ts,
+              ...(id.kind === "account" ? { accountAddress: id.accountAddress } : { telegramUserId: id.telegramUserId }),
+            }),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "strava_connect",
     "Exchange Strava OAuth code and store refresh token.",
     { accountAddress: z.string().min(1).optional(), telegramUserId: z.string().min(1).optional(), code: z.string().min(1), redirectUri: z.string().url() },

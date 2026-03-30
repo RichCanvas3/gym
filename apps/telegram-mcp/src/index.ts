@@ -798,6 +798,20 @@ function createServer(env: Env) {
   );
 
   server.tool(
+    "telegram_link_disconnect",
+    "Disconnect Telegram for an accountAddress (deletes stored link).",
+    { accountAddress: z.string().min(1) },
+    async (args) => {
+      const p = z.object({ accountAddress: z.string().min(1) }).parse(args);
+      await ensureSchema(env);
+      const acct = p.accountAddress.trim();
+      await env.DB.prepare(`DELETE FROM telegram_account_links WHERE account_address = ?`).bind(acct).run();
+      await env.DB.prepare(`DELETE FROM telegram_oauth_states WHERE account_address = ?`).bind(acct).run();
+      return { content: [{ type: "text", text: jsonText({ ok: true, accountAddress: acct, disconnectedAtISO: nowISO() }) }] };
+    },
+  );
+
+  server.tool(
     "telegram_send_message_to_account",
     "Send a Telegram message to a linked accountAddress.",
     { accountAddress: z.string().min(1), text: z.string().min(1), parseMode: z.enum(["MarkdownV2", "HTML"]).optional(), disableNotification: z.boolean().optional() },

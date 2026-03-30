@@ -349,6 +349,27 @@ function createServer(env: Env) {
   );
 
   server.tool(
+    "googlecalendar_disconnect",
+    "Disconnect Google Calendar for an account (deletes stored refresh token + cached events).",
+    { accountAddress: z.string().min(3).optional(), telegramUserId: z.string().min(3).optional(), clearCachedEvents: z.boolean().optional() },
+    async (args) => {
+      await ensureSchema(env);
+      await ensureEventCacheTables(env);
+      const p = z
+        .object({ accountAddress: z.string().min(3).optional(), telegramUserId: z.string().min(3).optional(), clearCachedEvents: z.boolean().optional() })
+        .parse(args);
+      const acctRaw = (p.accountAddress ?? "").trim();
+      const acct = acctRaw || (await resolveAccountAddress(env, { telegramUserId: p.telegramUserId })).accountAddress;
+      const ts = nowISO();
+      await env.DB.prepare(`DELETE FROM google_calendar_connections WHERE account_address = ?`).bind(acct).run();
+      if (p.clearCachedEvents !== false) {
+        await env.DB.prepare(`DELETE FROM google_calendar_events WHERE account_address = ?`).bind(acct).run();
+      }
+      return { content: [{ type: "text", text: jsonText({ ok: true, accountAddress: acct, disconnectedAtISO: ts, clearedEvents: p.clearCachedEvents !== false }) }] };
+    },
+  );
+
+  server.tool(
     "googlecalendar_freebusy",
     "Get free/busy blocks for the user's primary calendar.",
     {

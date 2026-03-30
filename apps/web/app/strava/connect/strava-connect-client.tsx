@@ -21,6 +21,18 @@ export default function StravaConnectClient() {
   const code = useMemo(() => (sp?.get("code") ?? "").trim(), [sp]);
   const redirectUri = useMemo(() => (typeof window !== "undefined" ? `${window.location.origin}/strava/connect` : ""), []);
 
+  async function disconnect() {
+    const tok = await getAccessToken();
+    if (!tok) throw new Error("Missing Privy access token");
+    await fetch("/api/strava/disconnect", { method: "POST", headers: { authorization: `Bearer ${tok}` } });
+    try {
+      if (typeof window !== "undefined") window.sessionStorage.removeItem("strava_oauth_connected");
+    } catch {
+      // ignore
+    }
+    setStatus({ kind: "idle" });
+  }
+
   useEffect(() => {
     if (!ready) return;
     if (!authenticated) return;
@@ -159,9 +171,17 @@ export default function StravaConnectClient() {
             <pre className="mt-3 max-h-80 overflow-auto rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-[11px] dark:border-white/10 dark:bg-black/40">
               {JSON.stringify(status.detail, null, 2)}
             </pre>
-            <Link href="/chat" className="mt-4 inline-flex text-xs font-medium underline">
-              Back to chat
-            </Link>
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                onClick={async () => disconnect()}
+                className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
+              >
+                Disconnect
+              </button>
+              <Link href="/chat" className="inline-flex text-xs font-medium underline">
+                Back to chat
+              </Link>
+            </div>
           </div>
         ) : null}
         {status.kind === "error" ? (

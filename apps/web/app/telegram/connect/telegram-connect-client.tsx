@@ -40,6 +40,18 @@ export function TelegramConnectClient() {
     }
   }
 
+  async function disconnect() {
+    if (!authenticated) return;
+    setBusy(true);
+    try {
+      const tok = await getAccessToken();
+      await fetch("/api/telegram/disconnect", { method: "POST", headers: { authorization: `Bearer ${tok}` } });
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   useEffect(() => {
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -68,6 +80,15 @@ export function TelegramConnectClient() {
             >
               {linked ? "Reconnect Telegram" : "Connect Telegram"}
             </button>
+            {linked ? (
+              <button
+                onClick={disconnect}
+                disabled={busy}
+                className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950 disabled:opacity-60"
+              >
+                Disconnect
+              </button>
+            ) : null}
             <button
               onClick={refresh}
               disabled={busy}

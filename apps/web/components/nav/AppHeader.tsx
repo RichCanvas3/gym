@@ -182,13 +182,11 @@ export function AppHeader() {
               <div className="min-w-0">
                 <div className="truncate font-semibold">Signed in</div>
                 <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">{accountAddress}</div>
-                <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">
-                  {telegramLinkedUserId
-                    ? `tg:${telegramLinkedUserId}`
-                    : telegramUserId
-                      ? `tg:${telegramUserId}`
-                      : "tg:(not linked)"}
-                </div>
+                {telegramLinkedUserId || telegramUserId ? (
+                  <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">
+                    {telegramLinkedUserId ? `tg:${telegramLinkedUserId}` : `tg:${telegramUserId}`}
+                  </div>
+                ) : null}
               </div>
             ) : (
               <div className="text-zinc-600 dark:text-zinc-400">Not signed in</div>
@@ -224,11 +222,24 @@ export function AppHeader() {
           ) : null}
 
           <button
-            onClick={() => {
+            onClick={async () => {
               clear();
               clearReservations();
-              if (authenticated) logout();
-              else login();
+              if (authenticated) {
+                try {
+                  const tok = await getAccessToken();
+                  await Promise.allSettled([
+                    fetch("/api/strava/disconnect", { method: "POST", headers: { authorization: `Bearer ${tok}` } }),
+                    fetch("/api/googlecalendar/disconnect", { method: "POST", headers: { authorization: `Bearer ${tok}` } }),
+                    fetch("/api/telegram/disconnect", { method: "POST", headers: { authorization: `Bearer ${tok}` } }),
+                  ]);
+                } catch {
+                  // ignore
+                }
+                logout();
+              } else {
+                login();
+              }
             }}
             className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-medium dark:border-white/10 dark:bg-zinc-950"
           >
