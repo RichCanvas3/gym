@@ -80,19 +80,20 @@ function addDaysISO(isoDate: string, days: number) {
   return startOfDayISO(new Date(ms + days * 24 * 3600 * 1000));
 }
 
-function formatLocalTime(iso: string) {
+function formatLocalTime(iso: string, tzName?: string) {
   const d = new Date(iso);
-  return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(d);
+  return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", ...(tzName ? { timeZone: tzName } : {}) }).format(d);
 }
 
 function formatWeekday(isoDate: string) {
   const d = new Date(`${isoDate}T00:00:00.000Z`);
-  return new Intl.DateTimeFormat("en-US", { weekday: "short" }).format(d);
+  // isoDate is a date-only label; format in UTC to avoid timezone day-shift.
+  return new Intl.DateTimeFormat("en-US", { weekday: "short", timeZone: "UTC" }).format(d);
 }
 
 function formatMonthDay(isoDate: string) {
   const d = new Date(`${isoDate}T00:00:00.000Z`);
-  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" }).format(d);
 }
 
 function formatEventWhen(startIso: string | null | undefined) {
@@ -104,21 +105,30 @@ function formatEventWhen(startIso: string | null | undefined) {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(d);
 }
 
-function gcalDateKey(startIso: string | null | undefined) {
+function dateKeyInTz(iso: string, tzName: string) {
+  const d = new Date(iso);
+  const ms = d.getTime();
+  if (!Number.isFinite(ms)) return "";
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tzName, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
+  const y = parts.find((p) => p.type === "year")?.value ?? "";
+  const m = parts.find((p) => p.type === "month")?.value ?? "";
+  const day = parts.find((p) => p.type === "day")?.value ?? "";
+  if (!y || !m || !day) return "";
+  return `${y}-${m}-${day}`;
+}
+
+function gcalDateKey(startIso: string | null | undefined, tzName: string) {
   const s = (startIso ?? "").trim();
   if (!s) return "";
   if (!s.includes("T") && /^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  const d = new Date(s);
-  const ms = d.getTime();
-  if (!Number.isFinite(ms)) return "";
-  return new Date(ms).toISOString().slice(0, 10);
+  return dateKeyInTz(s, tzName);
 }
 
-function gcalTimeLabel(startIso: string | null | undefined) {
+function gcalTimeLabel(startIso: string | null | undefined, tzName: string) {
   const s = (startIso ?? "").trim();
   if (!s) return "";
   if (!s.includes("T") && /^\d{4}-\d{2}-\d{2}$/.test(s)) return "All-day";
-  return formatLocalTime(s);
+  return formatLocalTime(s, tzName);
 }
 
 type Filters = {
@@ -316,14 +326,13 @@ function CalendarInner() {
     const map = new Map<string, CalendarItem[]>();
     for (const d of weekDates) map.set(d, []);
     for (const c of filteredClasses) {
-      const d = new Date(c.startTimeISO);
-      const key = d.toISOString().slice(0, 10);
+      const key = dateKeyInTz(c.startTimeISO, clientTz || "America/Denver");
       const arr = map.get(key);
       if (arr) arr.push({ kind: "class", c });
     }
     if (showPrivateCalendar) {
       for (const e of privateEvents) {
-        const key = gcalDateKey(e.start_iso ?? null);
+        const key = gcalDateKey(e.start_iso ?? null, clientTz || "America/Denver");
         const arr = map.get(key);
         if (arr) arr.push({ kind: "gcal", e });
       }
@@ -341,7 +350,7 @@ function CalendarInner() {
       map.set(k, arr);
     }
     return [...map.entries()];
-  }, [filteredClasses, weekDates, privateEvents, showPrivateCalendar]);
+  }, [filteredClasses, weekDates, privateEvents, showPrivateCalendar, clientTz]);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-black dark:text-zinc-50">
@@ -570,7 +579,7 @@ function CalendarInner() {
                       ) : (
                         items.map((it) => {
                           if (it.kind === "gcal") {
-                            const when = gcalTimeLabel(it.e.start_iso ?? null);
+                            const when = gcalTimeLabel(it.e.start_iso ?? null, clientTz || "America/Denver");
                             return (
                               <div
                                 key={`gcal:${it.e.event_id}`}
@@ -609,7 +618,7 @@ function CalendarInner() {
                                   <div className="flex flex-wrap items-center gap-2">
                                     <div className="flex items-center gap-1 text-xs font-medium">
                                       <Clock className="h-3.5 w-3.5 text-zinc-600 dark:text-zinc-400" aria-hidden="true" />
-                                      {formatLocalTime(c.startTimeISO)}
+                                      {formatLocalTime(c.startTimeISO, clientTz || "America/Denver")}
                                     </div>
                                     {reservedId ? (
                                       <span className="inline-flex items-center gap-1 rounded-full bg-emerald-600 px-2 py-0.5 text-[10px] font-semibold text-white dark:bg-emerald-500">

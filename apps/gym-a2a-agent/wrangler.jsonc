@@ -1,0 +1,25 @@
+/**
+ * Per-user A2A ingress worker (wildcard subdomains).
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gym-a2a-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "vars": {
+    "DEFAULT_TZ": "America/Denver",
+    "HANDLE_BASE_DOMAIN": "a2a.richardpedersen3.workers.dev",
+    "LANGGRAPH_ASSISTANT_ID": "gym"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gym-a2a-agent",
+      "database_id": "71ba0d80-882b-4e51-b247-d1ee5cb65c14",
+      "remote": true
+    }
+  ]
+}
+

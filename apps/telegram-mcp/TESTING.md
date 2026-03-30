@@ -338,7 +338,7 @@ The JSON includes **`urls`** (open in a browser to test). Cap: **120** unique `f
 Optional **scheduled** backfill: set **`TELEGRAM_CRON_BACKFILL=1`**, add to `wrangler.jsonc`:
 
 ```jsonc
-"triggers": { "crons": ["0 4 * * *"] }
+"triggers": { cd ..["0 4 * * *"] }
 ```
 
 (daily 04:00 UTC — adjust or remove). Without the var, the scheduled handler only logs a skip line.

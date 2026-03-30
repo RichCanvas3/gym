@@ -1,0 +1,20 @@
+{
+  "name": "gym-a2a-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "@noble/secp256k1": "^3.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260305.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.69.0"
+  }
+}
+
