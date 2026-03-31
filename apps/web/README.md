@@ -20,6 +20,21 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## A2A-backed chat (prod)
+
+The chat route `POST /api/agent/run` forwards requests through `gym-a2a-agent` (A2A) instead of calling LangGraph directly.
+
+Server-side env vars (Vercel):
+
+- `A2A_AGENT_URL`: base worker URL (no handle subdomain), e.g. `https://gym-a2a-agent.<acct>.workers.dev`
+- `A2A_HANDLE_BASE_DOMAIN`: wildcard base domain, e.g. `a2a.example.com`
+- `A2A_ADMIN_KEY`: must match worker `A2A_ADMIN_KEY` (used to upsert handle mappings)
+- `A2A_WEB_KEY`: must match worker `A2A_WEB_KEY` (used as header `x-web-key`)
+
+Optional (UI only):
+
+- `NEXT_PUBLIC_A2A_HANDLE_BASE_DOMAIN`: used by `/a2a` page to show the endpoint URL.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:

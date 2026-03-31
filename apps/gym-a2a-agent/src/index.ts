@@ -16,6 +16,9 @@ type Env = {
   // Admin writes (handle claiming) from web app
   A2A_ADMIN_KEY?: string;
 
+  // First-party web bypass (server-to-server)
+  A2A_WEB_KEY?: string;
+
   // Rudimentary abuse control
   RATE_LIMIT_PER_MINUTE?: string;
 };
@@ -249,8 +252,15 @@ async function forwardToLangGraph(env: Env, args: { handle: string; accountAddre
   const assistantId = (env.LANGGRAPH_ASSISTANT_ID ?? "gym").trim() || "gym";
   if (!deploymentUrl || !apiKey) throw new Error("missing_langgraph_env");
 
-  const tz = (env.DEFAULT_TZ ?? "America/Denver").trim() || "America/Denver";
   const threadId = `a2a_${args.handle}`;
+  const md = args.metadata && typeof args.metadata === "object" ? args.metadata : undefined;
+  const callerSession = md?.session && typeof md.session === "object" ? (md.session as Record<string, unknown>) : undefined;
+  const tzRaw = (callerSession?.timezone ?? md?.timezone ?? env.DEFAULT_TZ ?? "America/Denver") as unknown;
+  const tz = typeof tzRaw === "string" && tzRaw.trim() ? tzRaw.trim() : "America/Denver";
+  const gymNameRaw = (callerSession?.gymName ?? md?.gymName ?? "Erie Community Center") as unknown;
+  const gymName = typeof gymNameRaw === "string" && gymNameRaw.trim() ? gymNameRaw.trim() : "Erie Community Center";
+  const a2aMeta = md ? { ...md } : undefined;
+  if (a2aMeta && "session" in a2aMeta) delete (a2aMeta as Record<string, unknown>)["session"];
   const res = await fetch(`${deploymentUrl}/runs/wait`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-api-key": apiKey },
@@ -259,13 +269,15 @@ async function forwardToLangGraph(env: Env, args: { handle: string; accountAddre
       input: {
         message: args.message,
         session: {
-          gymName: "Erie Community Center",
+          ...(callerSession ?? {}),
+          gymName,
           timezone: tz,
           accountAddress: args.accountAddress,
           threadId,
-          a2a: { handle: args.handle, ...(args.metadata ?? {}) },
+          a2a: { handle: args.handle, ...(a2aMeta ?? {}) },
         },
       },
+      config: { configurable: { thread_id: threadId } },
     }),
   });
   const json = (await res.json().catch(() => ({}))) as any;
@@ -275,7 +287,7 @@ async function forwardToLangGraph(env: Env, args: { handle: string; accountAddre
   }
   const out = json?.output;
   const answer = typeof out?.answer === "string" ? out.answer : typeof out?.output === "string" ? out.output : null;
-  return { ok: true, answer, raw: json };
+  return { ok: true, answer, output: out ?? null, raw: json };
 }
 
 function agentCardForHandle(origin: string, handle: string) {
@@ -369,11 +381,16 @@ export default {
       if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
       const envl: A2aEnvelope = body && typeof body === "object" ? (body as A2aEnvelope) : {};
 
-      try {
-        await verifySignatureOrThrow(handle, envl);
-      } catch (e) {
-        const code = String((e as any)?.message ?? e);
-        return unauthorized(code);
+      const wantWeb = (env.A2A_WEB_KEY ?? "").trim();
+      const gotWeb = (req.headers.get("x-web-key") ?? "").trim();
+      const isWebBypass = Boolean(wantWeb && gotWeb && gotWeb === wantWeb);
+      if (!isWebBypass) {
+        try {
+          await verifySignatureOrThrow(handle, envl);
+        } catch (e) {
+          const code = String((e as any)?.message ?? e);
+          return unauthorized(code);
+        }
       }
 
       const message =
@@ -402,6 +419,8 @@ export default {
           handle,
           accountAddress: row.account_address,
           response: { received: true, processedAt: nowISO(), answer: forwarded.answer },
+          agentOutput: forwarded.output ?? null,
+          raw: isWebBypass ? forwarded.raw ?? null : undefined,
         });
       } catch (e) {
         return json({ ok: false, error: "forward_failed", detail: String((e as any)?.message ?? e) }, 502);

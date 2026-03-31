@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { requirePrivyAuth, telegramUserIdForPrivyDid } from "../../_lib/privy";
 import { mcpToolCall } from "../../_lib/mcp";
+import { createHash } from "crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,19 +11,54 @@ type Body = {
   session?: unknown;
 };
 
-export async function POST(req: Request) {
-  const deploymentUrl = process.env.LANGGRAPH_DEPLOYMENT_URL ?? "";
-  const apiKey = process.env.LANGSMITH_API_KEY ?? "";
-  const assistantId = process.env.LANGGRAPH_ASSISTANT_ID ?? "gym";
+function a2aAgentBaseUrl(): string {
+  const u = String(process.env.A2A_AGENT_URL ?? "").trim();
+  if (!u) throw new Error("Missing A2A_AGENT_URL");
+  return u.replace(/\/+$/, "");
+}
 
+function a2aHandleBaseDomain(): string {
+  const s = String(process.env.A2A_HANDLE_BASE_DOMAIN ?? "").trim();
+  if (!s) throw new Error("Missing A2A_HANDLE_BASE_DOMAIN");
+  const noProto = s.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  if (!noProto) throw new Error("Invalid A2A_HANDLE_BASE_DOMAIN");
+  return noProto;
+}
+
+function a2aAdminKey(): string {
+  const k = String(process.env.A2A_ADMIN_KEY ?? "").trim();
+  if (!k) throw new Error("Missing A2A_ADMIN_KEY");
+  return k;
+}
+
+function a2aWebKey(): string {
+  const k = String(process.env.A2A_WEB_KEY ?? "").trim();
+  if (!k) throw new Error("Missing A2A_WEB_KEY");
+  return k;
+}
+
+function handleForAccountAddress(accountAddress: string): string {
+  const acct = String(accountAddress ?? "").trim();
+  const hex = createHash("sha256").update(acct).digest("hex");
+  // Must match: /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/
+  return `u-${hex.slice(0, 50)}`;
+}
+
+export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
-  if (!deploymentUrl || !apiKey) {
-    return NextResponse.json(
-      { error: "Missing LANGGRAPH_DEPLOYMENT_URL or LANGSMITH_API_KEY" },
-      { status: 500 },
-    );
+  let baseUrl = "";
+  let baseDomain = "";
+  let adminKey = "";
+  let webKey = "";
+  try {
+    baseUrl = a2aAgentBaseUrl();
+    baseDomain = a2aHandleBaseDomain();
+    adminKey = a2aAdminKey();
+    webKey = a2aWebKey();
+  } catch (e) {
+    return NextResponse.json({ error: (e as Error)?.message ?? String(e ?? "") }, { status: 500 });
   }
 
   const body = (await req.json().catch(() => null)) as Body | null;
@@ -54,35 +90,54 @@ export async function POST(req: Request) {
   const threadId = typeof threadIdRaw === "string" && threadIdRaw.trim() ? threadIdRaw : derivedThreadId;
   sessionOut.threadId = threadId;
 
-  const url = `${deploymentUrl.replace(/\/$/, "")}/runs/wait`;
-  const res = await fetch(url, {
+  const handle = handleForAccountAddress(auth.accountAddress);
+
+  // Ensure handle → account mapping exists (idempotent).
+  try {
+    await fetch(`${baseUrl}/api/a2a/handle`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-admin-key": adminKey },
+      body: JSON.stringify({
+        handle,
+        accountAddress: auth.accountAddress,
+        telegramUserId: telegramUserId ?? null,
+      }),
+    });
+  } catch {
+    // ignore (best-effort); the subsequent /api/a2a call will fail clearly if handle missing
+  }
+
+  const a2aEndpoint = `https://${handle}.${baseDomain}/api/a2a`;
+  const res = await fetch(a2aEndpoint, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-    },
+    headers: { "content-type": "application/json", "x-web-key": webKey },
     body: JSON.stringify({
-      assistant_id: assistantId,
-      input: { message, session: sessionOut },
-      // LangGraph uses thread_id (via config) to restore state when a checkpointer is configured.
-      config: threadId ? { configurable: { thread_id: threadId } } : undefined,
+      fromAgentId: "web",
+      toAgentId: "gym-a2a-agent",
+      message,
+      metadata: {
+        session: sessionOut,
+        webThreadId: threadId,
+      },
     }),
   });
 
   const json = (await res.json().catch(() => ({}))) as unknown;
+  const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
   if (!res.ok) {
-    return NextResponse.json(json, { status: res.status });
+    return NextResponse.json({ error: "a2a_forward_failed", detail: rec?.error ?? json }, { status: 502 });
+  }
+  if (rec.ok !== true) {
+    return NextResponse.json({ error: "a2a_forward_failed", detail: json }, { status: 502 });
   }
 
-  // Our graph returns { output: { answer, ... }, messages: [...] }
-  const j = json as Record<string, unknown>;
-  if (j.__error__ && typeof j.__error__ === "object") {
-    return NextResponse.json({ error: "Agent error", detail: j.__error__ }, { status: 502 });
+  const agentOutput = rec.agentOutput;
+  if (agentOutput && typeof agentOutput === "object" && !Array.isArray(agentOutput)) {
+    return NextResponse.json(agentOutput);
   }
-  const output = (j.output ?? {}) as Record<string, unknown>;
-  if (!output || typeof output !== "object" || Array.isArray(output) || !("answer" in output)) {
-    return NextResponse.json({ error: "Agent returned no output", detail: j }, { status: 502 });
-  }
-  return NextResponse.json(output);
+  const response = rec.response && typeof rec.response === "object" ? (rec.response as Record<string, unknown>) : {};
+  const answer = typeof response.answer === "string" ? response.answer : "";
+  if (answer.trim()) return NextResponse.json({ answer });
+  return NextResponse.json({ error: "Agent returned no output", detail: json }, { status: 502 });
 }
 
