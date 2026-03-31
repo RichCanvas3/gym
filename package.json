@@ -2,6 +2,15 @@
   "name": "climb-gym-copilot",
   "private": true,
   "packageManager": "pnpm@10.25.0",
+  "pnpm": {
+    "packageExtensions": {
+      "@veramo/utils@*": {
+        "dependencies": {
+          "@noble/hashes": "^1.8.0"
+        }
+      }
+    }
+  },
   "scripts": {
     "dev": "pnpm --filter web dev",
     "build": "pnpm --filter web build",

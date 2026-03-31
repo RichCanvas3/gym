@@ -163,3 +163,56 @@ export async function telegramUserIdForPrivyDid(did: string): Promise<string | n
   }
 }
 
+function extractEoaFromPrivyUser(user: unknown): `0x${string}` | null {
+  if (!user || typeof user !== "object") return null;
+  const u = user as Record<string, unknown>;
+
+  const candidates: unknown[] = [];
+  // Common top-level fields (varies by Privy account type)
+  candidates.push(u.wallet_address, u.walletAddress, u.address);
+
+  // linked_accounts frequently contains embedded wallet entries
+  const linked = (u.linked_accounts ?? u.linkedAccounts) as unknown;
+  if (Array.isArray(linked)) {
+    for (const a of linked) {
+      if (!a || typeof a !== "object") continue;
+      const acc = a as Record<string, unknown>;
+      candidates.push(acc.address, acc.wallet_address, acc.walletAddress);
+
+      const wallet = acc.wallet && typeof acc.wallet === "object" ? (acc.wallet as Record<string, unknown>) : null;
+      if (wallet) candidates.push(wallet.address, wallet.wallet_address, wallet.walletAddress);
+    }
+  }
+
+  // Some shapes include `wallets: [{ address }]`
+  const wallets = u.wallets as unknown;
+  if (Array.isArray(wallets)) {
+    for (const w of wallets) {
+      if (!w || typeof w !== "object") continue;
+      const wr = w as Record<string, unknown>;
+      candidates.push(wr.address, wr.wallet_address, wr.walletAddress);
+    }
+  }
+
+  for (const c of candidates) {
+    if (typeof c !== "string") continue;
+    const s = c.trim();
+    if (/^0x[0-9a-fA-F]{40}$/.test(s)) return s.toLowerCase() as `0x${string}`;
+  }
+  return null;
+}
+
+export async function eoaAddressForPrivyDid(did: string): Promise<`0x${string}` | null> {
+  const clean = String(did ?? "").trim();
+  if (!clean) return null;
+  try {
+    const privy = privyClient();
+    const user = await (privy as unknown as { users: () => { _get: (id: string) => Promise<unknown> } })
+      .users()
+      ._get(clean);
+    return extractEoaFromPrivyUser(user);
+  } catch {
+    return null;
+  }
+}
+

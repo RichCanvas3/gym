@@ -56,6 +56,7 @@ export function AppHeader() {
   const [googleCalendarConnected, setGoogleCalendarConnected] = useState<boolean | null>(null);
   const [telegramConnected, setTelegramConnected] = useState<boolean | null>(null);
   const [telegramLinkedUserId, setTelegramLinkedUserId] = useState<string | null>(null);
+  const [gymAgentBaseName, setGymAgentBaseName] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -138,6 +139,31 @@ export function AppHeader() {
     };
   }, [authenticated, getAccessToken]);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      if (!authenticated) {
+        if (!cancelled) setGymAgentBaseName(null);
+        return;
+      }
+      try {
+        const tok = await getAccessToken();
+        const res = await fetch("/api/agentictrust/status", { headers: { authorization: `Bearer ${tok}` } });
+        const j = (await res.json().catch(() => ({}))) as unknown;
+        const rec = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
+        const v = rec.savedBaseName;
+        const name = typeof v === "string" && v.trim() ? v.trim() : null;
+        if (!cancelled) setGymAgentBaseName(name);
+      } catch {
+        if (!cancelled) setGymAgentBaseName(null);
+      }
+    }
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated, getAccessToken]);
+
   return (
     <div className="sticky top-0 z-20 border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-white/10 dark:bg-black/60">
       <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-3 px-4 py-3">
@@ -182,6 +208,11 @@ export function AppHeader() {
               <div className="min-w-0">
                 <div className="truncate font-semibold">Signed in</div>
                 <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">{accountAddress}</div>
+                {gymAgentBaseName ? (
+                  <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">
+                    {`gym:${gymAgentBaseName}`}
+                  </div>
+                ) : null}
                 {telegramLinkedUserId || telegramUserId ? (
                   <div className="truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-500">
                     {telegramLinkedUserId ? `tg:${telegramLinkedUserId}` : `tg:${telegramUserId}`}

@@ -222,6 +222,21 @@ export default function ChatPage() {
 
   useEffect(() => {
     let cancelled = false;
+    async function ensureGymAgentName() {
+      if (!authenticated) return;
+      if (!hydrated) return;
+      try {
+        const tok = await getAccessToken();
+        if (!tok || tok.split(".").length !== 3) return;
+        const res = await fetch("/api/agentictrust/status", { headers: { authorization: `Bearer ${tok}` } });
+        const json = (await res.json().catch(() => ({}))) as unknown;
+        const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+        const saved = typeof rec.savedBaseName === "string" ? rec.savedBaseName.trim() : "";
+        if (!saved && !cancelled) router.push("/agent/register");
+      } catch {
+        // ignore
+      }
+    }
     async function loadProfile() {
       if (!authenticated) return;
       if (!hydrated) return;
@@ -306,11 +321,12 @@ export default function ChatPage() {
         if (!cancelled) setProfileBusy(false);
       }
     }
+    void ensureGymAgentName();
     void loadProfile();
     return () => {
       cancelled = true;
     };
-  }, [hydrated, accountAddress, clientTz, threadId, getAccessToken]);
+  }, [hydrated, accountAddress, clientTz, threadId, getAccessToken, authenticated, router]);
 
   useEffect(() => {
     const tid = threadId || "thr_demo";

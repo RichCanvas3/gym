@@ -10,7 +10,7 @@
   "observability": { "enabled": true },
   "vars": {
     "DEFAULT_TZ": "America/Denver",
-    "HANDLE_BASE_DOMAIN": "a2a.richardpedersen3.workers.dev",
+    "HANDLE_BASE_DOMAIN": "gym-a2a-agent.richardpedersen3.workers.dev",
     "LANGGRAPH_ASSISTANT_ID": "gym"
   },
   "d1_databases": [

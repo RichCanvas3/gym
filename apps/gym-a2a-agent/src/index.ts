@@ -29,6 +29,16 @@ type HandleRow = {
   telegram_user_id: string | null;
 };
 
+type GymAgentProfileRow = {
+  account_address: string;
+  eoa_address: string | null;
+  base_name: string | null;
+  discovered_agent_name: string | null;
+  discovered_ens_name: string | null;
+  created_at_iso: string;
+  updated_at_iso: string;
+};
+
 type A2aEnvelope = {
   fromAgentId?: string;
   toAgentId?: string;
@@ -198,6 +208,16 @@ async function ensureSchema(db: D1Database) {
       status TEXT NOT NULL DEFAULT 'received'
     )`,
     `CREATE INDEX IF NOT EXISTS idx_a2a_messages_handle_created ON a2a_messages(handle, created_at_iso)`,
+    `CREATE TABLE IF NOT EXISTS gym_agent_profiles (
+      account_address TEXT PRIMARY KEY,
+      eoa_address TEXT,
+      base_name TEXT,
+      discovered_agent_name TEXT,
+      discovered_ens_name TEXT,
+      created_at_iso TEXT NOT NULL,
+      updated_at_iso TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_gym_agent_profiles_updated ON gym_agent_profiles(updated_at_iso DESC)`,
   ];
   for (const sql of stmts) {
     try {
@@ -206,6 +226,64 @@ async function ensureSchema(db: D1Database) {
       // ignore
     }
   }
+}
+
+function okOrNull(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  return s ? s : null;
+}
+
+async function upsertGymAgentProfile(
+  db: D1Database,
+  args: {
+    accountAddress: string;
+    eoaAddress?: string | null;
+    baseName?: string | null;
+    discoveredAgentName?: string | null;
+    discoveredEnsName?: string | null;
+  },
+) {
+  const acct = String(args.accountAddress ?? "").trim();
+  if (!acct) throw new Error("missing_account_address");
+  const ts = nowISO();
+  await db
+    .prepare(
+      `INSERT INTO gym_agent_profiles (
+        account_address, eoa_address, base_name, discovered_agent_name, discovered_ens_name, created_at_iso, updated_at_iso
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_address) DO UPDATE SET
+        eoa_address=excluded.eoa_address,
+        base_name=excluded.base_name,
+        discovered_agent_name=excluded.discovered_agent_name,
+        discovered_ens_name=excluded.discovered_ens_name,
+        updated_at_iso=excluded.updated_at_iso`,
+    )
+    .bind(
+      acct,
+      okOrNull(args.eoaAddress ?? null),
+      okOrNull(args.baseName ?? null),
+      okOrNull(args.discoveredAgentName ?? null),
+      okOrNull(args.discoveredEnsName ?? null),
+      ts,
+      ts,
+    )
+    .run();
+  return { ok: true, accountAddress: acct, updatedAtISO: ts };
+}
+
+async function getGymAgentProfile(db: D1Database, accountAddress: string): Promise<GymAgentProfileRow | null> {
+  const acct = String(accountAddress ?? "").trim();
+  if (!acct) return null;
+  const row = await db
+    .prepare(
+      `SELECT account_address, eoa_address, base_name, discovered_agent_name, discovered_ens_name, created_at_iso, updated_at_iso
+       FROM gym_agent_profiles WHERE account_address = ? LIMIT 1`,
+    )
+    .bind(acct)
+    .first<GymAgentProfileRow>();
+  if (!row?.account_address) return null;
+  return row;
 }
 
 async function getHandleRow(db: D1Database, handle: string): Promise<HandleRow | null> {
@@ -364,6 +442,49 @@ export default {
       } catch (e) {
         return badRequest("Failed to upsert handle", { detail: String((e as any)?.message ?? e) });
       }
+    }
+
+    // Admin: upsert gym agent profile (base name).
+    if (url.pathname === "/api/a2a/profile" && req.method === "POST") {
+      const want = (env.A2A_ADMIN_KEY ?? "").trim();
+      const got = (req.headers.get("x-admin-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-admin-key)");
+      const body = await readBodyJson(req).catch((e) => ({ __error__: String((e as any)?.message ?? e) }));
+      if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
+      const acct = String(body?.accountAddress ?? "").trim();
+      const eoa = body?.eoaAddress ? String(body.eoaAddress).trim() : null;
+      const baseName = body?.baseName ? String(body.baseName).trim() : null;
+      const discoveredAgentName = body?.discoveredAgentName ? String(body.discoveredAgentName).trim() : null;
+      const discoveredEnsName = body?.discoveredEnsName ? String(body.discoveredEnsName).trim() : null;
+      try {
+        const out = await upsertGymAgentProfile(env.DB, { accountAddress: acct, eoaAddress: eoa, baseName, discoveredAgentName, discoveredEnsName });
+        return json(out);
+      } catch (e) {
+        return badRequest("Failed to upsert profile", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
+    // Web/server: read gym agent profile for an account.
+    if (url.pathname === "/api/a2a/profile" && req.method === "GET") {
+      const wantWeb = (env.A2A_WEB_KEY ?? "").trim();
+      const gotWeb = (req.headers.get("x-web-key") ?? "").trim();
+      if (!wantWeb || gotWeb !== wantWeb) return unauthorized("Unauthorized (bad x-web-key)");
+      const acct = (url.searchParams.get("accountAddress") ?? "").trim();
+      if (!acct) return badRequest("Missing accountAddress");
+      const row = await getGymAgentProfile(env.DB, acct);
+      if (!row) return json({ ok: true, profile: null });
+      return json({
+        ok: true,
+        profile: {
+          accountAddress: row.account_address,
+          eoaAddress: row.eoa_address,
+          baseName: row.base_name,
+          discoveredAgentName: row.discovered_agent_name,
+          discoveredEnsName: row.discovered_ens_name,
+          createdAtISO: row.created_at_iso,
+          updatedAtISO: row.updated_at_iso,
+        },
+      });
     }
 
     if (url.pathname === "/api/a2a" && req.method === "POST") {
