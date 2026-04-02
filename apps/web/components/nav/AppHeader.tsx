@@ -6,6 +6,8 @@ import { useAuth } from "@/components/auth/AuthProvider";
 import { useCart } from "@/components/cart/CartProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
 import { CalendarDays, MessageCircle, ShoppingCart, UserCircle2 } from "lucide-react";
+import { getAgentictrustStatusCached } from "@/components/agentictrust/status-cache";
+import { usePathname, useRouter } from "next/navigation";
 
 function extractTelegramUserId(user: unknown): string | null {
   if (!user || typeof user !== "object") return null;
@@ -45,6 +47,8 @@ function extractTelegramUserId(user: unknown): string | null {
 }
 
 export function AppHeader() {
+  const router = useRouter();
+  const pathname = usePathname();
   const { authenticated, accountAddress, user, login, logout, getAccessToken } = useAuth();
   const { lines, clear } = useCart();
   const { reservations, clearReservations } = useReservations();
@@ -57,6 +61,7 @@ export function AppHeader() {
   const [telegramConnected, setTelegramConnected] = useState<boolean | null>(null);
   const [telegramLinkedUserId, setTelegramLinkedUserId] = useState<string | null>(null);
   const [gymAgentBaseName, setGymAgentBaseName] = useState<string | null>(null);
+  const [gymAgentChecked, setGymAgentChecked] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -143,26 +148,50 @@ export function AppHeader() {
     let cancelled = false;
     async function run() {
       if (!authenticated) {
-        if (!cancelled) setGymAgentBaseName(null);
+        if (!cancelled) {
+          setGymAgentBaseName(null);
+          setGymAgentChecked(false);
+        }
+        return;
+      }
+      // Wait for a concrete account before deciding whether to redirect.
+      if (!accountAddress || !String(accountAddress).trim()) {
+        if (!cancelled) {
+          setGymAgentBaseName(null);
+          setGymAgentChecked(false);
+        }
         return;
       }
       try {
         const tok = await getAccessToken();
-        const res = await fetch("/api/agentictrust/status", { headers: { authorization: `Bearer ${tok}` } });
-        const j = (await res.json().catch(() => ({}))) as unknown;
+        const j = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const rec = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
         const v = rec.savedBaseName;
         const name = typeof v === "string" && v.trim() ? v.trim() : null;
-        if (!cancelled) setGymAgentBaseName(name);
+        if (!cancelled) {
+          setGymAgentBaseName(name);
+          setGymAgentChecked(true);
+        }
       } catch {
-        if (!cancelled) setGymAgentBaseName(null);
+        // If the status check fails, don't force a redirect loop.
+        // We'll retry on the next render/TTL rather than treating it as "no name set".
+        if (!cancelled) setGymAgentChecked(false);
       }
     }
     void run();
     return () => {
       cancelled = true;
     };
-  }, [authenticated, getAccessToken]);
+  }, [authenticated, getAccessToken, accountAddress]);
+
+  useEffect(() => {
+    if (!authenticated) return;
+    if (!accountAddress || !String(accountAddress).trim()) return;
+    if (!gymAgentChecked) return;
+    if (gymAgentBaseName) return;
+    if ((pathname ?? "").startsWith("/agent/register")) return;
+    router.push("/agent/register");
+  }, [authenticated, accountAddress, gymAgentChecked, gymAgentBaseName, pathname, router]);
 
   return (
     <div className="sticky top-0 z-20 border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-white/10 dark:bg-black/60">

@@ -31,6 +31,52 @@ function baseNameFromAgentName(agentName: string): string | null {
   return base ? base : null;
 }
 
+function nameCandidatesFromAgentRecord(ar: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v !== "string") return;
+    const s = v.trim();
+    if (!s) return;
+    out.push(s);
+  };
+
+  push(ar.agentName);
+  push(ar.name);
+  push(ar.ensName);
+  push(ar.ens_name);
+  push(ar.identityEnsDid);
+
+  const identities = ar.identities as unknown;
+  if (Array.isArray(identities)) {
+    for (const id of identities) {
+      if (!id || typeof id !== "object") continue;
+      const ir = id as Record<string, unknown>;
+      push(ir.agentName);
+      push(ir.name);
+      push(ir.ensName);
+      push(ir.ens_name);
+      push(ir.did);
+      push(ir.didIdentity);
+      push(ir.identityEnsDid);
+      const did = typeof ir.did === "string" ? ir.did.trim() : "";
+      if (did.toLowerCase().startsWith("did:ens:")) {
+        push(did.slice("did:ens:".length));
+      }
+    }
+  }
+
+  // de-dupe preserving order
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const s of out) {
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    deduped.push(s);
+  }
+  return deduped;
+}
+
 type SavedProfile = {
   ok?: boolean;
   profile?: {
@@ -82,6 +128,11 @@ export async function GET(req: Request) {
   if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
 
   const eoaAddress = await eoaAddressForPrivyDid(auth.did);
+  try {
+    console.log("[agentictrust] eoaAddress", { accountAddress: auth.accountAddress, eoaAddress });
+  } catch {
+    // ignore
+  }
   const saved = await readSavedProfile(auth.accountAddress).catch(() => ({ ok: false, profile: null }));
   const savedRec = saved && typeof saved === "object" ? (saved as Record<string, unknown>) : {};
   const prof = savedRec.profile && typeof savedRec.profile === "object" ? (savedRec.profile as Record<string, unknown>) : {};
@@ -90,31 +141,47 @@ export async function GET(req: Request) {
   const discoveryUrl = String(process.env.AGENTIC_TRUST_DISCOVERY_URL ?? "").trim();
   const discoveryApiKey = String(process.env.AGENTIC_TRUST_DISCOVERY_API_KEY ?? "").trim();
   if (!discoveryUrl) {
-    return NextResponse.json(
-      { ok: false, error: "Missing AGENTIC_TRUST_DISCOVERY_URL", eoaAddress, savedBaseName },
-      { status: 500 },
-    );
+    return NextResponse.json({ ok: false, error: "Missing AGENTIC_TRUST_DISCOVERY_URL", eoaAddress, savedBaseName: null }, { status: 500 });
   }
   if (!eoaAddress) {
     return NextResponse.json(
-      { ok: true, eoaAddress: null, discovered: null, savedBaseName, note: "No embedded-wallet EOA found in Privy user." },
+      {
+        ok: true,
+        eoaAddress: null,
+        discovered: null,
+        savedBaseName: null,
+        pendingBaseName: savedBaseName,
+        note: "No embedded-wallet EOA found in Privy user.",
+      },
       { status: 200 },
     );
   }
 
-  // Lazy import to keep cold-start smaller when this route isn't used.
+  // Use discovery client owned-agents lookup (matches dao-collab usage).
   const mod = await import("@agentic-trust/core/server");
-  const AgenticTrustClient = (mod as unknown as { AgenticTrustClient: { create: (args: any) => Promise<any> } })
-    .AgenticTrustClient;
-
-  const client = await AgenticTrustClient.create({
-    graphQLUrl: discoveryUrl,
-    apiKey: discoveryApiKey || undefined,
-  });
-
-  // Best-effort discovery: search by suffix; filter client-side.
-  const resp = await client.searchAgents({ query: "gym.8004-agent.eth", page: 1, pageSize: 50 });
-  const agents: unknown[] = Array.isArray(resp?.agents) ? resp.agents : [];
+  const getDiscoveryClient = (mod as unknown as { getDiscoveryClient: (cfg?: { endpoint?: string; apiKey?: string }) => Promise<any> })
+    .getDiscoveryClient;
+  const discoveryClient = await getDiscoveryClient({ endpoint: discoveryUrl, apiKey: discoveryApiKey || undefined });
+  const chainIdRaw = Number(String(process.env.AGENTIC_TRUST_CHAIN_ID ?? "").trim() || "11155111");
+  const chainId = Number.isFinite(chainIdRaw) && chainIdRaw > 0 ? chainIdRaw : 11155111;
+  const owned = (await discoveryClient.getAgentsByAgentAccountOwnerEoa(chainId, eoaAddress, {
+    first: 200,
+    skip: 0,
+    includeIdentityAndAccounts: true,
+  })) as { agents?: unknown[]; total?: unknown; hasMore?: unknown };
+  const agents = Array.isArray(owned?.agents) ? owned.agents : [];
+  try {
+    console.log("[agentictrust] getAgentsByAgentAccountOwnerEoa", {
+      chainId,
+      eoaAddress,
+      count: Array.isArray(agents) ? agents.length : 0,
+      total: typeof owned?.total === "number" ? owned.total : null,
+      hasMore: owned?.hasMore === true,
+      agents,
+    });
+  } catch {
+    // ignore
+  }
 
   let discovered: { agentName: string; ensName: string | null; baseName: string; agentId?: string | null; chainId?: number | null } | null =
     null;
@@ -122,34 +189,45 @@ export async function GET(req: Request) {
   for (const a of agents) {
     if (!a || typeof a !== "object") continue;
     const ar = a as Record<string, unknown>;
-    const agentName = typeof ar.agentName === "string" ? ar.agentName : typeof ar.name === "string" ? ar.name : "";
-    const ensName = typeof ar.ensName === "string" ? ar.ensName : typeof ar.ens_name === "string" ? ar.ens_name : null;
-    const baseName = baseNameFromAgentName(agentName ?? "") ?? (ensName ? baseNameFromAgentName(ensName) : null);
-    if (!baseName) continue;
+    const candidates = nameCandidatesFromAgentRecord(ar);
+    for (const cand of candidates) {
+      const baseName = baseNameFromAgentName(cand);
+      if (!discovered && baseName) {
+        const ensName = cand.toLowerCase().endsWith(SUFFIX) ? cand : null;
 
-    // Confirm ownership by EOA when possible.
-    const agentId = typeof ar.agentId === "string" ? ar.agentId : typeof ar.id === "string" ? ar.id : null;
-    const chainId =
-      typeof ar.chainId === "number" ? ar.chainId : typeof ar.chain_id === "number" ? ar.chain_id : typeof ar.chainId === "string" ? Number(ar.chainId) : null;
-    if (agentId && chainId && Number.isFinite(chainId)) {
-      try {
-        const owner = await client.getAgentOwner(agentId, chainId);
-        const ownerAddr =
-          owner && typeof owner === "object"
-            ? (owner as Record<string, unknown>).ownerAddress ?? (owner as Record<string, unknown>).address
-            : null;
-        const ownerStr = typeof ownerAddr === "string" ? ownerAddr.trim().toLowerCase() : "";
-        if (ownerStr && ownerStr !== eoaAddress.toLowerCase()) continue;
-      } catch {
-        // If owner check fails, still allow match (discovery might already include owner).
+        const agentId =
+          typeof ar.agentId === "string"
+            ? ar.agentId
+            : typeof ar.agentId === "number"
+              ? String(ar.agentId)
+              : typeof ar.id === "string"
+                ? ar.id
+                : null;
+        const chainId =
+          typeof ar.chainId === "number"
+            ? ar.chainId
+            : typeof ar.chain_id === "number"
+              ? ar.chain_id
+              : typeof ar.chainId === "string"
+                ? Number(ar.chainId)
+                : null;
+        discovered = { agentName: cand, ensName, baseName, agentId, chainId: Number.isFinite(chainId ?? NaN) ? (chainId as number) : null };
       }
     }
-
-    discovered = { agentName, ensName, baseName, agentId, chainId };
-    break;
+    if (discovered) break;
   }
 
+  const validBaseName = discovered?.baseName ?? null;
+
   // Persist discovered baseName if present and no user-chosen baseName exists.
+  console.log("[agentictrust] discovered", discovered);
+  console.log("[agentictrust] savedBaseName", savedBaseName);
+  console.log("[agentictrust] saved", saved);
+  console.log("[agentictrust] auth", auth);
+  console.log("[agentictrust] eoaAddress", eoaAddress);
+  console.log("[agentictrust] auth.accountAddress", auth.accountAddress);
+  console.log("[agentictrust] auth.did", auth.did);
+
   if (discovered?.baseName && !savedBaseName) {
     try {
       await upsertSavedProfile({
@@ -171,7 +249,8 @@ export async function GET(req: Request) {
     discovered: discovered
       ? { agentName: discovered.agentName, ensName: discovered.ensName, baseName: discovered.baseName }
       : null,
-    savedBaseName: savedBaseName ?? (discovered?.baseName ?? null),
+    savedBaseName: validBaseName,
+    pendingBaseName: !validBaseName && savedBaseName ? savedBaseName : null,
   });
 }
 

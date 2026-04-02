@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { useRouter } from "next/navigation";
+import { getAgentictrustStatusCached } from "@/components/agentictrust/status-cache";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -105,6 +106,10 @@ export default function ChatPage() {
         if (!cancelled) setHydrated(true);
         return;
       }
+      if (!accountAddress || !String(accountAddress).trim()) {
+        if (!cancelled) setHydrated(true);
+        return;
+      }
       const tid = threadId || "thr_demo";
 
       // Load from browser cache first (fast, works even if server memory isn't ready).
@@ -155,6 +160,21 @@ export default function ChatPage() {
       try {
         const tok = await getAccessToken();
         if (!tok || tok.split(".").length !== 3) return;
+        const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
+        const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
+        const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+        if (!gymName) {
+          if (!cancelled && !loadedAny) {
+            setMessages([
+              {
+                role: "assistant",
+                text: "No valid discovered gym agent is available for this account yet.",
+              },
+            ]);
+            loadedAny = true;
+          }
+          return;
+        }
         const res = await fetch(url, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
@@ -225,14 +245,15 @@ export default function ChatPage() {
     async function ensureGymAgentName() {
       if (!authenticated) return;
       if (!hydrated) return;
+      if (!accountAddress || !String(accountAddress).trim()) return;
       try {
         const tok = await getAccessToken();
         if (!tok || tok.split(".").length !== 3) return;
-        const res = await fetch("/api/agentictrust/status", { headers: { authorization: `Bearer ${tok}` } });
-        const json = (await res.json().catch(() => ({}))) as unknown;
+        const json = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
         const saved = typeof rec.savedBaseName === "string" ? rec.savedBaseName.trim() : "";
-        if (!saved && !cancelled) router.push("/agent/register");
+        const ok = rec.ok === true;
+        if (ok && !saved && !cancelled) router.push("/agent/register");
       } catch {
         // ignore
       }
@@ -247,6 +268,13 @@ export default function ChatPage() {
         const tok = await getAccessToken();
         if (!tok || tok.split(".").length !== 3) {
           setProfileError("Missing access token. Please log in again.");
+          return;
+        }
+        const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
+        const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
+        const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+        if (!gymName) {
+          setProfileBusy(false);
           return;
         }
         const res = await fetch("/api/agent/run", {

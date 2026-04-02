@@ -48,6 +48,36 @@ export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
+  try {
+    const origin = new URL(req.url).origin;
+    const authz = req.headers.get("authorization") ?? "";
+    const stRes = await fetch(`${origin}/api/agentictrust/status`, {
+      headers: { authorization: authz },
+      cache: "no-store",
+    });
+    const stJson = (await stRes.json().catch(() => ({}))) as unknown;
+    const stRec = stJson && typeof stJson === "object" ? (stJson as Record<string, unknown>) : {};
+    const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+    if (!gymName) {
+      return NextResponse.json(
+        {
+          error: "invalid_gym_agent",
+          detail: "No discovered gym agent ending with -gym.8004-agent.eth is available for this account.",
+          pendingBaseName: typeof stRec.pendingBaseName === "string" ? stRec.pendingBaseName : null,
+        },
+        { status: 409 },
+      );
+    }
+  } catch (e) {
+    return NextResponse.json(
+      {
+        error: "agentictrust_status_failed",
+        detail: e instanceof Error ? e.message : String(e ?? ""),
+      },
+      { status: 502 },
+    );
+  }
+
   let baseUrl = "";
   let baseDomain = "";
   let adminKey = "";
@@ -125,10 +155,29 @@ export async function POST(req: Request) {
   const json = (await res.json().catch(() => ({}))) as unknown;
   const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
   if (!res.ok) {
-    return NextResponse.json({ error: "a2a_forward_failed", detail: rec?.error ?? json }, { status: 502 });
+    return NextResponse.json(
+      {
+        error: "a2a_forward_failed",
+        detail: rec?.error ?? json,
+        hint: "A2A endpoint returned non-200. Verify A2A_HANDLE_BASE_DOMAIN points at gym-a2a-agent wildcard DNS and that HANDLE_BASE_DOMAIN in the worker matches.",
+        a2aEndpoint,
+      },
+      { status: 502 },
+    );
   }
   if (rec.ok !== true) {
-    return NextResponse.json({ error: "a2a_forward_failed", detail: json }, { status: 502 });
+    const looksLikeOtherAgent = rec.success === true || ("response" in rec && rec.ok !== true);
+    return NextResponse.json(
+      {
+        error: "a2a_forward_failed",
+        detail: json,
+        hint: looksLikeOtherAgent
+          ? "A2A_HANDLE_BASE_DOMAIN appears to route to a different worker/agent (response shape mismatch). Point wildcard DNS to gym-a2a-agent and set A2A_HANDLE_BASE_DOMAIN to that base domain."
+          : "A2A response missing ok:true. Verify A2A_HANDLE_BASE_DOMAIN + worker HANDLE_BASE_DOMAIN and that the handle is connected.",
+        a2aEndpoint,
+      },
+      { status: 502 },
+    );
   }
 
   const agentOutput = rec.agentOutput;
