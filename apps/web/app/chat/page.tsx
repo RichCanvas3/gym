@@ -4,7 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useCart } from "@/components/cart/CartProvider";
 import { useAuth } from "@/components/auth/AuthProvider";
+import { clearA2AWebAuthSession, ensureA2AWebAuthSession } from "@/components/agentictrust/a2a-web-auth";
 import { useRouter } from "next/navigation";
+import { useWallets } from "@privy-io/react-auth";
 import { getAgentictrustStatusCached } from "@/components/agentictrust/status-cache";
 
 type ChatMessage = {
@@ -42,6 +44,7 @@ export default function ChatPage() {
   const router = useRouter();
   const { lines, addLine, removeSku, clear } = useCart();
   const { ready, authenticated, accountAddress, getAccessToken, login, logout } = useAuth();
+  const { wallets } = useWallets();
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -66,6 +69,7 @@ export default function ChatPage() {
   const [threadNonce, setThreadNonce] = useState("0");
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const didInitialScrollRef = useRef(false);
+  const authSessionPromiseRef = useRef<Promise<string> | null>(null);
 
   const threadId = useMemo(() => {
     const safeAddr = accountAddress ? accountAddress.replace(/[^a-zA-Z0-9_]/g, "_") : "anon";
@@ -156,7 +160,6 @@ export default function ChatPage() {
         // ignore
       }
 
-      const url = "/api/agent/run";
       try {
         const tok = await getAccessToken();
         if (!tok || tok.split(".").length !== 3) return;
@@ -166,23 +169,15 @@ export default function ChatPage() {
         if (!gymName) {
           return;
         }
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-          body: JSON.stringify({
-            message: "__CHAT_HISTORY__",
-            session: {
-              gymName: "Erie Community Center",
-              timezone: clientTz || "America/Denver",
-              threadId: tid,
-              goalBundle: goalBundle ?? undefined,
-              accountAddress: accountAddress ?? undefined,
-            },
-          }),
+        const { res, json } = await postAgentRun("__CHAT_HISTORY__", {
+          gymName: "Erie Community Center",
+          timezone: clientTz || "America/Denver",
+          threadId: tid,
+          goalBundle: goalBundle ?? undefined,
+          accountAddress: accountAddress ?? undefined,
         });
         if (!res.ok) {
-          const j = (await res.json().catch(() => ({}))) as unknown;
-          const r = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
+          const r = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
           const msg = typeof r.error === "string" ? r.error : typeof r.detail === "string" ? r.detail : "Unauthorized";
           if (!cancelled) {
             setMessages([{ role: "assistant", text: msg }]);
@@ -191,7 +186,6 @@ export default function ChatPage() {
           if (res.status === 401) logout();
           return;
         }
-        const json = (await res.json().catch(() => ({}))) as unknown;
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
         const data = rec.data && typeof rec.data === "object" ? (rec.data as Record<string, unknown>) : {};
         const msgs = data.messages;
@@ -229,7 +223,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [threadId, clientTz, accountAddress, getAccessToken]);
+  }, [threadId, clientTz, accountAddress, getAccessToken, wallets]);
 
   useEffect(() => {
     let cancelled = false;
@@ -268,29 +262,20 @@ export default function ChatPage() {
           setProfileBusy(false);
           return;
         }
-        const res = await fetch("/api/agent/run", {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-          body: JSON.stringify({
-            message: "__WEIGHT_PROFILE_GET__",
-            session: {
-              gymName: "Erie Community Center",
-              timezone: clientTz || "America/Denver",
-              threadId: threadId || "thr_demo",
-              accountAddress,
-            },
-          }),
+        const { res, json } = await postAgentRun("__WEIGHT_PROFILE_GET__", {
+          gymName: "Erie Community Center",
+          timezone: clientTz || "America/Denver",
+          threadId: threadId || "thr_demo",
+          accountAddress,
         });
         if (!res.ok) {
-          const j = (await res.json().catch(() => ({}))) as unknown;
-          const r = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
+          const r = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
           const msg = typeof r.error === "string" ? r.error : typeof r.detail === "string" ? r.detail : "Profile load failed.";
           setProfileError(msg);
           setProfileMissing(true);
           if (res.status === 401) logout();
           return;
         }
-        const json = (await res.json().catch(() => ({}))) as unknown;
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
         const data = rec.data && typeof rec.data === "object" ? (rec.data as Record<string, unknown>) : {};
         const ok = data.ok;
@@ -345,7 +330,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [hydrated, accountAddress, clientTz, threadId, getAccessToken, authenticated, router]);
+  }, [hydrated, accountAddress, clientTz, threadId, getAccessToken, authenticated, router, wallets]);
 
   useEffect(() => {
     const tid = threadId || "thr_demo";
@@ -372,6 +357,55 @@ export default function ChatPage() {
   }, [hydrated, messages.length]);
 
   const canSend = useMemo(() => input.trim().length > 0 && !busy, [input, busy]);
+
+  async function ensureA2AAuthSessionToken(force = false): Promise<string> {
+    if (!accountAddress) throw new Error("Missing account address.");
+    if (force) authSessionPromiseRef.current = null;
+    if (authSessionPromiseRef.current) return await authSessionPromiseRef.current;
+    const pending = (async () => {
+      const tok = await getAccessToken();
+      if (!tok || tok.split(".").length !== 3) throw new Error("Missing access token. Please log in again.");
+      return await ensureA2AWebAuthSession({
+        accountAddress,
+        accessToken: tok,
+        wallets: wallets as Array<{ address?: string; walletClientType?: string; getEthereumProvider?: () => Promise<unknown>; switchChain?: (targetChainId: `0x${string}` | number) => Promise<void> }>,
+        origin: window.location.origin,
+        force,
+      });
+    })();
+    authSessionPromiseRef.current = pending;
+    try {
+      return await pending;
+    } finally {
+      if (authSessionPromiseRef.current === pending) authSessionPromiseRef.current = null;
+    }
+  }
+
+  async function postAgentRun(messageText: string, sessionBody: Record<string, unknown>) {
+    const tok = await getAccessToken();
+    if (!tok || tok.split(".").length !== 3) throw new Error("Missing access token. Please log in again.");
+
+    const exec = async (a2aAuthSessionToken: string) => {
+      const res = await fetch("/api/agent/run", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
+        body: JSON.stringify({ message: messageText, session: sessionBody, a2aAuthSessionToken }),
+      });
+      const json = (await res.json().catch(() => ({}))) as unknown;
+      return { res, json };
+    };
+
+    let sessionToken = await ensureA2AAuthSessionToken(false);
+    let result = await exec(sessionToken);
+    const rec = result.json && typeof result.json === "object" ? (result.json as Record<string, unknown>) : {};
+    const err = typeof rec.error === "string" ? rec.error : "";
+    if (result.res.status === 401 && (err === "a2a_auth_required" || err === "a2a_auth_invalid" || err === "a2a_auth_account_mismatch" || err === "a2a_auth_agent_mismatch")) {
+      clearA2AWebAuthSession(accountAddress);
+      sessionToken = await ensureA2AAuthSessionToken(true);
+      result = await exec(sessionToken);
+    }
+    return result;
+  }
 
   function clearChat() {
     const safeAddr = accountAddress ? accountAddress.replace(/[^a-zA-Z0-9_]/g, "_") : "anon";
@@ -421,31 +455,14 @@ export default function ChatPage() {
     setMessages((m) => [...m, { role: "user", text }]);
     setBusy(true);
     try {
-      const url = "/api/agent/run";
-      const tok = await getAccessToken();
-      if (!tok || tok.split(".").length !== 3) {
-        setMessages((m) => [...m, { role: "assistant", text: "Please log in again (missing access token)." }]);
-        return;
-      }
-      const body = {
-        message: text,
-        session: {
-          gymName: "Erie Community Center",
-          timezone: clientTz || "America/Denver",
-          cartLines: lines,
-          threadId: threadId || "thr_demo",
-          goalBundle: goalBundle ?? undefined,
-          accountAddress: accountAddress ?? undefined,
-        },
-      };
-
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-        body: JSON.stringify(body),
+      const { res, json } = await postAgentRun(text, {
+        gymName: "Erie Community Center",
+        timezone: clientTz || "America/Denver",
+        cartLines: lines,
+        threadId: threadId || "thr_demo",
+        goalBundle: goalBundle ?? undefined,
+        accountAddress: accountAddress ?? undefined,
       });
-
-      const json = (await res.json().catch(() => ({}))) as unknown;
       const j = json as Record<string, unknown>;
       const payload = json as ChatApiResponse;
       if (!res.ok) {
@@ -722,34 +739,19 @@ export default function ChatPage() {
                     if (Number.isFinite(weightLbN)) profile.weight_lb = weightLbN;
                     if (profileBodyShape) profile.body_shape = profileBodyShape;
                     if (profileActivityLevel) profile.activity_level = profileActivityLevel;
-                    await fetch("/api/agent/run", {
-                      method: "POST",
-                      headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-                      body: JSON.stringify({
-                        message: `__WEIGHT_PROFILE_UPSERT__:${JSON.stringify({ profile })}`,
-                        session: {
-                          gymName: "Erie Community Center",
-                          timezone: clientTz || "America/Denver",
-                          threadId: threadId || "thr_demo",
-                          accountAddress,
-                        },
-                      }),
+                    await postAgentRun(`__WEIGHT_PROFILE_UPSERT__:${JSON.stringify({ profile })}`, {
+                      gymName: "Erie Community Center",
+                      timezone: clientTz || "America/Denver",
+                      threadId: threadId || "thr_demo",
+                      accountAddress,
                     });
                     // Reload profile to confirm it persisted.
-                    const res2 = await fetch("/api/agent/run", {
-                      method: "POST",
-                      headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-                      body: JSON.stringify({
-                        message: "__WEIGHT_PROFILE_GET__",
-                        session: {
-                          gymName: "Erie Community Center",
-                          timezone: clientTz || "America/Denver",
-                          threadId: threadId || "thr_demo",
-                          accountAddress,
-                        },
-                      }),
+                    const { res: res2, json: j2 } = await postAgentRun("__WEIGHT_PROFILE_GET__", {
+                      gymName: "Erie Community Center",
+                      timezone: clientTz || "America/Denver",
+                      threadId: threadId || "thr_demo",
+                      accountAddress,
                     });
-                    const j2 = (await res2.json().catch(() => ({}))) as unknown;
                     const rec = j2 && typeof j2 === "object" ? (j2 as Record<string, unknown>) : {};
                     const data = rec.data && typeof rec.data === "object" ? (rec.data as Record<string, unknown>) : {};
                     if (data.ok === false) {

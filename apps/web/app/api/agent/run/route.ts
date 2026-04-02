@@ -8,6 +8,7 @@ export const dynamic = "force-dynamic";
 type Body = {
   message?: unknown;
   session?: unknown;
+  a2aAuthSessionToken?: unknown;
 };
 
 function a2aAgentBaseUrl(): string {
@@ -19,12 +20,6 @@ function a2aAgentBaseUrl(): string {
 function a2aAdminKey(): string {
   const k = String(process.env.A2A_ADMIN_KEY ?? "").trim();
   if (!k) throw new Error("Missing A2A_ADMIN_KEY");
-  return k;
-}
-
-function a2aWebKey(): string {
-  const k = String(process.env.A2A_WEB_KEY ?? "").trim();
-  if (!k) throw new Error("Missing A2A_WEB_KEY");
   return k;
 }
 
@@ -78,22 +73,23 @@ export async function POST(req: Request) {
 
   let baseUrl = "";
   let adminKey = "";
-  let webKey = "";
   try {
     baseUrl = a2aAgentBaseUrl();
     adminKey = a2aAdminKey();
-    webKey = a2aWebKey();
   } catch (e) {
     return NextResponse.json({ error: (e as Error)?.message ?? String(e ?? "") }, { status: 500 });
   }
 
   const body = (await req.json().catch(() => null)) as Body | null;
   const message = typeof body?.message === "string" ? body.message.trim() : "";
+  const a2aAuthSessionToken = typeof body?.a2aAuthSessionToken === "string" ? body.a2aAuthSessionToken.trim() : "";
 
   if (!message) return NextResponse.json({ error: "Missing message" }, { status: 400 });
+  if (!a2aAuthSessionToken) {
+    return NextResponse.json({ error: "a2a_auth_required" }, { status: 401 });
+  }
 
-  const session =
-    body?.session && typeof body.session === "object" ? (body.session as Record<string, unknown>) : undefined;
+  const session = body?.session && typeof body.session === "object" ? (body.session as Record<string, unknown>) : undefined;
 
   const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
   sessionOut.accountAddress = auth.accountAddress;
@@ -109,14 +105,12 @@ export async function POST(req: Request) {
     }
   }
   if (telegramUserId) sessionOut.telegramUserId = telegramUserId;
-  // Remove legacy/unsupported identity field (waiver flow removed).
   if ("waiver" in sessionOut) delete sessionOut["waiver"];
   const derivedThreadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;
   const threadIdRaw = sessionOut["threadId"];
   const threadId = typeof threadIdRaw === "string" && threadIdRaw.trim() ? threadIdRaw : derivedThreadId;
   sessionOut.threadId = threadId;
 
-  // Ensure handle → account mapping exists (idempotent).
   try {
     await fetch(`${baseUrl}/api/a2a/handle`, {
       method: "POST",
@@ -134,7 +128,7 @@ export async function POST(req: Request) {
   const a2aEndpoint = `${a2aHost}/api/a2a`;
   const res = await fetch(a2aEndpoint, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-web-key": webKey },
+    headers: { "content-type": "application/json", "x-a2a-web-session": a2aAuthSessionToken },
     body: JSON.stringify({
       fromAgentId: "web",
       toAgentId: "gym-a2a-agent",
@@ -161,14 +155,12 @@ export async function POST(req: Request) {
       {
         error: "a2a_forward_failed",
         detail: rec?.error ?? json,
-        hint: "A2A endpoint returned non-200. Verify A2A_HANDLE_BASE_DOMAIN points at gym-a2a-agent wildcard DNS and that HANDLE_BASE_DOMAIN in the worker matches.",
         a2aEndpoint,
       },
       { status: 502 },
     );
   }
   if (rec.ok !== true) {
-    const looksLikeOtherAgent = rec.success === true || ("response" in rec && rec.ok !== true);
     console.error("[a2a] forward bad-shape", {
       accountAddress: auth.accountAddress,
       agentHandle,
@@ -180,9 +172,6 @@ export async function POST(req: Request) {
       {
         error: "a2a_forward_failed",
         detail: json,
-        hint: looksLikeOtherAgent
-          ? "A2A_HANDLE_BASE_DOMAIN appears to route to a different worker/agent (response shape mismatch). Point wildcard DNS to gym-a2a-agent and set A2A_HANDLE_BASE_DOMAIN to that base domain."
-          : "A2A response missing ok:true. Verify A2A_HANDLE_BASE_DOMAIN + worker HANDLE_BASE_DOMAIN and that the handle is connected.",
         a2aEndpoint,
       },
       { status: 502 },
@@ -198,4 +187,3 @@ export async function POST(req: Request) {
   if (answer.trim()) return NextResponse.json({ answer });
   return NextResponse.json({ error: "Agent returned no output", detail: json }, { status: 502 });
 }
-

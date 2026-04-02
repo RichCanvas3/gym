@@ -1,5 +1,7 @@
 import { keccak_256 } from "@noble/hashes/sha3";
 import { Point, recoverPublicKey } from "@noble/secp256k1";
+import { createPublicClient, hashTypedData, http, recoverTypedDataAddress } from "viem";
+import { sepolia } from "viem/chains";
 
 type Env = {
   DB: D1Database;
@@ -54,8 +56,48 @@ type A2aEnvelope = {
   nonce?: string;
 };
 
+type A2AWebSessionPayload = {
+  sessionId: string;
+  sessionToken: string;
+  challengeId: string;
+  accountAddress: string;
+  walletAddress: string;
+  principalSmartAccount: string;
+  agentHandle: string;
+  a2aHost: string;
+  chainId: number;
+  scope: string;
+  erc1271Validated: true;
+  verifiedAtISO: string;
+  expiresAtISO: string;
+};
+
+type A2AWebAuthChallengeRow = {
+  challenge_id: string;
+  account_address: string;
+  wallet_address: string;
+  principal_smart_account: string;
+  agent_handle: string;
+  a2a_host: string;
+  chain_id: number;
+  origin: string;
+  uri: string;
+  agent_card_uri: string;
+  nonce: string;
+  requested_scope: string;
+  issued_at_iso: string;
+  expires_at_iso: string;
+  used_at_iso: string | null;
+};
+
 function nowISO() {
   return new Date().toISOString();
+}
+
+function randomHex(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function json(obj: unknown, status = 200, headers?: Record<string, string>) {
@@ -218,6 +260,40 @@ async function ensureSchema(db: D1Database) {
       updated_at_iso TEXT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_gym_agent_profiles_updated ON gym_agent_profiles(updated_at_iso DESC)`,
+    `CREATE TABLE IF NOT EXISTS a2a_auth_challenges (
+      challenge_id TEXT PRIMARY KEY,
+      account_address TEXT NOT NULL,
+      wallet_address TEXT NOT NULL,
+      principal_smart_account TEXT NOT NULL,
+      agent_handle TEXT NOT NULL,
+      a2a_host TEXT NOT NULL,
+      chain_id INTEGER NOT NULL,
+      origin TEXT NOT NULL,
+      uri TEXT NOT NULL,
+      agent_card_uri TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      requested_scope TEXT NOT NULL,
+      issued_at_iso TEXT NOT NULL,
+      expires_at_iso TEXT NOT NULL,
+      used_at_iso TEXT
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_a2a_auth_challenges_account ON a2a_auth_challenges(account_address, issued_at_iso DESC)`,
+    `CREATE TABLE IF NOT EXISTS a2a_auth_sessions (
+      session_token TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      challenge_id TEXT NOT NULL,
+      account_address TEXT NOT NULL,
+      wallet_address TEXT NOT NULL,
+      principal_smart_account TEXT NOT NULL,
+      agent_handle TEXT NOT NULL,
+      a2a_host TEXT NOT NULL,
+      chain_id INTEGER NOT NULL,
+      scope TEXT NOT NULL,
+      verified_at_iso TEXT NOT NULL,
+      expires_at_iso TEXT NOT NULL,
+      created_at_iso TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_a2a_auth_sessions_account ON a2a_auth_sessions(account_address, created_at_iso DESC)`,
   ];
   for (const sql of stmts) {
     try {
@@ -232,6 +308,256 @@ function okOrNull(v: unknown): string | null {
   if (typeof v !== "string") return null;
   const s = v.trim();
   return s ? s : null;
+}
+
+
+const A2A_WEB_AUTH_PRIMARY_TYPE = "A2AWebAuthRequest";
+const A2A_WEB_AUTH_SCOPE = "a2a:chat";
+const A2A_WEB_AUTH_MAGIC_VALUE = "0x1626ba7e";
+const A2A_WEB_AUTH_DOMAIN_NAME = "GymA2AWebAuth";
+const A2A_WEB_AUTH_DOMAIN_VERSION = "1";
+const DEFAULT_CHAIN_ID = 11155111;
+const CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const SESSION_TTL_MS = 15 * 60 * 1000;
+
+function rpcUrlForChain(chainId: number): string {
+  if (chainId === 11155111) {
+    return "https://ethereum-sepolia-rpc.publicnode.com";
+  }
+  throw new Error(`unsupported_chain:${chainId}`);
+}
+
+function publicClientForChain(chainId: number) {
+  if (chainId === 11155111) {
+    return createPublicClient({ chain: sepolia, transport: http(rpcUrlForChain(chainId)) });
+  }
+  return createPublicClient({ transport: http(rpcUrlForChain(chainId)) });
+}
+
+function typedDataMessageFromChallenge(row: A2AWebAuthChallengeRow) {
+  return {
+    challengeId: row.challenge_id,
+    nonce: row.nonce,
+    origin: row.origin,
+    uri: row.uri,
+    wallet: row.wallet_address as `0x${string}`,
+    smartAccount: row.principal_smart_account as `0x${string}`,
+    agentHandle: row.agent_handle,
+    agentCardUri: row.agent_card_uri,
+    requestedScope: row.requested_scope,
+    issuedAt: row.issued_at_iso,
+    expiresAt: row.expires_at_iso,
+  };
+}
+
+function typedDataForChallenge(row: A2AWebAuthChallengeRow) {
+  return {
+    domain: {
+      name: A2A_WEB_AUTH_DOMAIN_NAME,
+      version: A2A_WEB_AUTH_DOMAIN_VERSION,
+      chainId: row.chain_id,
+      verifyingContract: row.principal_smart_account as `0x${string}`,
+    },
+    types: {
+      [A2A_WEB_AUTH_PRIMARY_TYPE]: [
+        { name: "challengeId", type: "string" },
+        { name: "nonce", type: "string" },
+        { name: "origin", type: "string" },
+        { name: "uri", type: "string" },
+        { name: "wallet", type: "address" },
+        { name: "smartAccount", type: "address" },
+        { name: "agentHandle", type: "string" },
+        { name: "agentCardUri", type: "string" },
+        { name: "requestedScope", type: "string" },
+        { name: "issuedAt", type: "string" },
+        { name: "expiresAt", type: "string" },
+      ],
+    },
+    primaryType: A2A_WEB_AUTH_PRIMARY_TYPE,
+    message: typedDataMessageFromChallenge(row),
+  } as const;
+}
+
+function makeChallenge(row: {
+  accountAddress: string;
+  walletAddress: string;
+  principalSmartAccount: string;
+  agentHandle: string;
+  a2aHost: string;
+  chainId: number;
+  origin: string;
+}): A2AWebAuthChallengeRow {
+  const now = Date.now();
+  return {
+    challenge_id: `chal_${crypto.randomUUID()}`,
+    account_address: row.accountAddress.trim(),
+    wallet_address: normalizeAddress(row.walletAddress),
+    principal_smart_account: normalizeAddress(row.principalSmartAccount),
+    agent_handle: row.agentHandle.trim().toLowerCase(),
+    a2a_host: row.a2aHost.trim().replace(/\/+$/, ""),
+    chain_id: Number.isFinite(row.chainId) && row.chainId > 0 ? row.chainId : DEFAULT_CHAIN_ID,
+    origin: row.origin.trim().replace(/\/+$/, ""),
+    uri: `${row.origin.trim().replace(/\/+$/, "")}/api/a2a/auth/verify`,
+    agent_card_uri: `${row.a2aHost.trim().replace(/\/+$/, "")}/.well-known/agent.json`,
+    nonce: `0x${randomHex(32)}`,
+    requested_scope: A2A_WEB_AUTH_SCOPE,
+    issued_at_iso: new Date(now).toISOString(),
+    expires_at_iso: new Date(now + CHALLENGE_TTL_MS).toISOString(),
+    used_at_iso: null,
+  };
+}
+
+async function storeChallenge(db: D1Database, row: A2AWebAuthChallengeRow) {
+  await db.prepare(
+    `INSERT INTO a2a_auth_challenges (
+      challenge_id, account_address, wallet_address, principal_smart_account, agent_handle, a2a_host,
+      chain_id, origin, uri, agent_card_uri, nonce, requested_scope, issued_at_iso, expires_at_iso, used_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  .bind(
+    row.challenge_id,
+    row.account_address,
+    row.wallet_address,
+    row.principal_smart_account,
+    row.agent_handle,
+    row.a2a_host,
+    row.chain_id,
+    row.origin,
+    row.uri,
+    row.agent_card_uri,
+    row.nonce,
+    row.requested_scope,
+    row.issued_at_iso,
+    row.expires_at_iso,
+    row.used_at_iso,
+  )
+  .run();
+}
+
+async function getChallenge(db: D1Database, challengeId: string): Promise<A2AWebAuthChallengeRow | null> {
+  const row = await db.prepare(
+    `SELECT challenge_id, account_address, wallet_address, principal_smart_account, agent_handle, a2a_host,
+      chain_id, origin, uri, agent_card_uri, nonce, requested_scope, issued_at_iso, expires_at_iso, used_at_iso
+     FROM a2a_auth_challenges WHERE challenge_id = ? LIMIT 1`
+  ).bind(challengeId.trim()).first<A2AWebAuthChallengeRow>();
+  return row?.challenge_id ? row : null;
+}
+
+async function markChallengeUsed(db: D1Database, challengeId: string) {
+  await db.prepare(`UPDATE a2a_auth_challenges SET used_at_iso = ? WHERE challenge_id = ?`).bind(nowISO(), challengeId.trim()).run();
+}
+
+async function createWebSession(db: D1Database, args: {
+  challenge: A2AWebAuthChallengeRow;
+}): Promise<A2AWebSessionPayload> {
+  const verifiedAtISO = nowISO();
+  const expiresAtISO = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  const sessionId = `sess_${crypto.randomUUID()}`;
+  const sessionToken = `ws_${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`;
+  await db.prepare(
+    `INSERT INTO a2a_auth_sessions (
+      session_token, session_id, challenge_id, account_address, wallet_address, principal_smart_account,
+      agent_handle, a2a_host, chain_id, scope, verified_at_iso, expires_at_iso, created_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  .bind(
+    sessionToken,
+    sessionId,
+    args.challenge.challenge_id,
+    args.challenge.account_address,
+    args.challenge.wallet_address,
+    args.challenge.principal_smart_account,
+    args.challenge.agent_handle,
+    args.challenge.a2a_host,
+    args.challenge.chain_id,
+    A2A_WEB_AUTH_SCOPE,
+    verifiedAtISO,
+    expiresAtISO,
+    verifiedAtISO,
+  )
+  .run();
+  return {
+    sessionId,
+    sessionToken,
+    challengeId: args.challenge.challenge_id,
+    accountAddress: args.challenge.account_address,
+    walletAddress: args.challenge.wallet_address,
+    principalSmartAccount: args.challenge.principal_smart_account,
+    agentHandle: args.challenge.agent_handle,
+    a2aHost: args.challenge.a2a_host,
+    chainId: args.challenge.chain_id,
+    scope: A2A_WEB_AUTH_SCOPE,
+    erc1271Validated: true,
+    verifiedAtISO,
+    expiresAtISO,
+  };
+}
+
+async function verifyWebSessionToken(db: D1Database, token: string): Promise<A2AWebSessionPayload> {
+  const row = await db.prepare(
+    `SELECT session_token, session_id, challenge_id, account_address, wallet_address, principal_smart_account,
+      agent_handle, a2a_host, chain_id, scope, verified_at_iso, expires_at_iso
+     FROM a2a_auth_sessions WHERE session_token = ? LIMIT 1`
+  ).bind(token.trim()).first<Record<string, unknown>>();
+  if (!row) throw new Error("invalid_session_token");
+  const expiresAtISO = typeof row.expires_at_iso === "string" ? row.expires_at_iso : "";
+  if (!expiresAtISO || Number.isNaN(Date.parse(expiresAtISO)) || Date.parse(expiresAtISO) <= Date.now()) {
+    throw new Error("session_expired");
+  }
+  return {
+    sessionId: String(row.session_id ?? ""),
+    sessionToken: String(row.session_token ?? ""),
+    challengeId: String(row.challenge_id ?? ""),
+    accountAddress: String(row.account_address ?? ""),
+    walletAddress: String(row.wallet_address ?? ""),
+    principalSmartAccount: String(row.principal_smart_account ?? ""),
+    agentHandle: String(row.agent_handle ?? ""),
+    a2aHost: String(row.a2a_host ?? ""),
+    chainId: Number(row.chain_id ?? DEFAULT_CHAIN_ID),
+    scope: String(row.scope ?? ""),
+    erc1271Validated: true,
+    verifiedAtISO: String(row.verified_at_iso ?? ""),
+    expiresAtISO,
+  };
+}
+
+async function recoverWebAuthSigner(row: A2AWebAuthChallengeRow, signature: string): Promise<string> {
+  const typed = typedDataForChallenge(row);
+  const recovered = await recoverTypedDataAddress({
+    domain: typed.domain,
+    types: typed.types,
+    primaryType: typed.primaryType,
+    message: typed.message,
+    signature: signature as `0x${string}`,
+  });
+  return normalizeAddress(recovered);
+}
+
+async function verifyWebAuthErc1271(row: A2AWebAuthChallengeRow, signature: string): Promise<{ digest: string; ok: boolean }> {
+  const typed = typedDataForChallenge(row);
+  const digest = hashTypedData({
+    domain: typed.domain,
+    types: typed.types,
+    primaryType: typed.primaryType,
+    message: typed.message,
+  });
+  const client = publicClientForChain(row.chain_id);
+  const result = await client.readContract({
+    address: row.principal_smart_account as `0x${string}`,
+    abi: [{
+      type: "function",
+      stateMutability: "view",
+      name: "isValidSignature",
+      inputs: [
+        { name: "hash", type: "bytes32" },
+        { name: "signature", type: "bytes" },
+      ],
+      outputs: [{ name: "magicValue", type: "bytes4" }],
+    }],
+    functionName: "isValidSignature",
+    args: [digest, signature as `0x${string}`],
+  });
+  return { digest, ok: String(result).toLowerCase() === A2A_WEB_AUTH_MAGIC_VALUE };
 }
 
 async function upsertGymAgentProfile(
@@ -487,6 +813,93 @@ export default {
       });
     }
 
+    if (url.pathname === "/api/a2a/auth/challenge" && req.method === "POST") {
+      const want = (env.A2A_ADMIN_KEY ?? "").trim();
+      const got = (req.headers.get("x-admin-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-admin-key)");
+      const body = await readBodyJson(req).catch((e) => ({ __error__: String((e as any)?.message ?? e) }));
+      if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
+      const accountAddress = String(body?.accountAddress ?? "").trim();
+      const walletAddress = normalizeAddress(String(body?.walletAddress ?? ""));
+      const principalSmartAccount = normalizeAddress(String(body?.principalSmartAccount ?? ""));
+      const agentHandleBody = String(body?.agentHandle ?? "").trim().toLowerCase();
+      const a2aHost = String(body?.a2aHost ?? "").trim();
+      const originBody = String(body?.origin ?? "").trim();
+      const chainId = Number(body?.chainId ?? DEFAULT_CHAIN_ID);
+      if (!accountAddress || !walletAddress || !principalSmartAccount || !agentHandleBody || !a2aHost || !originBody) {
+        return badRequest("Missing required auth challenge fields");
+      }
+      try {
+        const challenge = makeChallenge({
+          accountAddress,
+          walletAddress,
+          principalSmartAccount,
+          agentHandle: agentHandleBody,
+          a2aHost,
+          chainId,
+          origin: originBody,
+        });
+        await storeChallenge(env.DB, challenge);
+        return json({
+          ok: true,
+          challengeId: challenge.challenge_id,
+          challenge: {
+            challengeId: challenge.challenge_id,
+            nonce: challenge.nonce,
+            accountAddress: challenge.account_address,
+            walletAddress: challenge.wallet_address,
+            principalSmartAccount: challenge.principal_smart_account,
+            agentHandle: challenge.agent_handle,
+            a2aHost: challenge.a2a_host,
+            chainId: challenge.chain_id,
+            origin: challenge.origin,
+            uri: challenge.uri,
+            agentCardUri: challenge.agent_card_uri,
+            requestedScope: challenge.requested_scope,
+            issuedAtISO: challenge.issued_at_iso,
+            expiresAtISO: challenge.expires_at_iso,
+          },
+          typedData: typedDataForChallenge(challenge),
+        });
+      } catch (e) {
+        return badRequest("Failed to create auth challenge", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
+    if (url.pathname === "/api/a2a/auth/verify" && req.method === "POST") {
+      const want = (env.A2A_ADMIN_KEY ?? "").trim();
+      const got = (req.headers.get("x-admin-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-admin-key)");
+      const body = await readBodyJson(req).catch((e) => ({ __error__: String((e as any)?.message ?? e) }));
+      if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
+      const challengeId = String(body?.challengeId ?? "").trim();
+      const signature = String(body?.signature ?? "").trim();
+      const accountAddress = String(body?.accountAddress ?? "").trim();
+      const walletAddress = normalizeAddress(String(body?.walletAddress ?? ""));
+      if (!challengeId || !signature || !accountAddress || !walletAddress) {
+        return badRequest("Missing required auth verify fields");
+      }
+      const challenge = await getChallenge(env.DB, challengeId);
+      if (!challenge) return notFound("Unknown challengeId");
+      if (challenge.used_at_iso) return badRequest("challenge_already_used");
+      if (Date.parse(challenge.expires_at_iso) <= Date.now()) return badRequest("challenge_expired");
+      if (challenge.account_address !== accountAddress) return unauthorized("challenge_account_mismatch");
+      if (challenge.wallet_address !== walletAddress) return unauthorized("challenge_wallet_mismatch");
+      try {
+        const recoveredSigner = await recoverWebAuthSigner(challenge, signature);
+        if (recoveredSigner !== challenge.wallet_address) return unauthorized("wallet_signature_mismatch");
+        const erc1271 = await verifyWebAuthErc1271(challenge, signature);
+        if (!erc1271.ok) {
+          return unauthorized("erc1271_validation_failed");
+        }
+        await markChallengeUsed(env.DB, challenge.challenge_id);
+        const session = await createWebSession(env.DB, { challenge });
+        return json({ ok: true, recoveredSigner, digest: erc1271.digest, session });
+      } catch (e) {
+        return badRequest("Failed to verify auth challenge", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
     if (url.pathname === "/api/a2a" && req.method === "POST") {
       if (!handle) return notFound("Missing handle in host.");
       try {
@@ -502,10 +915,18 @@ export default {
       if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
       const envl: A2aEnvelope = body && typeof body === "object" ? (body as A2aEnvelope) : {};
 
-      const wantWeb = (env.A2A_WEB_KEY ?? "").trim();
-      const gotWeb = (req.headers.get("x-web-key") ?? "").trim();
-      const isWebBypass = Boolean(wantWeb && gotWeb && gotWeb === wantWeb);
-      if (!isWebBypass) {
+      const webSessionToken = (req.headers.get("x-a2a-web-session") ?? "").trim();
+      let webSession: A2AWebSessionPayload | null = null;
+      if (webSessionToken) {
+        try {
+          webSession = await verifyWebSessionToken(env.DB, webSessionToken);
+        } catch (e) {
+          const code = String((e as any)?.message ?? e);
+          return unauthorized(code);
+        }
+        if (webSession.agentHandle !== handle) return unauthorized("session_handle_mismatch");
+        if (webSession.accountAddress !== row.account_address) return unauthorized("session_account_mismatch");
+      } else {
         try {
           await verifySignatureOrThrow(handle, envl);
         } catch (e) {
@@ -541,7 +962,7 @@ export default {
           accountAddress: row.account_address,
           response: { received: true, processedAt: nowISO(), answer: forwarded.answer },
           agentOutput: forwarded.output ?? null,
-          raw: isWebBypass ? forwarded.raw ?? null : undefined,
+          raw: webSession ? undefined : forwarded.raw ?? null,
         });
       } catch (e) {
         return json({ ok: false, error: "forward_failed", detail: String((e as any)?.message ?? e) }, 502);

@@ -16,17 +16,18 @@
     "e2e:live": "playwright test -c playwright.live.config.ts"
   },
   "dependencies": {
-    "@climb-gym/agent": "workspace:*",
-    "@climb-gym/ops": "workspace:*",
     "@agentic-trust/agentic-trust-sdk": "1.0.44",
     "@agentic-trust/core": "1.0.44",
+    "@climb-gym/agent": "workspace:*",
+    "@climb-gym/ops": "workspace:*",
     "@noble/hashes": "^1.8.0",
     "@privy-io/node": "^0.11.0",
     "@privy-io/react-auth": "^3.18.0",
     "lucide-react": "^0.575.0",
     "next": "16.1.6",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "viem": "^2.47.6"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",

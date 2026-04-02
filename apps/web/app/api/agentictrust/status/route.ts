@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAccountOwner, getAgenticTrustClient, getDiscoveryClient, getENSClient } from "@agentic-trust/core/server";
+import { extractAgentAccountFromDiscovery, getAccountOwner, getAgenticTrustClient, getDiscoveryClient, getENSClient } from "@agentic-trust/core/server";
 import { requirePrivyAuth, eoaAddressForPrivyDid } from "../../_lib/privy";
 import { baseNameFromGymAgentName, gymAgentLabelFromBaseName, gymAgentNameFromBaseName, nameCandidatesFromAgentRecord } from "../_lib/gym-agent";
 
@@ -81,6 +81,77 @@ async function isA2aEndpointReachable(a2aHost: string): Promise<boolean> {
   }
 }
 
+type DiscoveredGymAgent = {
+  agentName: string;
+  ensName: string | null;
+  baseName: string;
+  agentId?: string | null;
+  chainId?: number | null;
+  agentAccount?: `0x${string}` | null;
+};
+
+async function discoverOwnedGymAgent(args: {
+  chainId: number;
+  eoaAddress: `0x${string}`;
+  discoveryUrl: string;
+  discoveryApiKey?: string;
+}): Promise<DiscoveredGymAgent | null> {
+  const discoveryClient = await getDiscoveryClient({ endpoint: args.discoveryUrl, apiKey: args.discoveryApiKey || undefined });
+  const owned = (await discoveryClient.getAgentsByAgentAccountOwnerEoa(args.chainId, args.eoaAddress, {
+    first: 200,
+    skip: 0,
+    includeIdentityAndAccounts: true,
+  })) as { agents?: unknown[]; total?: unknown; hasMore?: unknown };
+  const agents = Array.isArray(owned?.agents) ? owned.agents : [];
+  try {
+    console.log("[agentictrust] getAgentsByAgentAccountOwnerEoa", {
+      chainId: args.chainId,
+      eoaAddress: args.eoaAddress,
+      count: Array.isArray(agents) ? agents.length : 0,
+      total: typeof owned?.total === "number" ? owned.total : null,
+      hasMore: owned?.hasMore === true,
+    });
+  } catch {
+    // ignore
+  }
+
+  for (const a of agents) {
+    if (!a || typeof a !== "object") continue;
+    const ar = a as Record<string, unknown>;
+    const candidates = nameCandidatesFromAgentRecord(ar);
+    for (const cand of candidates) {
+      const baseName = baseNameFromGymAgentName(cand);
+      if (!baseName) continue;
+      const ensName = cand.toLowerCase().endsWith(".8004-agent.eth") ? cand : null;
+      const agentId =
+        typeof ar.agentId === "string"
+          ? ar.agentId
+          : typeof ar.agentId === "number"
+            ? String(ar.agentId)
+            : typeof ar.id === "string"
+              ? ar.id
+              : null;
+      const discoveredChainId =
+        typeof ar.chainId === "number"
+          ? ar.chainId
+          : typeof ar.chain_id === "number"
+            ? ar.chain_id
+            : typeof ar.chainId === "string"
+              ? Number(ar.chainId)
+              : null;
+      return {
+        agentName: cand,
+        ensName,
+        baseName,
+        agentId,
+        chainId: Number.isFinite(discoveredChainId ?? NaN) ? (discoveredChainId as number) : null,
+        agentAccount: extractAgentAccountFromDiscovery(a) ?? null,
+      };
+    }
+  }
+  return null;
+}
+
 type SavedProfile = {
   ok?: boolean;
   profile?: {
@@ -142,6 +213,14 @@ export async function GET(req: Request) {
   const savedRec = saved && typeof saved === "object" ? (saved as Record<string, unknown>) : {};
   const prof = savedRec.profile && typeof savedRec.profile === "object" ? (savedRec.profile as Record<string, unknown>) : {};
   const savedBaseName = typeof prof.baseName === "string" && prof.baseName.trim() ? prof.baseName.trim() : null;
+  const discoveryUrl = String(process.env.AGENTIC_TRUST_DISCOVERY_URL ?? "").trim();
+  const discoveryApiKey = String(process.env.AGENTIC_TRUST_DISCOVERY_API_KEY ?? "").trim();
+  const discovered = discoveryUrl
+    ? await discoverOwnedGymAgent({ chainId, eoaAddress: eoaAddress as `0x${string}`, discoveryUrl, discoveryApiKey }).catch((e) => {
+        console.error("[agentictrust] discovery fallback failed", e);
+        return null;
+      })
+    : null;
   if (!eoaAddress) {
     return NextResponse.json(
       {
@@ -163,17 +242,19 @@ export async function GET(req: Request) {
     const client = canReadEns ? await getAgenticTrustClient() : null;
     const agentInfo = canReadEns ? await client?.getENSInfo(fullAgentName, chainId).catch(() => null) : null;
     const hasOwner = canReadEns ? await ensNameHasOwner(fullAgentName, chainId).catch(() => false) : false;
-    const agentAccount = normalizeAddress(agentInfo?.account);
+    const discoveredForSaved = discovered?.baseName === savedBaseName ? discovered : null;
+    const agentAccount = discoveredForSaved?.agentAccount ?? normalizeAddress(agentInfo?.account);
     const owner = agentAccount ? await getAccountOwner(agentAccount, chainId).catch(() => null) : null;
     const validOwner = typeof owner === "string" && owner.trim().toLowerCase() === eoaAddress.toLowerCase();
     const savedEoaMatches =
       typeof prof.eoaAddress === "string" && prof.eoaAddress.trim().toLowerCase() === eoaAddress.toLowerCase();
     const infoUrlMatches = typeof agentInfo?.url === "string" && agentInfo.url.trim() === a2aHost;
     const trustedSavedDiscovery =
-      hasOwner &&
-      ((typeof prof.discoveredAgentName === "string" && prof.discoveredAgentName.trim().toLowerCase() === fullAgentName.toLowerCase()) ||
-        (savedEoaMatches && Boolean(agentAccount)) ||
-        infoUrlMatches);
+      Boolean(discoveredForSaved?.agentAccount) ||
+      (hasOwner &&
+        ((typeof prof.discoveredAgentName === "string" && prof.discoveredAgentName.trim().toLowerCase() === fullAgentName.toLowerCase()) ||
+          (savedEoaMatches && Boolean(agentAccount)) ||
+          infoUrlMatches));
     if (validOwner || trustedSavedDiscovery) {
       const chatReady = await isA2aEndpointReachable(a2aHost);
       return NextResponse.json({
@@ -192,6 +273,7 @@ export async function GET(req: Request) {
         agentHandle: gymAgentLabelFromBaseName(savedBaseName),
         a2aHost,
         agentAccount: agentAccount ?? null,
+        agentOwnerEoa: typeof owner === "string" ? owner : null,
         chatReady,
       });
     }
@@ -213,71 +295,6 @@ export async function GET(req: Request) {
     }
   }
 
-  const discoveryUrl = String(process.env.AGENTIC_TRUST_DISCOVERY_URL ?? "").trim();
-  const discoveryApiKey = String(process.env.AGENTIC_TRUST_DISCOVERY_API_KEY ?? "").trim();
-  let discovered: { agentName: string; ensName: string | null; baseName: string; agentId?: string | null; chainId?: number | null } | null =
-    null;
-
-  if (discoveryUrl) {
-    try {
-      const discoveryClient = await getDiscoveryClient({ endpoint: discoveryUrl, apiKey: discoveryApiKey || undefined });
-      const owned = (await discoveryClient.getAgentsByAgentAccountOwnerEoa(chainId, eoaAddress, {
-        first: 200,
-        skip: 0,
-        includeIdentityAndAccounts: true,
-      })) as { agents?: unknown[]; total?: unknown; hasMore?: unknown };
-      const agents = Array.isArray(owned?.agents) ? owned.agents : [];
-      try {
-        console.log("[agentictrust] getAgentsByAgentAccountOwnerEoa", {
-          chainId,
-          eoaAddress,
-          count: Array.isArray(agents) ? agents.length : 0,
-          total: typeof owned?.total === "number" ? owned.total : null,
-          hasMore: owned?.hasMore === true,
-        });
-      } catch {
-        // ignore
-      }
-
-      for (const a of agents) {
-        if (!a || typeof a !== "object") continue;
-        const ar = a as Record<string, unknown>;
-        const candidates = nameCandidatesFromAgentRecord(ar);
-        for (const cand of candidates) {
-          const baseName = baseNameFromGymAgentName(cand);
-          if (!discovered && baseName) {
-            const ensName = cand.toLowerCase().endsWith(".8004-agent.eth") ? cand : null;
-            const agentId =
-              typeof ar.agentId === "string"
-                ? ar.agentId
-                : typeof ar.agentId === "number"
-                  ? String(ar.agentId)
-                  : typeof ar.id === "string"
-                    ? ar.id
-                    : null;
-            const discoveredChainId =
-              typeof ar.chainId === "number"
-                ? ar.chainId
-                : typeof ar.chain_id === "number"
-                  ? ar.chain_id
-                  : typeof ar.chainId === "string"
-                    ? Number(ar.chainId)
-                    : null;
-            discovered = {
-              agentName: cand,
-              ensName,
-              baseName,
-              agentId,
-              chainId: Number.isFinite(discoveredChainId ?? NaN) ? (discoveredChainId as number) : null,
-            };
-          }
-        }
-        if (discovered) break;
-      }
-    } catch (e) {
-      console.error("[agentictrust] discovery fallback failed", e);
-    }
-  }
 
   if (discovered?.baseName && !savedBaseName) {
     try {
@@ -296,6 +313,7 @@ export async function GET(req: Request) {
   const validBaseName = discovered?.baseName ?? null;
   const activeBaseName = validBaseName || savedBaseName || null;
   const a2aHost = activeBaseName ? a2aHostForBaseName(activeBaseName) : null;
+  const discoveredOwner = discovered?.agentAccount ? await getAccountOwner(discovered.agentAccount, chainId).catch(() => null) : null;
   const chatReady = a2aHost ? await isA2aEndpointReachable(a2aHost) : false;
 
   return NextResponse.json({
@@ -306,6 +324,8 @@ export async function GET(req: Request) {
     discovered: discovered
       ? { agentName: discovered.agentName, ensName: discovered.ensName, baseName: discovered.baseName }
       : null,
+    agentAccount: discovered?.agentAccount ?? null,
+    agentOwnerEoa: typeof discoveredOwner === "string" ? discoveredOwner : null,
     savedBaseName: validBaseName,
     pendingBaseName: !validBaseName && savedBaseName ? savedBaseName : null,
     fullAgentName: activeBaseName ? gymAgentNameFromBaseName(activeBaseName) : null,
