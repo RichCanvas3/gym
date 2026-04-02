@@ -163,12 +163,16 @@ export default function ChatPage() {
         const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
         const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+        const chatReady = stRec.chatReady === true;
         if (!gymName) {
+          return;
+        }
+        if (!chatReady) {
           if (!cancelled && !loadedAny) {
             setMessages([
               {
                 role: "assistant",
-                text: "No valid discovered gym agent is available for this account yet.",
+                text: "Your gym agent exists, but its A2A endpoint is not reachable yet.",
               },
             ]);
             loadedAny = true;
@@ -253,7 +257,7 @@ export default function ChatPage() {
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
         const saved = typeof rec.savedBaseName === "string" ? rec.savedBaseName.trim() : "";
         const ok = rec.ok === true;
-        if (ok && !saved && !cancelled) router.push("/agent/register");
+        if (ok && !saved && !cancelled) router.replace("/agent/register");
       } catch {
         // ignore
       }
@@ -273,8 +277,14 @@ export default function ChatPage() {
         const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
         const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+        const chatReady = stRec.chatReady === true;
         if (!gymName) {
           setProfileBusy(false);
+          return;
+        }
+        if (!chatReady) {
+          setProfileBusy(false);
+          setProfileError("Gym agent A2A endpoint is not reachable yet.");
           return;
         }
         const res = await fetch("/api/agent/run", {

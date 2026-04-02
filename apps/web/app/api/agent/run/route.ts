@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { requirePrivyAuth, telegramUserIdForPrivyDid } from "../../_lib/privy";
 import { mcpToolCall } from "../../_lib/mcp";
-import { createHash } from "crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,14 +16,6 @@ function a2aAgentBaseUrl(): string {
   return u.replace(/\/+$/, "");
 }
 
-function a2aHandleBaseDomain(): string {
-  const s = String(process.env.A2A_HANDLE_BASE_DOMAIN ?? "").trim();
-  if (!s) throw new Error("Missing A2A_HANDLE_BASE_DOMAIN");
-  const noProto = s.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
-  if (!noProto) throw new Error("Invalid A2A_HANDLE_BASE_DOMAIN");
-  return noProto;
-}
-
 function a2aAdminKey(): string {
   const k = String(process.env.A2A_ADMIN_KEY ?? "").trim();
   if (!k) throw new Error("Missing A2A_ADMIN_KEY");
@@ -37,17 +28,12 @@ function a2aWebKey(): string {
   return k;
 }
 
-function handleForAccountAddress(accountAddress: string): string {
-  const acct = String(accountAddress ?? "").trim();
-  const hex = createHash("sha256").update(acct).digest("hex");
-  // Must match: /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/
-  return `u-${hex.slice(0, 50)}`;
-}
-
 export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
+  let agentHandle = "";
+  let a2aHost = "";
   try {
     const origin = new URL(req.url).origin;
     const authz = req.headers.get("authorization") ?? "";
@@ -58,11 +44,35 @@ export async function POST(req: Request) {
     const stJson = (await stRes.json().catch(() => ({}))) as unknown;
     const stRec = stJson && typeof stJson === "object" ? (stJson as Record<string, unknown>) : {};
     const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+    agentHandle = typeof stRec.agentHandle === "string" ? stRec.agentHandle.trim() : "";
+    a2aHost = typeof stRec.a2aHost === "string" ? stRec.a2aHost.trim() : "";
+    const chatReady = stRec.chatReady === true;
     if (!gymName) {
       return NextResponse.json(
         {
           error: "invalid_gym_agent",
-          detail: "No discovered gym agent ending with -gym.8004-agent.eth is available for this account.",
+          detail: "No valid gym agent ENS name is available for this account.",
+          pendingBaseName: typeof stRec.pendingBaseName === "string" ? stRec.pendingBaseName : null,
+        },
+        { status: 409 },
+      );
+    }
+    if (!chatReady) {
+      return NextResponse.json(
+        {
+          error: "agent_endpoint_unreachable",
+          detail: "Gym agent A2A endpoint is not reachable yet.",
+          a2aHost: a2aHost || null,
+          pendingBaseName: typeof stRec.pendingBaseName === "string" ? stRec.pendingBaseName : null,
+        },
+        { status: 409 },
+      );
+    }
+    if (!agentHandle || !a2aHost) {
+      return NextResponse.json(
+        {
+          error: "invalid_gym_agent",
+          detail: "Gym agent status is missing the A2A routing metadata.",
           pendingBaseName: typeof stRec.pendingBaseName === "string" ? stRec.pendingBaseName : null,
         },
         { status: 409 },
@@ -79,12 +89,10 @@ export async function POST(req: Request) {
   }
 
   let baseUrl = "";
-  let baseDomain = "";
   let adminKey = "";
   let webKey = "";
   try {
     baseUrl = a2aAgentBaseUrl();
-    baseDomain = a2aHandleBaseDomain();
     adminKey = a2aAdminKey();
     webKey = a2aWebKey();
   } catch (e) {
@@ -120,15 +128,13 @@ export async function POST(req: Request) {
   const threadId = typeof threadIdRaw === "string" && threadIdRaw.trim() ? threadIdRaw : derivedThreadId;
   sessionOut.threadId = threadId;
 
-  const handle = handleForAccountAddress(auth.accountAddress);
-
   // Ensure handle → account mapping exists (idempotent).
   try {
     await fetch(`${baseUrl}/api/a2a/handle`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-admin-key": adminKey },
       body: JSON.stringify({
-        handle,
+        handle: agentHandle,
         accountAddress: auth.accountAddress,
         telegramUserId: telegramUserId ?? null,
       }),
@@ -137,7 +143,7 @@ export async function POST(req: Request) {
     // ignore (best-effort); the subsequent /api/a2a call will fail clearly if handle missing
   }
 
-  const a2aEndpoint = `https://${handle}.${baseDomain}/api/a2a`;
+  const a2aEndpoint = `${a2aHost}/api/a2a`;
   const res = await fetch(a2aEndpoint, {
     method: "POST",
     headers: { "content-type": "application/json", "x-web-key": webKey },

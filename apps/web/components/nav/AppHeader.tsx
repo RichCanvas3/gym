@@ -61,6 +61,7 @@ export function AppHeader() {
   const [telegramConnected, setTelegramConnected] = useState<boolean | null>(null);
   const [telegramLinkedUserId, setTelegramLinkedUserId] = useState<string | null>(null);
   const [gymAgentBaseName, setGymAgentBaseName] = useState<string | null>(null);
+  const [gymAgentPendingBaseName, setGymAgentPendingBaseName] = useState<string | null>(null);
   const [gymAgentChecked, setGymAgentChecked] = useState(false);
 
   useEffect(() => {
@@ -166,10 +167,13 @@ export function AppHeader() {
         const tok = await getAccessToken();
         const j = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const rec = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
-        const v = rec.savedBaseName;
-        const name = typeof v === "string" && v.trim() ? v.trim() : null;
+        const saved = rec.savedBaseName;
+        const pending = rec.pendingBaseName;
+        const name = typeof saved === "string" && saved.trim() ? saved.trim() : null;
+        const pendingName = typeof pending === "string" && pending.trim() ? pending.trim() : null;
         if (!cancelled) {
           setGymAgentBaseName(name);
+          setGymAgentPendingBaseName(pendingName);
           setGymAgentChecked(true);
         }
       } catch {
@@ -190,7 +194,7 @@ export function AppHeader() {
     if (!gymAgentChecked) return;
     if (gymAgentBaseName) return;
     if ((pathname ?? "").startsWith("/agent/register")) return;
-    router.push("/agent/register");
+    router.replace("/agent/register");
   }, [authenticated, accountAddress, gymAgentChecked, gymAgentBaseName, pathname, router]);
 
   return (

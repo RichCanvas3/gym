@@ -103,7 +103,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       config={{
         loginMethodsAndOrder: {
           // Wallet methods are specific wallet entries (e.g. "metamask"), not "wallet".
-          primary: ["metamask", "google", "telegram", "email", "sms"],
+          primary: ["metamask", "google", "telegram", "email"],
+          overflow: ["sms"],
+        },
+        embeddedWallets: {
+          ethereum: {
+            createOnLogin: "users-without-wallets",
+          },
         },
         intl: { defaultCountry: "US" },
       }}
