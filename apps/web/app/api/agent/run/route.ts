@@ -46,23 +46,11 @@ export async function POST(req: Request) {
     const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
     agentHandle = typeof stRec.agentHandle === "string" ? stRec.agentHandle.trim() : "";
     a2aHost = typeof stRec.a2aHost === "string" ? stRec.a2aHost.trim() : "";
-    const chatReady = stRec.chatReady === true;
     if (!gymName) {
       return NextResponse.json(
         {
           error: "invalid_gym_agent",
           detail: "No valid gym agent ENS name is available for this account.",
-          pendingBaseName: typeof stRec.pendingBaseName === "string" ? stRec.pendingBaseName : null,
-        },
-        { status: 409 },
-      );
-    }
-    if (!chatReady) {
-      return NextResponse.json(
-        {
-          error: "agent_endpoint_unreachable",
-          detail: "Gym agent A2A endpoint is not reachable yet.",
-          a2aHost: a2aHost || null,
           pendingBaseName: typeof stRec.pendingBaseName === "string" ? stRec.pendingBaseName : null,
         },
         { status: 409 },
@@ -161,6 +149,14 @@ export async function POST(req: Request) {
   const json = (await res.json().catch(() => ({}))) as unknown;
   const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
   if (!res.ok) {
+    console.error("[a2a] forward non-200", {
+      accountAddress: auth.accountAddress,
+      agentHandle,
+      a2aHost,
+      a2aEndpoint,
+      status: res.status,
+      body: json,
+    });
     return NextResponse.json(
       {
         error: "a2a_forward_failed",
@@ -173,6 +169,13 @@ export async function POST(req: Request) {
   }
   if (rec.ok !== true) {
     const looksLikeOtherAgent = rec.success === true || ("response" in rec && rec.ok !== true);
+    console.error("[a2a] forward bad-shape", {
+      accountAddress: auth.accountAddress,
+      agentHandle,
+      a2aHost,
+      a2aEndpoint,
+      body: json,
+    });
     return NextResponse.json(
       {
         error: "a2a_forward_failed",

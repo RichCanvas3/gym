@@ -5,12 +5,19 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "gym-a2a-agent",
   "main": "src/index.ts",
+  "workers_dev": true,
   "compatibility_date": "2025-03-10",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  "routes": [
+    {
+      "pattern": "*.impact-agent.io/*",
+      "zone_name": "impact-agent.io"
+    }
+  ],
   "vars": {
     "DEFAULT_TZ": "America/Denver",
-    "HANDLE_BASE_DOMAIN": "gym-a2a-agent.richardpedersen3.workers.dev",
+    "HANDLE_BASE_DOMAIN": "impact-agent.io",
     "LANGGRAPH_ASSISTANT_ID": "gym"
   },
   "d1_databases": [

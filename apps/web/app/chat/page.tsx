@@ -163,20 +163,7 @@ export default function ChatPage() {
         const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
         const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
-        const chatReady = stRec.chatReady === true;
         if (!gymName) {
-          return;
-        }
-        if (!chatReady) {
-          if (!cancelled && !loadedAny) {
-            setMessages([
-              {
-                role: "assistant",
-                text: "Your gym agent exists, but its A2A endpoint is not reachable yet.",
-              },
-            ]);
-            loadedAny = true;
-          }
           return;
         }
         const res = await fetch(url, {
@@ -277,14 +264,8 @@ export default function ChatPage() {
         const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
         const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
-        const chatReady = stRec.chatReady === true;
         if (!gymName) {
           setProfileBusy(false);
-          return;
-        }
-        if (!chatReady) {
-          setProfileBusy(false);
-          setProfileError("Gym agent A2A endpoint is not reachable yet.");
           return;
         }
         const res = await fetch("/api/agent/run", {
