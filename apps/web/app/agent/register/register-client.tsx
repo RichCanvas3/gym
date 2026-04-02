@@ -11,6 +11,7 @@ import { useCreateWallet, useWallets } from "@privy-io/react-auth";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/auth/AuthProvider";
+import { setAgentictrustStatusCached } from "@/components/agentictrust/status-cache";
 
 type Status =
   | { kind: "idle" }
@@ -295,12 +296,22 @@ export default function AgentRegisterClient() {
       const completeRec = completeJson && typeof completeJson === "object" ? (completeJson as Record<string, unknown>) : {};
       const completedFullName = typeof completeRec.fullName === "string" ? completeRec.fullName.trim() : availability.fullName;
       const completedTxHash = typeof completeRec.txHash === "string" ? completeRec.txHash.trim() : txHash;
+      setAgentictrustStatusCached(accountAddress, {
+        ok: true,
+        savedBaseName: baseName.trim(),
+        pendingBaseName: null,
+        fullAgentName: completedFullName || null,
+        agentHandle: availability.fullName.replace(/\.8004-agent\.eth$/i, ""),
+        a2aHost: availability.a2aHost,
+        chatReady: false,
+      });
       setStatus({
         kind: "saved",
         ...(completedFullName ? { fullName: completedFullName } : {}),
         ...(completedTxHash ? { txHash: completedTxHash } : {}),
       });
       setBaseName(baseName.trim());
+      router.replace("/chat");
     } catch (e) {
       setStatus({ kind: "error", error: e instanceof Error ? e.message : String(e ?? "") });
     }
