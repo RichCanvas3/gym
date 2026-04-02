@@ -166,10 +166,14 @@ export async function GET(req: Request) {
     const agentAccount = normalizeAddress(agentInfo?.account);
     const owner = agentAccount ? await getAccountOwner(agentAccount, chainId).catch(() => null) : null;
     const validOwner = typeof owner === "string" && owner.trim().toLowerCase() === eoaAddress.toLowerCase();
+    const savedEoaMatches =
+      typeof prof.eoaAddress === "string" && prof.eoaAddress.trim().toLowerCase() === eoaAddress.toLowerCase();
+    const infoUrlMatches = typeof agentInfo?.url === "string" && agentInfo.url.trim() === a2aHost;
     const trustedSavedDiscovery =
       hasOwner &&
-      typeof prof.discoveredAgentName === "string" &&
-      prof.discoveredAgentName.trim().toLowerCase() === fullAgentName.toLowerCase();
+      ((typeof prof.discoveredAgentName === "string" && prof.discoveredAgentName.trim().toLowerCase() === fullAgentName.toLowerCase()) ||
+        (savedEoaMatches && Boolean(agentAccount)) ||
+        infoUrlMatches);
     if (validOwner || trustedSavedDiscovery) {
       const chatReady = await isA2aEndpointReachable(a2aHost);
       return NextResponse.json({
