@@ -1,4 +1,4 @@
-# SIWE For Agents + Principal Domain MCP Architecture
+# SIWE For Agents: Principal Delegation And MCP Protocol Architecture
 
 ## Status
 
@@ -8,7 +8,7 @@ Draft protocol architecture document.
 
 Wallet sign-in is good at answering one question: who controls this wallet right now.
 
-It does not, by itself, answer the harder question this protocol is built for:
+It does not answer the harder question this protocol is built for:
 
 - how an agent can safely act for a person or organization
 - across multiple domains such as Faith, Fitness, and Finance
@@ -17,12 +17,7 @@ It does not, by itself, answer the harder question this protocol is built for:
 - without relying on broad backend API keys
 - without trusting caller-supplied principal identifiers on downstream services
 
-For most real agent systems, login is only the start. After login, the system still needs a secure way to:
-
-- establish who the principal is
-- delegate constrained authority to an agent runtime
-- route that authority to the correct domain service
-- let the domain service verify the chain before touching principal data or executing principal actions
+This protocol exists to extend Ethereum-style authentication into verifiable delegated agent execution. It is protocol-centric, grounded in Ethereum standards and standards-track account-abstraction patterns, and designed so downstream services can independently validate the full chain before touching principal data.
 
 Without this pattern, most systems collapse into one of two weak models:
 
@@ -43,12 +38,12 @@ flowchart LR
   service -.-> note2
 ```
 
-This protocol exists to make delegated agent execution verifiable, scoped, and portable across domains, while keeping the session wallet private key securely stored inside the trusted A2A agent service at all times.
+The protocol replaces that with a delegation chain:
 
 ```mermaid
 flowchart LR
   wallet[Wallet Auth] --> principal[Principal Smart Account]
-  principal --> delegation[Delegation To Session Account]
+  principal --> delegation[Delegation To Session Smart Account]
   delegation --> gateway[Agent Gateway]
   gateway --> token[Audience Scoped MCP Token]
   token --> domain[Principal Domain MCP]
@@ -64,7 +59,7 @@ This document describes the end-to-end authentication, delegation, and authoriza
 3. LangChain/LangGraph runtime
 4. Principal Domain MCP
 
-The goal is to provide a standards-style description of how SIWE-style wallet authentication, principal smart-account delegation, session packages, and MCP authorization work together to safely access principal-scoped data.
+The goal is to provide a standards-style description of how wallet authentication, principal smart-account delegation, session packages, and MCP authorization work together to safely access principal-scoped data.
 
 ## Scope
 
@@ -85,14 +80,53 @@ This document does not define:
 - Cross-domain revocation registries
 - Non-wallet authentication methods
 
+## Architecture Highlights
+
+- the principal smart account is the authority root for delegated agent execution
+- the session wallet private key is generated and securely stored only inside the trusted Agent Gateway
+- the original principal-to-session delegation is verified by the Agent Gateway before storage
+- the Agent Gateway mints only short-lived, audience-scoped MCP authorization artifacts
+- the LangChain runtime carries auth metadata but never receives the underlying session private key
+- the downstream Principal Domain MCP validates the token, session proof, and original delegation before serving principal-scoped data or actions
+- the protocol fails closed when verification does not succeed
+
+## Core Actors
+
+- `PrincipalSmartAccount`
+  - The long-lived account representing the principal
+  - This is the authority root for delegated agent execution
+- `AgentGateway`
+  - Trusted service boundary that verifies wallet-based authentication
+  - Generates the session key and session smart account
+  - Stores the encrypted session package
+  - Mints audience-scoped MCP authorization artifacts
+- `SessionSmartAccount`
+  - Delegated runtime account used for constrained execution
+- `LangChainRuntime`
+  - Execution environment that invokes MCP tools
+  - Carries short-lived auth metadata but does not hold the underlying session private key
+- `PrincipalDomainMcp`
+  - Domain-scoped MCP service that validates the auth chain and only then serves principal-scoped data or actions
+
+## Security Goals
+
+This architecture is designed to guarantee the following:
+
+- the browser never receives the session private key
+- delegation is explicit, bounded, and principal-linked
+- MCP authorization is audience-specific and short-lived
+- downstream services validate the chain instead of trusting headers or caller claims
+- principal-linked writes occur only for the validated principal
+- the protocol fails closed when verification does not succeed
+
 ## High-Level Overview
 
 The system separates authentication from delegation:
 
-- Authentication proves that the web user controls the wallet authorized to act for the principal smart account.
-- Delegation proves that the principal smart account delegated a constrained capability to a session smart account.
-- Session packaging binds the delegated capability to a session key held only by the trusted A2A service.
-- MCP authorization derives per-request bearer credentials from that stored session package.
+- authentication proves that the web user controls the wallet authorized to act for the principal smart account
+- delegation proves that the principal smart account delegated a constrained capability to a session smart account
+- session packaging binds the delegated capability to a session key held only by the trusted Agent Gateway
+- MCP authorization derives per-request bearer credentials from that stored session package
 
 At runtime, the web client never receives the session wallet private key. That key is generated for the session, securely stored inside the Agent Gateway, and never passed to the browser, the LangChain runtime, or the downstream MCP. The Agent Gateway instead derives a short-lived bearer token for a Principal Domain MCP and passes only that token through the runtime so the downstream MCP can validate the full chain before touching principal data.
 
@@ -115,6 +149,70 @@ Why this matters to a general web3 builder:
 - each MCP audience can receive a separate, short-lived authorization artifact
 - principal-linked writes can be strongly bound to the validated principal instead of caller-supplied identifiers
 - the same pattern can work for a person, a family office, a church, a gym business, or another organization acting as a principal
+
+## The Protocol In Plain English
+
+### Step 1: Authenticate the user
+
+The web client asks the Agent Gateway for an authentication challenge.
+
+The user proves wallet control by signing the challenge.
+
+The Agent Gateway verifies the signature path and principal binding.
+
+Result: the system knows who authenticated and which principal smart account that wallet is acting for.
+
+### Step 2: Create the runtime session account
+
+The Agent Gateway generates a fresh session key and derives a session smart account.
+
+The private key never leaves the trusted gateway.
+
+Result: a runtime identity exists, but it has no authority yet.
+
+### Step 3: Delegate constrained authority
+
+The web client asks the principal smart account to delegate constrained authority to the session smart account.
+
+This delegation can be limited by selector, time window, and intended capability scope.
+
+Result: the runtime session account now has explicit, bounded authority from the principal.
+
+### Step 4: Store the encrypted session package
+
+The Agent Gateway assembles and stores the session package, including:
+
+- principal smart account
+- session smart account
+- session key material
+- signed delegation
+- relevant chain and transport metadata
+
+Before storing it, the Agent Gateway verifies the original principal-to-session smart-account delegation.
+
+Result: the delegated execution state exists entirely inside the trusted boundary.
+
+### Step 5: Mint audience-scoped MCP auth at runtime
+
+When the user sends a chat request, the Agent Gateway validates the session package and mints a short-lived token for the specific MCP audience being called.
+
+Result: the runtime gets only the service-specific authority it needs for that request.
+
+### Step 6: Invoke the Principal Domain MCP
+
+The runtime forwards the request with the short-lived bearer artifact.
+
+The downstream MCP validates:
+
+- issuer
+- audience
+- expiry
+- session key proof
+- original delegation consistency
+- principal binding
+- selector and scope constraints
+
+Result: the MCP can derive the real principal from the validated chain instead of trusting user-supplied IDs.
 
 Terminology used in this document:
 
@@ -144,28 +242,22 @@ flowchart LR
 - `PrincipalWallet`
   - User-controlled EOA wallet used for SIWE-style challenge signing and smart-account delegation signing
 - `PrincipalSmartAccount`
-  - The long-lived smart account that represents the user/agent principal
+  - The long-lived smart account that represents the user or organization principal
+  - The authority root for delegated agent execution
 - `AgentGateway`
   - Trusted service boundary
+  - Verifies wallet-based authentication
   - Generates session keys
   - Stores encrypted session packages
   - Mints MCP-scoped runtime auth artifacts
 - `SessionSmartAccount`
-  - Delegated session account derived by the A2A Agent
+  - Delegated runtime account used for constrained execution
 - `LangChainRuntime`
   - LangGraph/LangChain execution environment that invokes MCP tools
+  - Carries short-lived auth metadata but not the underlying session private key
 - `PrincipalDomainMcp`
   - Principal-scoped domain data and action service
-  - Validates delegated runtime auth before allowing data access
-
-## Security Goals
-
-- The browser must not receive the session private key.
-- A2A web auth must prove control of the wallet associated with the principal smart account.
-- Delegation must be explicit from principal smart account to session smart account.
-- MCP calls must be audience-scoped and short-lived.
-- The Principal Domain MCP must reject calls that are expired, malformed, or not bound to the correct principal.
-- Principal-linked writes must only affect the validated principal.
+  - Validates the auth chain before allowing data access
 
 ## Trust Boundaries
 
@@ -265,7 +357,9 @@ The Agent Gateway assembles the final session package using:
 - selector
 - bundler / chain metadata
 
-The final session package is encrypted and stored by account in the Agent Gateway service database.
+Before storing the final session package, the Agent Gateway verifies the original principal-to-session delegation using the principal smart account signature path.
+
+The final session package is then encrypted and stored by account in the Agent Gateway service database.
 
 ### 5. Runtime MCP Auth Minting
 
@@ -311,6 +405,7 @@ Validation checks include:
 - session key validity window
 - issuer HMAC or equivalent service signature
 - session key signature over the canonical claims payload
+- original principal-to-session smart-account delegation signature
 - signed delegation delegate equals session smart account
 - signed delegation delegator equals principal smart account
 - selector matches the expected delegated function scope
@@ -339,6 +434,7 @@ sequenceDiagram
   WebClient->>PrincipalWallet: Sign delegation to sessionAA
   PrincipalWallet-->>WebClient: signedDelegation
   WebClient->>AgentGateway: Session complete
+  AgentGateway->>AgentGateway: Verify original delegation
   AgentGateway->>AgentGateway: Assemble and encrypt session package
 
   WebClient->>AgentGateway: Chat request with A2A session
@@ -346,7 +442,7 @@ sequenceDiagram
   AgentGateway->>AgentGateway: Mint Principal Domain MCP bearer token
   AgentGateway->>LangChainRuntime: Run request + session.mcpAuth.principalDomain
   LangChainRuntime->>PrincipalDomainMcp: MCP request with Authorization Bearer token
-  PrincipalDomainMcp->>PrincipalDomainMcp: Validate token + delegation + principal
+  PrincipalDomainMcp->>PrincipalDomainMcp: Validate token + session proof + original delegation + principal
   PrincipalDomainMcp-->>LangChainRuntime: MCP tool result
   LangChainRuntime-->>AgentGateway: Final answer
   AgentGateway-->>WebClient: Chat response
@@ -374,9 +470,10 @@ Suggested fields:
 
 Represents the server-stored delegated session state.
 
-Core fields:
+Suggested fields:
 
 - `chainId`
+- `principalSmartAccount`
 - `aa` / `agentAccount`
 - `sessionAA`
 - `selector`
@@ -398,6 +495,7 @@ Core claims:
 - `iss`
 - `aud`
 - `sub`
+- `chainId`
 - `accountAddress`
 - `agentHandle`
 - `principalSmartAccount`
@@ -438,6 +536,7 @@ MCP authorization answers:
 - Is the session still valid?
 - Is the token signed by the delegated session key?
 - Did the trusted Agent Gateway mint this runtime artifact?
+- Is the original principal-to-session delegation cryptographically valid?
 - Which principal should this MCP request run as?
 
 ## Principal-Scoped Data Enforcement
@@ -464,6 +563,7 @@ The protocol is fail-closed.
 Requests must be rejected if:
 
 - auth challenge verification fails
+- principal binding fails
 - delegation bootstrap is incomplete
 - session package is missing
 - session package is expired
@@ -471,6 +571,7 @@ Requests must be rejected if:
 - bearer audience is wrong
 - session-key signature is invalid
 - issuer signature is invalid
+- original delegation signature is invalid
 - delegation binding is inconsistent
 - principal does not match the requested data target
 
@@ -483,9 +584,9 @@ No static API-key fallback should be used for A2A-originated principal-scoped re
 - LangChain MCP injection
 - MCP authorization and principal enforcement
 
-## Standardization Notes
+## Standardization Opportunity
 
-To evolve this into a protocol standards document, the next step is to formalize:
+To move from architecture to standard, the next work should define:
 
 - canonical bearer token encoding
 - canonical claims serialization
@@ -498,15 +599,17 @@ To evolve this into a protocol standards document, the next step is to formalize
 
 ## Summary
 
-This architecture defines a clean chain of trust:
+This architecture defines a clear chain of trust for delegated agent execution:
 
-1. Wallet challenge proves user control.
-2. Principal smart account delegates to a session smart account.
-3. A trusted Agent Gateway stores the session package.
-4. Runtime MCP bearer auth is minted from that package.
-5. The target Principal Domain MCP validates the delegated chain before touching principal data.
+1. the user proves wallet control
+2. the principal smart account delegates bounded authority
+3. the trusted Agent Gateway verifies and stores the delegated runtime state
+4. the gateway mints short-lived, audience-scoped MCP authorization
+5. the downstream Principal Domain MCP validates the chain before touching principal data
 
-This gives a SIWE-for-Agents style flow that extends beyond login into delegated, audience-scoped MCP execution.
+That is the core contribution.
+
+It takes the idea behind SIWE and extends it from login into verifiable, principal-safe, delegated agent execution.
 
 ## How This Differs From SIWE
 
@@ -522,19 +625,23 @@ This architecture goes further:
 
 In short, SIWE is the identity entry point, while this model defines the full post-login execution chain.
 
-## How This Differs From OWS
+## How This Differs From Backend-Session-Centric Models
 
-OWS-style systems generally emphasize a web-session or service-session trust model in which the backend issues or manages bearer-style authorization for downstream services.
+Many service-session architectures treat downstream authorization as a backend concern.
 
-This architecture differs in several important ways:
+The backend authenticates the user, creates a service session, and then calls downstream services as a broadly trusted internal actor.
 
-- the root of trust is wallet authentication plus smart-account delegation, not only a service session
-- delegated authority is explicitly bound to a session smart account and session key, rather than only to an opaque backend session
-- the browser never receives the delegated runtime key material
-- downstream MCP services validate delegation-linked claims, not just bearer possession
-- authorization is audience-scoped and principal-scoped for MCP execution, rather than being a broad session token pattern
+That is operationally convenient, but it weakens the security story.
 
-In short, OWS-style models are typically service-session centric, while this model is delegation-chain centric and wallet-rooted.
+This architecture takes a different path:
+
+- the trust root is wallet authentication plus smart-account delegation
+- downstream authorization is tied to delegated runtime identity, not only backend session state
+- the delegated runtime key never leaves the trusted gateway
+- each MCP audience receives short-lived, scoped authorization
+- downstream services can independently validate the chain
+
+That makes the system more inspectable, more portable, and more suitable for agent ecosystems where multiple runtimes and services may participate.
 
 ## Technical Architecture And Standards
 
@@ -664,6 +771,7 @@ flowchart TD
 
 - verifies wallet and smart-account authentication
 - generates the session wallet and session account
+- verifies the original principal-to-session delegation before storage
 - securely stores the session wallet private key
 - assembles and encrypts the session package
 - mints short-lived MCP audience tokens from the stored session package
@@ -676,9 +784,41 @@ flowchart TD
 
 #### Principal Domain MCP
 
-- validates audience, expiry, issuer signature, session-key signature, and delegation binding
+- validates audience, expiry, issuer signature, session-key signature, original delegation signature, and delegation binding
 - derives the validated principal from auth context
 - rejects any attempt to act outside the validated principal scope
+
+## Design Principles
+
+This protocol is built on a few simple principles:
+
+1. Authentication is not authorization.
+2. Delegation must be explicit.
+3. Sensitive runtime key material should remain in the most trusted boundary.
+4. Every downstream service should be able to validate the chain.
+5. Principal-scoped actions must be derived from validated principal context.
+6. Short-lived, audience-scoped runtime auth is safer than broad reusable credentials.
+
+## Where This Fits Best
+
+This pattern is especially strong when:
+
+- one principal may interact with multiple domain services
+- an agent runtime needs bounded machine authority
+- principal-scoped writes matter
+- you want strong security review posture
+- you want a portable trust model that can work across multiple MCP services and domains
+
+Examples include:
+
+- personal AI assistants
+- organizational AI agents
+- churches and ministry systems
+- fitness and coaching systems
+- financial workflows
+- member data platforms
+- grant and approval systems
+- multi-domain agent ecosystems
 
 ### What Is Standardized Versus Protocol-Specific
 
