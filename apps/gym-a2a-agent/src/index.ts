@@ -1,6 +1,7 @@
 import { keccak_256 } from "@noble/hashes/sha3";
 import { Point, recoverPublicKey } from "@noble/secp256k1";
 import { createPublicClient, hashTypedData, http, recoverTypedDataAddress } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { sepolia } from "viem/chains";
 
 type Env = {
@@ -20,6 +21,8 @@ type Env = {
 
   // First-party web bypass (server-to-server)
   A2A_WEB_KEY?: string;
+  A2A_SESSION_PACKAGE_SECRET?: string;
+  MCP_DELEGATION_SHARED_SECRET?: string;
 
   // Rudimentary abuse control
   RATE_LIMIT_PER_MINUTE?: string;
@@ -88,6 +91,84 @@ type A2AWebAuthChallengeRow = {
   issued_at_iso: string;
   expires_at_iso: string;
   used_at_iso: string | null;
+};
+
+type SessionPackageRow = {
+  account_address: string;
+  agent_handle: string;
+  principal_smart_account: string;
+  principal_owner_eoa: string;
+  agent_id: number | null;
+  chain_id: number;
+  session_key_address: string;
+  session_aa: string | null;
+  permissions_version: string;
+  permissions_hash: string;
+  encrypted_package_json: string;
+  expires_at_iso: string;
+  created_at_iso: string;
+  updated_at_iso: string;
+};
+
+type RuntimeSessionPackage = {
+  row: SessionPackageRow;
+  sessionPackage: Record<string, unknown>;
+  sessionAA: `0x${string}`;
+  selector: `0x${string}`;
+  sessionKey: {
+    privateKey: `0x${string}`;
+    address: `0x${string}`;
+    validAfter: number;
+    validUntil: number;
+  };
+  signedDelegation: {
+    delegate: `0x${string}`;
+    delegator: `0x${string}`;
+    authority: `0x${string}`;
+    caveats: unknown[];
+    salt: `0x${string}`;
+    signature: `0x${string}`;
+  };
+};
+
+type CoreMcpDelegationClaims = {
+  v: 1;
+  iss: "gym-a2a-agent";
+  aud: "urn:mcp:server:core";
+  sub: string;
+  accountAddress: string;
+  agentHandle: string;
+  principalSmartAccount: `0x${string}`;
+  principalOwnerEoa: `0x${string}`;
+  sessionAA: `0x${string}`;
+  sessionKeyAddress: `0x${string}`;
+  sessionValidAfter: number;
+  sessionValidUntil: number;
+  selector: `0x${string}`;
+  permissionsHash: string;
+  signedDelegation: RuntimeSessionPackage["signedDelegation"];
+  issuedAtISO: string;
+  expiresAtISO: string;
+  nonce: string;
+};
+
+type CoreMcpDelegationEnvelope = {
+  claims: CoreMcpDelegationClaims;
+  sessionSignature: `0x${string}`;
+  issuerSignature: string;
+};
+
+type SessionInitRow = {
+  account_address: string;
+  agent_handle: string;
+  principal_smart_account: string;
+  principal_owner_eoa: string;
+  chain_id: number;
+  session_aa: string;
+  encrypted_init_json: string;
+  expires_at_iso: string;
+  created_at_iso: string;
+  updated_at_iso: string;
 };
 
 function nowISO() {
@@ -294,6 +375,36 @@ async function ensureSchema(db: D1Database) {
       created_at_iso TEXT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_a2a_auth_sessions_account ON a2a_auth_sessions(account_address, created_at_iso DESC)`,
+    `CREATE TABLE IF NOT EXISTS a2a_session_packages (
+      account_address TEXT PRIMARY KEY,
+      agent_handle TEXT NOT NULL,
+      principal_smart_account TEXT NOT NULL,
+      principal_owner_eoa TEXT NOT NULL,
+      agent_id INTEGER,
+      chain_id INTEGER NOT NULL,
+      session_key_address TEXT NOT NULL,
+      session_aa TEXT,
+      permissions_version TEXT NOT NULL,
+      permissions_hash TEXT NOT NULL,
+      encrypted_package_json TEXT NOT NULL,
+      expires_at_iso TEXT NOT NULL,
+      created_at_iso TEXT NOT NULL,
+      updated_at_iso TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_a2a_session_packages_handle ON a2a_session_packages(agent_handle, updated_at_iso DESC)`,
+    `CREATE TABLE IF NOT EXISTS a2a_session_inits (
+      account_address TEXT PRIMARY KEY,
+      agent_handle TEXT NOT NULL,
+      principal_smart_account TEXT NOT NULL,
+      principal_owner_eoa TEXT NOT NULL,
+      chain_id INTEGER NOT NULL,
+      session_aa TEXT NOT NULL,
+      encrypted_init_json TEXT NOT NULL,
+      expires_at_iso TEXT NOT NULL,
+      created_at_iso TEXT NOT NULL,
+      updated_at_iso TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_a2a_session_inits_handle ON a2a_session_inits(agent_handle, updated_at_iso DESC)`,
   ];
   for (const sql of stmts) {
     try {
@@ -308,6 +419,226 @@ function okOrNull(v: unknown): string | null {
   if (typeof v !== "string") return null;
   const s = v.trim();
   return s ? s : null;
+}
+
+const SESSION_PACKAGE_PERMISSIONS_VERSION = "v1";
+const SESSION_PACKAGE_REQUIRED_PERMISSIONS = [
+  { aud: "urn:mcp:server:core", tool: "*", actions: ["execute"] },
+  { aud: "urn:mcp:server:strava", tool: "*", actions: ["execute"] },
+  { aud: "urn:mcp:server:googlecalendar", tool: "*", actions: ["execute"] },
+  { aud: "urn:mcp:server:telegram", tool: "*", actions: ["execute"] },
+] as const;
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function base64UrlEncodeBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecodeBytes(value: string): Uint8Array {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+async function sha256Base64Url(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", toArrayBuffer(utf8Bytes(value)));
+  return base64UrlEncodeBytes(new Uint8Array(digest));
+}
+
+async function sessionPackageSecretKey(env: Env): Promise<CryptoKey> {
+  const secret = String(env.A2A_SESSION_PACKAGE_SECRET ?? "").trim();
+  if (!secret) throw new Error("missing_session_package_secret");
+  const digest = await crypto.subtle.digest("SHA-256", toArrayBuffer(utf8Bytes(secret)));
+  return await crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptSessionPackage(env: Env, value: unknown): Promise<string> {
+  const key = await sessionPackageSecretKey(env);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = utf8Bytes(JSON.stringify(value));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, toArrayBuffer(plaintext));
+  return JSON.stringify({
+    v: 1,
+    iv: base64UrlEncodeBytes(iv),
+    ciphertext: base64UrlEncodeBytes(new Uint8Array(ciphertext)),
+  });
+}
+
+async function decryptSessionPackage<T>(env: Env, payload: string): Promise<T> {
+  const key = await sessionPackageSecretKey(env);
+  const parsed = JSON.parse(payload) as Record<string, unknown>;
+  const iv = typeof parsed.iv === "string" ? parsed.iv : "";
+  const ciphertext = typeof parsed.ciphertext === "string" ? parsed.ciphertext : "";
+  if (!iv || !ciphertext) throw new Error("invalid_encrypted_session_package");
+  const plaintext = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(base64UrlDecodeBytes(iv)) },
+    key,
+    toArrayBuffer(base64UrlDecodeBytes(ciphertext)),
+  );
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(plaintext))) as T;
+}
+
+async function requiredPermissionsHash(): Promise<string> {
+  return await sha256Base64Url(JSON.stringify(SESSION_PACKAGE_REQUIRED_PERMISSIONS));
+}
+
+function base64UrlEncodeText(value: string): string {
+  return base64UrlEncodeBytes(utf8Bytes(value));
+}
+
+function base64UrlDecodeText(value: string): string {
+  return new TextDecoder().decode(base64UrlDecodeBytes(value));
+}
+
+function normalizeHexString(value: unknown): `0x${string}` | null {
+  const s = String(value ?? "").trim();
+  if (!/^0x[0-9a-fA-F]+$/.test(s)) return null;
+  return s.toLowerCase() as `0x${string}`;
+}
+
+function normalizeSignedDelegation(value: unknown): RuntimeSessionPackage["signedDelegation"] | null {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  const msg = raw && raw.message && typeof raw.message === "object" ? (raw.message as Record<string, unknown>) : raw;
+  if (!msg) return null;
+  const delegate = normalizeAddress(String(msg.delegate ?? ""));
+  const delegator = normalizeAddress(String(msg.delegator ?? ""));
+  const authority = normalizeAddress(String(msg.authority ?? ""));
+  const salt = normalizeHexString(msg.salt);
+  const signature = normalizeHexString(raw?.signature ?? msg.signature);
+  const caveats = Array.isArray(msg.caveats) ? msg.caveats : [];
+  if (!delegate || !delegator || !authority || !salt || !signature) return null;
+  return {
+    delegate: delegate as `0x${string}`,
+    delegator: delegator as `0x${string}`,
+    authority: authority as `0x${string}`,
+    caveats,
+    salt,
+    signature,
+  };
+}
+
+async function mcpDelegationSecretKey(env: Env): Promise<CryptoKey> {
+  const secret = String(env.MCP_DELEGATION_SHARED_SECRET ?? "").trim();
+  if (!secret) throw new Error("missing_mcp_delegation_shared_secret");
+  return await crypto.subtle.importKey("raw", toArrayBuffer(utf8Bytes(secret)), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+}
+
+function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
+  return JSON.stringify({
+    v: claims.v,
+    iss: claims.iss,
+    aud: claims.aud,
+    sub: claims.sub,
+    accountAddress: claims.accountAddress,
+    agentHandle: claims.agentHandle,
+    principalSmartAccount: claims.principalSmartAccount,
+    principalOwnerEoa: claims.principalOwnerEoa,
+    sessionAA: claims.sessionAA,
+    sessionKeyAddress: claims.sessionKeyAddress,
+    sessionValidAfter: claims.sessionValidAfter,
+    sessionValidUntil: claims.sessionValidUntil,
+    selector: claims.selector,
+    permissionsHash: claims.permissionsHash,
+    signedDelegation: claims.signedDelegation,
+    issuedAtISO: claims.issuedAtISO,
+    expiresAtISO: claims.expiresAtISO,
+    nonce: claims.nonce,
+  });
+}
+
+async function signCoreMcpClaimsWithIssuer(env: Env, claims: CoreMcpDelegationClaims): Promise<string> {
+  const key = await mcpDelegationSecretKey(env);
+  const payload = utf8Bytes(coreMcpClaimsCanonicalString(claims));
+  const sig = await crypto.subtle.sign("HMAC", key, toArrayBuffer(payload));
+  return base64UrlEncodeBytes(new Uint8Array(sig));
+}
+
+async function loadRuntimeSessionPackage(env: Env, accountAddress: string): Promise<RuntimeSessionPackage> {
+  const status = await sessionPackageStatus(env.DB, accountAddress);
+  if (!status.hasPackage) throw new Error("missing_session_package");
+  if (status.expired) throw new Error("session_package_expired");
+  if (!status.ready) throw new Error("session_package_not_ready");
+  const row = await getSessionPackageRow(env.DB, accountAddress);
+  if (!row) throw new Error("missing_session_package_row");
+  const sessionPackage = await decryptSessionPackage<Record<string, unknown>>(env, row.encrypted_package_json);
+  const sessionAA = normalizeAddress(String(sessionPackage.sessionAA ?? row.session_aa ?? ""));
+  const selector = normalizeHexString(sessionPackage.selector);
+  const sessionKey = sessionPackage.sessionKey && typeof sessionPackage.sessionKey === "object"
+    ? (sessionPackage.sessionKey as Record<string, unknown>)
+    : null;
+  const sessionKeyAddress = normalizeAddress(String(sessionKey?.address ?? ""));
+  const sessionKeyPrivateKey = normalizeHexString(sessionKey?.privateKey);
+  const sessionValidAfter = Number(sessionKey?.validAfter ?? 0);
+  const sessionValidUntil = Number(sessionKey?.validUntil ?? 0);
+  const signedDelegation = normalizeSignedDelegation(sessionPackage.signedDelegation);
+  if (!sessionAA || !selector || !sessionKey || !sessionKeyAddress || !sessionKeyPrivateKey || !Number.isFinite(sessionValidAfter) || !Number.isFinite(sessionValidUntil) || !signedDelegation) {
+    throw new Error("invalid_runtime_session_package");
+  }
+  if (signedDelegation.delegate !== sessionAA) throw new Error("session_package_delegate_mismatch");
+  if (signedDelegation.delegator !== row.principal_smart_account) throw new Error("session_package_principal_mismatch");
+  if (sessionKeyAddress !== row.session_key_address) throw new Error("session_package_session_key_mismatch");
+  return {
+    row,
+    sessionPackage,
+    sessionAA: sessionAA as `0x${string}`,
+    selector,
+    sessionKey: {
+      privateKey: sessionKeyPrivateKey,
+      address: sessionKeyAddress as `0x${string}`,
+      validAfter: sessionValidAfter,
+      validUntil: sessionValidUntil,
+    },
+    signedDelegation,
+  };
+}
+
+async function mintCoreMcpDelegationToken(env: Env, accountAddress: string): Promise<CoreMcpDelegationEnvelope & { token: string }> {
+  const runtime = await loadRuntimeSessionPackage(env, accountAddress);
+  const nowMs = Date.now();
+  const issuedAtISO = new Date(nowMs).toISOString();
+  const maxExpiresAtMs = Math.min(Date.parse(runtime.row.expires_at_iso), runtime.sessionKey.validUntil * 1000, nowMs + 5 * 60 * 1000);
+  if (!Number.isFinite(maxExpiresAtMs) || maxExpiresAtMs <= nowMs) throw new Error("runtime_session_package_expired");
+  const claims: CoreMcpDelegationClaims = {
+    v: 1,
+    iss: "gym-a2a-agent",
+    aud: "urn:mcp:server:core",
+    sub: runtime.row.account_address,
+    accountAddress: runtime.row.account_address,
+    agentHandle: runtime.row.agent_handle,
+    principalSmartAccount: runtime.row.principal_smart_account as `0x${string}`,
+    principalOwnerEoa: runtime.row.principal_owner_eoa as `0x${string}`,
+    sessionAA: runtime.sessionAA,
+    sessionKeyAddress: runtime.sessionKey.address,
+    sessionValidAfter: runtime.sessionKey.validAfter,
+    sessionValidUntil: runtime.sessionKey.validUntil,
+    selector: runtime.selector,
+    permissionsHash: runtime.row.permissions_hash,
+    signedDelegation: runtime.signedDelegation,
+    issuedAtISO,
+    expiresAtISO: new Date(maxExpiresAtMs).toISOString(),
+    nonce: `core_${crypto.randomUUID()}`,
+  };
+  const signer = privateKeyToAccount(runtime.sessionKey.privateKey);
+  const canonical = coreMcpClaimsCanonicalString(claims);
+  const sessionSignature = await signer.signMessage({ message: canonical });
+  const issuerSignature = await signCoreMcpClaimsWithIssuer(env, claims);
+  const envelope: CoreMcpDelegationEnvelope = {
+    claims,
+    sessionSignature,
+    issuerSignature,
+  };
+  return {
+    ...envelope,
+    token: base64UrlEncodeText(JSON.stringify(envelope)),
+  };
 }
 
 
@@ -521,6 +852,185 @@ async function verifyWebSessionToken(db: D1Database, token: string): Promise<A2A
   };
 }
 
+async function getSessionPackageRow(db: D1Database, accountAddress: string): Promise<SessionPackageRow | null> {
+  const row = await db.prepare(
+    `SELECT account_address, agent_handle, principal_smart_account, principal_owner_eoa, agent_id, chain_id,
+      session_key_address, session_aa, permissions_version, permissions_hash, encrypted_package_json,
+      expires_at_iso, created_at_iso, updated_at_iso
+     FROM a2a_session_packages WHERE account_address = ? LIMIT 1`
+  )
+    .bind(accountAddress.trim())
+    .first<SessionPackageRow>();
+  return row?.account_address ? row : null;
+}
+
+async function getSessionInitRow(db: D1Database, accountAddress: string): Promise<SessionInitRow | null> {
+  const row = await db.prepare(
+    `SELECT account_address, agent_handle, principal_smart_account, principal_owner_eoa, chain_id,
+      session_aa, encrypted_init_json, expires_at_iso, created_at_iso, updated_at_iso
+     FROM a2a_session_inits WHERE account_address = ? LIMIT 1`
+  )
+    .bind(accountAddress.trim())
+    .first<SessionInitRow>();
+  return row?.account_address ? row : null;
+}
+
+async function clearSessionInit(db: D1Database, accountAddress: string) {
+  await db.prepare(`DELETE FROM a2a_session_inits WHERE account_address = ?`).bind(accountAddress.trim()).run();
+}
+
+async function upsertSessionInit(db: D1Database, env: Env, args: {
+  accountAddress: string;
+  agentHandle: string;
+  principalSmartAccount: string;
+  principalOwnerEoa: string;
+  chainId: number;
+  sessionAA: string;
+  expiresAtISO: string;
+  initData: Record<string, unknown>;
+}) {
+  const now = nowISO();
+  const encryptedInitJson = await encryptSessionPackage(env, args.initData);
+  await db.prepare(
+    `INSERT INTO a2a_session_inits (
+      account_address, agent_handle, principal_smart_account, principal_owner_eoa, chain_id,
+      session_aa, encrypted_init_json, expires_at_iso, created_at_iso, updated_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(account_address) DO UPDATE SET
+      agent_handle = excluded.agent_handle,
+      principal_smart_account = excluded.principal_smart_account,
+      principal_owner_eoa = excluded.principal_owner_eoa,
+      chain_id = excluded.chain_id,
+      session_aa = excluded.session_aa,
+      encrypted_init_json = excluded.encrypted_init_json,
+      expires_at_iso = excluded.expires_at_iso,
+      updated_at_iso = excluded.updated_at_iso`
+  )
+    .bind(
+      args.accountAddress.trim(),
+      args.agentHandle.trim().toLowerCase(),
+      normalizeAddress(args.principalSmartAccount),
+      normalizeAddress(args.principalOwnerEoa),
+      args.chainId,
+      normalizeAddress(args.sessionAA),
+      encryptedInitJson,
+      args.expiresAtISO,
+      now,
+      now,
+    )
+    .run();
+}
+
+async function readSessionInit(db: D1Database, env: Env, accountAddress: string) {
+  const row = await getSessionInitRow(db, accountAddress);
+  if (!row) return { pending: false, expired: false, initData: null as Record<string, unknown> | null, row: null as SessionInitRow | null };
+  const expiresAtMs = row.expires_at_iso ? Date.parse(row.expires_at_iso) : Number.NaN;
+  const expired = !row.expires_at_iso || Number.isNaN(expiresAtMs) || expiresAtMs <= Date.now();
+  if (expired) {
+    await clearSessionInit(db, accountAddress).catch(() => null);
+    return { pending: false, expired: true, initData: null as Record<string, unknown> | null, row: null as SessionInitRow | null };
+  }
+  const initData = await decryptSessionPackage<Record<string, unknown>>(env, row.encrypted_init_json);
+  return { pending: true, expired: false, initData, row };
+}
+
+async function sessionPackageStatus(db: D1Database, accountAddress: string) {
+  const row = await getSessionPackageRow(db, accountAddress);
+  const permissionsHash = await requiredPermissionsHash();
+  const nowMs = Date.now();
+  const expiresAtMs = row?.expires_at_iso ? Date.parse(row.expires_at_iso) : Number.NaN;
+  const expired = !row?.expires_at_iso || Number.isNaN(expiresAtMs) || expiresAtMs <= nowMs;
+  const ready = !!row && !expired && row.permissions_hash === permissionsHash && row.permissions_version === SESSION_PACKAGE_PERMISSIONS_VERSION;
+  return {
+    ready,
+    hasPackage: !!row,
+    expired,
+    permissionsVersion: SESSION_PACKAGE_PERMISSIONS_VERSION,
+    permissionsHash,
+    requiredPermissions: SESSION_PACKAGE_REQUIRED_PERMISSIONS,
+    packageMeta: row
+      ? {
+          accountAddress: row.account_address,
+          agentHandle: row.agent_handle,
+          principalSmartAccount: row.principal_smart_account,
+          principalOwnerEoa: row.principal_owner_eoa,
+          agentId: row.agent_id,
+          chainId: row.chain_id,
+          sessionKeyAddress: row.session_key_address,
+          sessionAA: row.session_aa,
+          expiresAtISO: row.expires_at_iso,
+          createdAtISO: row.created_at_iso,
+          updatedAtISO: row.updated_at_iso,
+        }
+      : null,
+  };
+}
+
+async function upsertSessionPackage(db: D1Database, env: Env, args: {
+  accountAddress: string;
+  agentHandle: string;
+  principalSmartAccount: string;
+  principalOwnerEoa: string;
+  agentId: number | null;
+  chainId: number;
+  sessionPackage: Record<string, unknown>;
+}) {
+  const sessionKey = (args.sessionPackage.sessionKey ?? {}) as Record<string, unknown>;
+  const signedDelegation = (args.sessionPackage.signedDelegation ?? {}) as Record<string, unknown>;
+  const sessionKeyAddress = normalizeAddress(String(sessionKey.address ?? ""));
+  const sessionAA = normalizeAddress(String(args.sessionPackage.sessionAA ?? "")) || null;
+  const expiresAtISO = (() => {
+    const validUntil = Number(sessionKey.validUntil ?? 0);
+    return Number.isFinite(validUntil) && validUntil > 0 ? new Date(validUntil * 1000).toISOString() : "";
+  })();
+  if (!sessionKeyAddress) throw new Error("invalid_session_key_address");
+  if (!expiresAtISO) throw new Error("invalid_session_expiry");
+  if (!String(sessionKey.privateKey ?? "").trim()) throw new Error("missing_session_private_key");
+  if (!String(signedDelegation.signature ?? "").trim()) throw new Error("missing_signed_delegation");
+  const permissionsHash = await requiredPermissionsHash();
+  const encryptedPackageJson = await encryptSessionPackage(env, args.sessionPackage);
+  const now = nowISO();
+  await db.prepare(
+    `INSERT INTO a2a_session_packages (
+      account_address, agent_handle, principal_smart_account, principal_owner_eoa, agent_id, chain_id,
+      session_key_address, session_aa, permissions_version, permissions_hash, encrypted_package_json,
+      expires_at_iso, created_at_iso, updated_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(account_address) DO UPDATE SET
+      agent_handle = excluded.agent_handle,
+      principal_smart_account = excluded.principal_smart_account,
+      principal_owner_eoa = excluded.principal_owner_eoa,
+      agent_id = excluded.agent_id,
+      chain_id = excluded.chain_id,
+      session_key_address = excluded.session_key_address,
+      session_aa = excluded.session_aa,
+      permissions_version = excluded.permissions_version,
+      permissions_hash = excluded.permissions_hash,
+      encrypted_package_json = excluded.encrypted_package_json,
+      expires_at_iso = excluded.expires_at_iso,
+      updated_at_iso = excluded.updated_at_iso`
+  )
+    .bind(
+      args.accountAddress.trim(),
+      args.agentHandle.trim().toLowerCase(),
+      normalizeAddress(args.principalSmartAccount),
+      normalizeAddress(args.principalOwnerEoa),
+      args.agentId,
+      args.chainId,
+      sessionKeyAddress,
+      sessionAA,
+      SESSION_PACKAGE_PERMISSIONS_VERSION,
+      permissionsHash,
+      encryptedPackageJson,
+      expiresAtISO,
+      now,
+      now,
+    )
+    .run();
+  await clearSessionInit(db, args.accountAddress).catch(() => null);
+  return await sessionPackageStatus(db, args.accountAddress);
+}
+
 async function recoverWebAuthSigner(row: A2AWebAuthChallengeRow, signature: string): Promise<string> {
   const typed = typedDataForChallenge(row);
   const recovered = await recoverTypedDataAddress({
@@ -650,7 +1160,18 @@ async function upsertHandle(db: D1Database, args: { handle: string; accountAddre
   return { handle: h, accountAddress: acct, telegramUserId: args.telegramUserId ?? null, updatedAtISO: ts };
 }
 
-async function forwardToLangGraph(env: Env, args: { handle: string; accountAddress: string; message: string; metadata?: Record<string, unknown> }) {
+async function forwardToLangGraph(env: Env, args: {
+  handle: string;
+  accountAddress: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  mcpAuth?: {
+    core?: {
+      bearerToken: string;
+      expiresAtISO: string;
+    };
+  };
+}) {
   const deploymentUrl = (env.LANGGRAPH_DEPLOYMENT_URL ?? "").trim().replace(/\/$/, "");
   const apiKey = (env.LANGSMITH_API_KEY ?? "").trim();
   const assistantId = (env.LANGGRAPH_ASSISTANT_ID ?? "gym").trim() || "gym";
@@ -678,6 +1199,7 @@ async function forwardToLangGraph(env: Env, args: { handle: string; accountAddre
           timezone: tz,
           accountAddress: args.accountAddress,
           threadId,
+          ...(args.mcpAuth ? { mcpAuth: args.mcpAuth } : {}),
           a2a: { handle: args.handle, ...(a2aMeta ?? {}) },
         },
       },
@@ -883,20 +1405,161 @@ export default {
       if (!challenge) return notFound("Unknown challengeId");
       if (challenge.used_at_iso) return badRequest("challenge_already_used");
       if (Date.parse(challenge.expires_at_iso) <= Date.now()) return badRequest("challenge_expired");
-      if (challenge.account_address !== accountAddress) return unauthorized("challenge_account_mismatch");
-      if (challenge.wallet_address !== walletAddress) return unauthorized("challenge_wallet_mismatch");
+      if (challenge.account_address !== accountAddress) {
+        return json(
+          {
+            ok: false,
+            error: "challenge_account_mismatch",
+            detail: `challengeAccount=${challenge.account_address} requestAccount=${accountAddress}`,
+          },
+          401,
+        );
+      }
+      if (challenge.wallet_address !== walletAddress) {
+        return json(
+          {
+            ok: false,
+            error: "challenge_wallet_mismatch",
+            detail: `challengeWallet=${challenge.wallet_address} requestWallet=${walletAddress}`,
+          },
+          401,
+        );
+      }
       try {
-        const recoveredSigner = await recoverWebAuthSigner(challenge, signature);
-        if (recoveredSigner !== challenge.wallet_address) return unauthorized("wallet_signature_mismatch");
+        let recoveredSigner = "";
+        try {
+          recoveredSigner = await recoverWebAuthSigner(challenge, signature);
+        } catch {
+          recoveredSigner = "";
+        }
+        if (recoveredSigner && recoveredSigner !== challenge.wallet_address) {
+          return json(
+            {
+              ok: false,
+              error: "wallet_signature_mismatch",
+              detail: `recoveredSigner=${recoveredSigner} expectedWallet=${challenge.wallet_address}`,
+            },
+            401,
+          );
+        }
         const erc1271 = await verifyWebAuthErc1271(challenge, signature);
         if (!erc1271.ok) {
-          return unauthorized("erc1271_validation_failed");
+          return json(
+            {
+              ok: false,
+              error: "erc1271_validation_failed",
+              detail: `principalSmartAccount=${challenge.principal_smart_account} walletAddress=${challenge.wallet_address} digest=${erc1271.digest}`,
+            },
+            401,
+          );
         }
         await markChallengeUsed(env.DB, challenge.challenge_id);
         const session = await createWebSession(env.DB, { challenge });
-        return json({ ok: true, recoveredSigner, digest: erc1271.digest, session });
+        return json({ ok: true, recoveredSigner: recoveredSigner || null, digest: erc1271.digest, session });
       } catch (e) {
         return badRequest("Failed to verify auth challenge", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
+    if (url.pathname === "/api/a2a/session/status" && req.method === "GET") {
+      const want = (env.A2A_WEB_KEY ?? "").trim();
+      const got = (req.headers.get("x-web-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-web-key)");
+      const accountAddress = (url.searchParams.get("accountAddress") ?? "").trim();
+      if (!accountAddress) return badRequest("Missing accountAddress");
+      try {
+        const status = await sessionPackageStatus(env.DB, accountAddress);
+        return json({ ok: true, ...status });
+      } catch (e) {
+        return badRequest("Failed to read session package status", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
+    if (url.pathname === "/api/a2a/session/init" && req.method === "GET") {
+      const want = (env.A2A_WEB_KEY ?? "").trim();
+      const got = (req.headers.get("x-web-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-web-key)");
+      const accountAddress = (url.searchParams.get("accountAddress") ?? "").trim();
+      if (!accountAddress) return badRequest("Missing accountAddress");
+      try {
+        const init = await readSessionInit(env.DB, env, accountAddress);
+        return json({
+          ok: true,
+          pending: init.pending,
+          expired: init.expired,
+          sessionAA: init.row?.session_aa ?? null,
+          chainId: init.row?.chain_id ?? null,
+          initData: init.initData,
+        });
+      } catch (e) {
+        return badRequest("Failed to read session init", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
+    if (url.pathname === "/api/a2a/session/init" && req.method === "POST") {
+      const want = (env.A2A_ADMIN_KEY ?? "").trim();
+      const got = (req.headers.get("x-admin-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-admin-key)");
+      const body = await readBodyJson(req).catch((e) => ({ __error__: String((e as any)?.message ?? e) }));
+      if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
+      const accountAddress = String(body?.accountAddress ?? "").trim();
+      const agentHandle = String(body?.agentHandle ?? "").trim().toLowerCase();
+      const principalSmartAccount = normalizeAddress(String(body?.principalSmartAccount ?? ""));
+      const principalOwnerEoa = normalizeAddress(String(body?.principalOwnerEoa ?? ""));
+      const sessionAA = normalizeAddress(String(body?.sessionAA ?? ""));
+      const chainId = Number(body?.chainId ?? DEFAULT_CHAIN_ID);
+      const expiresAtISO = String(body?.expiresAtISO ?? "").trim();
+      const initData = body?.initData && typeof body.initData === "object" ? (body.initData as Record<string, unknown>) : null;
+      if (!accountAddress || !agentHandle || !principalSmartAccount || !principalOwnerEoa || !sessionAA || !expiresAtISO || !initData) {
+        return badRequest("Missing required session init fields");
+      }
+      try {
+        await upsertSessionInit(env.DB, env, {
+          accountAddress,
+          agentHandle,
+          principalSmartAccount,
+          principalOwnerEoa,
+          chainId,
+          sessionAA,
+          expiresAtISO,
+          initData,
+        });
+        return json({ ok: true, pending: true, sessionAA, chainId, expiresAtISO });
+      } catch (e) {
+        return badRequest("Failed to store session init", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
+    if (url.pathname === "/api/a2a/session/package" && req.method === "POST") {
+      const want = (env.A2A_ADMIN_KEY ?? "").trim();
+      const got = (req.headers.get("x-admin-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-admin-key)");
+      const body = await readBodyJson(req).catch((e) => ({ __error__: String((e as any)?.message ?? e) }));
+      if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
+      const accountAddress = String(body?.accountAddress ?? "").trim();
+      const agentHandle = String(body?.agentHandle ?? "").trim().toLowerCase();
+      const principalSmartAccount = normalizeAddress(String(body?.principalSmartAccount ?? ""));
+      const principalOwnerEoa = normalizeAddress(String(body?.principalOwnerEoa ?? ""));
+      const agentIdRaw = body?.agentId;
+      const agentId = Number.isFinite(Number(agentIdRaw)) ? Number(agentIdRaw) : null;
+      const chainId = Number(body?.chainId ?? DEFAULT_CHAIN_ID);
+      const sessionPackage = body?.sessionPackage && typeof body.sessionPackage === "object" ? (body.sessionPackage as Record<string, unknown>) : null;
+      if (!accountAddress || !agentHandle || !principalSmartAccount || !principalOwnerEoa || !sessionPackage) {
+        return badRequest("Missing required session package fields");
+      }
+      try {
+        const status = await upsertSessionPackage(env.DB, env, {
+          accountAddress,
+          agentHandle,
+          principalSmartAccount,
+          principalOwnerEoa,
+          agentId,
+          chainId,
+          sessionPackage,
+        });
+        return json({ ok: true, ...status });
+      } catch (e) {
+        return badRequest("Failed to store session package", { detail: String((e as any)?.message ?? e) });
       }
     }
 
@@ -954,7 +1617,30 @@ export default {
       }
 
       try {
-        const forwarded = await forwardToLangGraph(env, { handle, accountAddress: row.account_address, message, metadata: envl.metadata });
+        let coreMcpAuth: { core: { bearerToken: string; expiresAtISO: string } };
+        try {
+          const minted = await mintCoreMcpDelegationToken(env, row.account_address);
+          coreMcpAuth = {
+            core: {
+              bearerToken: minted.token,
+              expiresAtISO: minted.claims.expiresAtISO,
+            },
+          };
+        } catch (e) {
+          console.warn("[gym-a2a-agent] core MCP delegation mint failed", {
+            handle,
+            accountAddress: row.account_address,
+            detail: String((e as any)?.message ?? e),
+          });
+          return json({ ok: false, error: "core_mcp_delegation_unavailable", detail: String((e as any)?.message ?? e) }, 401);
+        }
+        const forwarded = await forwardToLangGraph(env, {
+          handle,
+          accountAddress: row.account_address,
+          message,
+          metadata: envl.metadata,
+          mcpAuth: coreMcpAuth,
+        });
         return json({
           ok: true,
           messageId,

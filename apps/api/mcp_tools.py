@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -10,6 +11,17 @@ from typing import Any, Optional, Tuple
 from langchain_core.tools import BaseTool
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+_RUNTIME_MCP_OVERRIDES: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
+    "runtime_mcp_overrides", default=None
+)
+
+
+def set_runtime_mcp_overrides(overrides: Optional[dict[str, Any]]) -> contextvars.Token[Optional[dict[str, Any]]]:
+    return _RUNTIME_MCP_OVERRIDES.set(overrides if isinstance(overrides, dict) and overrides else None)
+
+
+def reset_runtime_mcp_overrides(token: contextvars.Token[Optional[dict[str, Any]]]) -> None:
+    _RUNTIME_MCP_OVERRIDES.reset(token)
 
 
 def _truthy_env(name: str, default: bool) -> bool:
@@ -89,6 +101,33 @@ def _apply_timeouts(servers: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _runtime_server_overrides() -> Optional[dict[str, Any]]:
+    value = _RUNTIME_MCP_OVERRIDES.get()
+    return value if isinstance(value, dict) and value else None
+
+
+def _merge_runtime_overrides(servers: dict[str, Any], overrides: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not overrides:
+        return servers
+    out: dict[str, Any] = {}
+    for name, cfg in servers.items():
+        base_cfg = dict(cfg) if isinstance(cfg, dict) else cfg
+        ov = overrides.get(name) if isinstance(overrides, dict) else None
+        if not isinstance(base_cfg, dict) or not isinstance(ov, dict):
+            out[name] = base_cfg
+            continue
+        merged = dict(base_cfg)
+        for key, value in ov.items():
+            if key == "headers" and isinstance(value, dict):
+                headers = dict(merged.get("headers") or {}) if isinstance(merged.get("headers"), dict) else {}
+                headers.update(value)
+                merged["headers"] = headers
+            else:
+                merged[key] = value
+        out[name] = merged
+    return out
+
+
 def _filter_tools(tools: list[BaseTool]) -> list[BaseTool]:
     allow = _csv_set("MCP_TOOL_ALLOWLIST")
     deny = _csv_set("MCP_TOOL_DENYLIST")
@@ -132,6 +171,7 @@ def _cache_key_for_env() -> str:
         "MCP_TOOL_DENYLIST": os.environ.get("MCP_TOOL_DENYLIST", "").strip(),
         "MCP_STREAMABLE_HTTP_TIMEOUT_SECONDS": os.environ.get("MCP_STREAMABLE_HTTP_TIMEOUT_SECONDS", "").strip(),
         "MCP_STREAMABLE_HTTP_SSE_READ_TIMEOUT_SECONDS": os.environ.get("MCP_STREAMABLE_HTTP_SSE_READ_TIMEOUT_SECONDS", "").strip(),
+        "RUNTIME_MCP_OVERRIDES": _runtime_server_overrides(),
     }
     return json.dumps(parts, sort_keys=True)
 
@@ -149,10 +189,11 @@ async def load_mcp_tools_from_env() -> list[BaseTool]:
 
 async def load_mcp_tools_with_diagnostics_from_env() -> Tuple[list[BaseTool], dict[str, Any]]:
     ttl = _mcp_tools_cache_ttl_seconds()
+    runtime_overrides = _runtime_server_overrides()
     key = _cache_key_for_env()
     now = time.monotonic()
     global _CACHED_TOOLS, _CACHED_DIAG, _CACHED_AT_MONO, _CACHED_KEY
-    if ttl > 0 and _CACHED_TOOLS is not None and _CACHED_DIAG is not None and _CACHED_AT_MONO is not None and _CACHED_KEY == key:
+    if runtime_overrides is None and ttl > 0 and _CACHED_TOOLS is not None and _CACHED_DIAG is not None and _CACHED_AT_MONO is not None and _CACHED_KEY == key:
         if (now - _CACHED_AT_MONO) < ttl:
             return _CACHED_TOOLS, _CACHED_DIAG
 
@@ -160,11 +201,12 @@ async def load_mcp_tools_with_diagnostics_from_env() -> Tuple[list[BaseTool], di
     if not servers:
         tools0: list[BaseTool] = []
         diag0 = {"okServers": [], "failedServers": []}
-        if ttl > 0:
+        if runtime_overrides is None and ttl > 0:
             _CACHED_TOOLS, _CACHED_DIAG, _CACHED_AT_MONO, _CACHED_KEY = tools0, diag0, now, key
         return tools0, diag0
 
     servers = _apply_timeouts(servers)
+    servers = _merge_runtime_overrides(servers, runtime_overrides)
     tool_name_prefix = _truthy_env("MCP_TOOL_NAME_PREFIX", default=True)
 
     try:
@@ -192,7 +234,7 @@ async def load_mcp_tools_with_diagnostics_from_env() -> Tuple[list[BaseTool], di
             continue
     tools_out = _filter_tools(all_tools)
     diag_out = {"okServers": ok_servers, "failedServers": failed_servers}
-    if ttl > 0:
+    if runtime_overrides is None and ttl > 0:
         _CACHED_TOOLS, _CACHED_DIAG, _CACHED_AT_MONO, _CACHED_KEY = tools_out, diag_out, now, key
     return tools_out, diag_out
 

@@ -163,41 +163,82 @@ export async function telegramUserIdForPrivyDid(did: string): Promise<string | n
   }
 }
 
-function extractEoaFromPrivyUser(user: unknown): `0x${string}` | null {
-  if (!user || typeof user !== "object") return null;
+function normalizeEthAddress(value: unknown): `0x${string}` | null {
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(s)) return null;
+  return s.toLowerCase() as `0x${string}`;
+}
+
+function extractEthereumWalletsFromPrivyUser(user: unknown): Array<Record<string, unknown>> {
+  if (!user || typeof user !== "object") return [];
   const u = user as Record<string, unknown>;
-
-  const candidates: unknown[] = [];
-  // Common top-level fields (varies by Privy account type)
-  candidates.push(u.wallet_address, u.walletAddress, u.address);
-
-  // linked_accounts frequently contains embedded wallet entries
+  const out: Array<Record<string, unknown>> = [];
+  const pushIfEthereumWallet = (value: unknown) => {
+    if (!value || typeof value !== "object") return;
+    const rec = value as Record<string, unknown>;
+    const type = typeof rec.type === "string" ? rec.type : "";
+    const chainType = typeof rec.chainType === "string" ? rec.chainType : typeof rec.chain_type === "string" ? rec.chain_type : "";
+    if (type === "wallet" && chainType === "ethereum") out.push(rec);
+  };
   const linked = (u.linked_accounts ?? u.linkedAccounts) as unknown;
   if (Array.isArray(linked)) {
-    for (const a of linked) {
-      if (!a || typeof a !== "object") continue;
-      const acc = a as Record<string, unknown>;
-      candidates.push(acc.address, acc.wallet_address, acc.walletAddress);
-
-      const wallet = acc.wallet && typeof acc.wallet === "object" ? (acc.wallet as Record<string, unknown>) : null;
-      if (wallet) candidates.push(wallet.address, wallet.wallet_address, wallet.walletAddress);
-    }
+    for (const item of linked) pushIfEthereumWallet(item);
   }
-
-  // Some shapes include `wallets: [{ address }]`
   const wallets = u.wallets as unknown;
   if (Array.isArray(wallets)) {
-    for (const w of wallets) {
-      if (!w || typeof w !== "object") continue;
-      const wr = w as Record<string, unknown>;
-      candidates.push(wr.address, wr.wallet_address, wr.walletAddress);
-    }
+    for (const item of wallets) pushIfEthereumWallet(item);
   }
+  return out;
+}
 
-  for (const c of candidates) {
-    if (typeof c !== "string") continue;
-    const s = c.trim();
-    if (/^0x[0-9a-fA-F]{40}$/.test(s)) return s.toLowerCase() as `0x${string}`;
+function walletClientTypeOf(value: Record<string, unknown>): string {
+  return typeof value.walletClientType === "string"
+    ? value.walletClientType
+    : typeof value.wallet_client_type === "string"
+      ? value.wallet_client_type
+      : "";
+}
+
+function walletAddressOf(value: Record<string, unknown>): `0x${string}` | null {
+  const direct = normalizeEthAddress(value.address ?? value.wallet_address ?? value.walletAddress);
+  if (direct) return direct;
+  const wallet = value.wallet && typeof value.wallet === "object" ? (value.wallet as Record<string, unknown>) : null;
+  return normalizeEthAddress(wallet?.address ?? wallet?.wallet_address ?? wallet?.walletAddress);
+}
+
+function isEmbeddedPrivyWallet(value: Record<string, unknown>): boolean {
+  const walletClientType = walletClientTypeOf(value);
+  const imported = value.imported === true;
+  return (walletClientType === "privy" || walletClientType === "privy-v2") && !imported;
+}
+
+function isExternalWallet(value: Record<string, unknown>): boolean {
+  const walletClientType = walletClientTypeOf(value);
+  return Boolean(walletClientType) && walletClientType !== "privy" && walletClientType !== "privy-v2";
+}
+
+function extractEoaFromPrivyUser(user: unknown): `0x${string}` | null {
+  const wallets = extractEthereumWalletsFromPrivyUser(user);
+  for (const rec of wallets) {
+    if (!isExternalWallet(rec)) continue;
+    const addr = walletAddressOf(rec);
+    if (addr) return addr;
+  }
+  for (const rec of wallets) {
+    if (!isEmbeddedPrivyWallet(rec)) continue;
+    const addr = walletAddressOf(rec);
+    if (addr) return addr;
+  }
+  return null;
+}
+
+function extractEmbeddedEoaFromPrivyUser(user: unknown): `0x${string}` | null {
+  const wallets = extractEthereumWalletsFromPrivyUser(user);
+  for (const rec of wallets) {
+    if (!isEmbeddedPrivyWallet(rec)) continue;
+    const addr = walletAddressOf(rec);
+    if (addr) return addr;
   }
   return null;
 }
@@ -211,6 +252,20 @@ export async function eoaAddressForPrivyDid(did: string): Promise<`0x${string}` 
       .users()
       ._get(clean);
     return extractEoaFromPrivyUser(user);
+  } catch {
+    return null;
+  }
+}
+
+export async function embeddedEoaAddressForPrivyDid(did: string): Promise<`0x${string}` | null> {
+  const clean = String(did ?? "").trim();
+  if (!clean) return null;
+  try {
+    const privy = privyClient();
+    const user = await (privy as unknown as { users: () => { _get: (id: string) => Promise<unknown> } })
+      .users()
+      ._get(clean);
+    return extractEmbeddedEoaFromPrivyUser(user);
   } catch {
     return null;
   }

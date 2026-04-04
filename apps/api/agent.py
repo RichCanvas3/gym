@@ -16,7 +16,12 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from .knowledge_index import KnowledgeHit, ensure_index_with_mcp, search_kb
-from .mcp_tools import load_mcp_tools_from_env, load_mcp_tools_with_diagnostics_from_env
+from .mcp_tools import (
+    load_mcp_tools_from_env,
+    load_mcp_tools_with_diagnostics_from_env,
+    reset_runtime_mcp_overrides,
+    set_runtime_mcp_overrides,
+)
 
 
 def _now_iso() -> str:
@@ -75,6 +80,21 @@ def _session_telegram_user_id(session: Optional["Session"]) -> str:
         if v:
             return v
     return ""
+
+
+def _runtime_mcp_overrides_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
+    if not session or not isinstance(getattr(session, "mcpAuth", None), dict):
+        return None
+    mcp_auth = getattr(session, "mcpAuth", None)
+    if not isinstance(mcp_auth, dict):
+        return None
+    core = mcp_auth.get("core")
+    if not isinstance(core, dict):
+        return None
+    bearer = core.get("bearerToken")
+    if not isinstance(bearer, str) or not bearer.strip():
+        return None
+    return {"core": {"headers": {"authorization": f"Bearer {bearer.strip()}"}}}
 
 
 def _waiver_participant(session: Optional["Session"]) -> str:
@@ -955,6 +975,7 @@ class Session(BaseModel):
     cartLines: Optional[list[dict[str, Any]]] = None
     waiver: Optional[dict[str, Any]] = None
     threadId: Optional[str] = None
+    mcpAuth: Optional[dict[str, Any]] = None
 
 
 class Input(BaseModel):
@@ -1864,7 +1885,7 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     return tools, trace
 
 
-async def run(input: Input) -> Output:
+async def _run_impl(input: Input) -> Output:
     msg = input.message.strip()
     mlow = msg.lower()
 
@@ -4084,4 +4105,12 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
         uiActions=ui_actions if isinstance(ui_actions, list) else None,
         goalBundle=goal_out,
     )
+
+
+async def run(input: Input) -> Output:
+    token = set_runtime_mcp_overrides(_runtime_mcp_overrides_from_session(input.session))
+    try:
+        return await _run_impl(input)
+    finally:
+        reset_runtime_mcp_overrides(token)
 

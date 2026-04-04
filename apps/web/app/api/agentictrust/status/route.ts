@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
-import { extractAgentAccountFromDiscovery, getAccountOwner, getAgenticTrustClient, getDiscoveryClient, getENSClient } from "@agentic-trust/core/server";
+import { extractAgentAccountFromDiscovery, getAgenticTrustClient, getDiscoveryClient } from "@agentic-trust/core/server";
 import { requirePrivyAuth, eoaAddressForPrivyDid } from "../../_lib/privy";
 import { baseNameFromGymAgentName, gymAgentLabelFromBaseName, gymAgentNameFromBaseName, nameCandidatesFromAgentRecord } from "../_lib/gym-agent";
+import { createPublicClient, http } from "viem";
+import { sepolia } from "viem/chains";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -50,26 +52,44 @@ function hasEnsReadConfig(chainId: number): boolean {
 function normalizeAddress(value: unknown): `0x${string}` | null {
   const s = typeof value === "string" ? value.trim() : "";
   if (!/^0x[a-fA-F0-9]{40}$/.test(s)) return null;
-  return s as `0x${string}`;
+  return s.toLowerCase() as `0x${string}`;
 }
 
 function a2aHostForBaseName(baseName: string): string {
   return `https://${gymAgentLabelFromBaseName(baseName)}.${a2aHandleBaseDomain()}`;
 }
 
-async function ensNameHasOwner(fullName: string, chainId: number): Promise<boolean> {
-  const withoutEth = fullName.trim().toLowerCase().replace(/\.eth$/i, "");
-  const parts = withoutEth.split(".");
-  if (parts.length < 2) return false;
-  const agentNameLabel = parts[0] ?? "";
-  const orgNameClean = parts.slice(1).join(".");
-  if (!agentNameLabel || !orgNameClean) return false;
-  const ensClient = await getENSClient(chainId);
-  if (typeof (ensClient as { hasAgentNameOwner?: unknown }).hasAgentNameOwner !== "function") return false;
-  return await (ensClient as { hasAgentNameOwner: (orgName: string, agentName: string) => Promise<boolean> }).hasAgentNameOwner(
-    orgNameClean,
-    agentNameLabel,
-  );
+function rpcUrlForChain(chainId: number): string {
+  if (chainId === 11155111) {
+    return String(process.env.AGENTIC_TRUST_RPC_URL_SEPOLIA ?? process.env.NEXT_PUBLIC_AGENTIC_TRUST_RPC_URL_SEPOLIA ?? "").trim();
+  }
+  return "";
+}
+
+async function readSmartAccountOwner(chainId: number, smartAccount: string): Promise<`0x${string}` | null> {
+  const account = normalizeAddress(smartAccount);
+  const rpcUrl = rpcUrlForChain(chainId);
+  if (!account || !rpcUrl) return null;
+  if (chainId !== 11155111) return null;
+  const client = createPublicClient({ chain: sepolia, transport: http(rpcUrl) });
+  try {
+    const owner = await client.readContract({
+      address: account,
+      abi: [
+        {
+          type: "function",
+          name: "owner",
+          stateMutability: "view",
+          inputs: [],
+          outputs: [{ type: "address" }],
+        },
+      ],
+      functionName: "owner",
+    });
+    return normalizeAddress(owner);
+  } catch {
+    return null;
+  }
 }
 
 async function isA2aEndpointReachable(a2aHost: string): Promise<boolean> {
@@ -215,25 +235,33 @@ export async function GET(req: Request) {
   const savedBaseName = typeof prof.baseName === "string" && prof.baseName.trim() ? prof.baseName.trim() : null;
   const discoveryUrl = String(process.env.AGENTIC_TRUST_DISCOVERY_URL ?? "").trim();
   const discoveryApiKey = String(process.env.AGENTIC_TRUST_DISCOVERY_API_KEY ?? "").trim();
-  const discovered = discoveryUrl
-    ? await discoverOwnedGymAgent({ chainId, eoaAddress: eoaAddress as `0x${string}`, discoveryUrl, discoveryApiKey }).catch((e) => {
-        console.error("[agentictrust] discovery fallback failed", e);
-        return null;
-      })
-    : null;
+  if (!discoveryUrl) {
+    return NextResponse.json({ ok: false, error: "missing_agentictrust_discovery_url" }, { status: 500 });
+  }
   if (!eoaAddress) {
     return NextResponse.json(
       {
         ok: true,
         eoaAddress: null,
         discovered: null,
-        savedBaseName: null,
+        savedBaseName,
         pendingBaseName: savedBaseName,
-        note: "No embedded-wallet EOA found in Privy user.",
+        registrationRequired: !savedBaseName,
+        note: "No connected Ethereum wallet EOA found in Privy user.",
       },
       { status: 200 },
     );
   }
+  const discovered = await discoverOwnedGymAgent({
+    chainId,
+    eoaAddress: eoaAddress as `0x${string}`,
+    discoveryUrl,
+    discoveryApiKey,
+  }).catch((e) => {
+    const msg = e instanceof Error ? e.message : String(e ?? "");
+    return NextResponse.json({ ok: false, error: "agent_discovery_failed", detail: msg }, { status: 502 });
+  });
+  if (discovered instanceof NextResponse) return discovered;
 
   if (savedBaseName) {
     const fullAgentName = gymAgentNameFromBaseName(savedBaseName);
@@ -241,21 +269,29 @@ export async function GET(req: Request) {
     const canReadEns = hasEnsReadConfig(chainId);
     const client = canReadEns ? await getAgenticTrustClient() : null;
     const agentInfo = canReadEns ? await client?.getENSInfo(fullAgentName, chainId).catch(() => null) : null;
-    const hasOwner = canReadEns ? await ensNameHasOwner(fullAgentName, chainId).catch(() => false) : false;
     const discoveredForSaved = discovered?.baseName === savedBaseName ? discovered : null;
-    const agentAccount = discoveredForSaved?.agentAccount ?? normalizeAddress(agentInfo?.account);
-    const owner = agentAccount ? await getAccountOwner(agentAccount, chainId).catch(() => null) : null;
-    const validOwner = typeof owner === "string" && owner.trim().toLowerCase() === eoaAddress.toLowerCase();
-    const savedEoaMatches =
-      typeof prof.eoaAddress === "string" && prof.eoaAddress.trim().toLowerCase() === eoaAddress.toLowerCase();
-    const infoUrlMatches = typeof agentInfo?.url === "string" && agentInfo.url.trim() === a2aHost;
-    const trustedSavedDiscovery =
-      Boolean(discoveredForSaved?.agentAccount) ||
-      (hasOwner &&
-        ((typeof prof.discoveredAgentName === "string" && prof.discoveredAgentName.trim().toLowerCase() === fullAgentName.toLowerCase()) ||
-          (savedEoaMatches && Boolean(agentAccount)) ||
-          infoUrlMatches));
-    if (validOwner || trustedSavedDiscovery) {
+    const agentAccount = discoveredForSaved?.agentAccount ?? normalizeAddress(agentInfo?.account) ?? "";
+    const savedProfileEoa = normalizeAddress(prof.eoaAddress);
+    const owner = agentAccount ? await readSmartAccountOwner(chainId, agentAccount) : null;
+    const liveOwnerMatches = Boolean(owner) && owner === eoaAddress.toLowerCase();
+    const savedOwnerMatchesCurrent = Boolean(savedProfileEoa) && savedProfileEoa === eoaAddress.toLowerCase();
+    const validOwner = Boolean(agentAccount) && (liveOwnerMatches || (!owner && savedOwnerMatchesCurrent));
+    const discoveredOwnedAgent = Boolean(discoveredForSaved?.agentAccount);
+    const resolvedOwnerEoa = owner ?? (savedOwnerMatchesCurrent ? savedProfileEoa : null);
+    if (owner && savedProfileEoa !== owner) {
+      try {
+        await upsertSavedProfile({
+          accountAddress: auth.accountAddress,
+          eoaAddress: owner,
+          baseName: savedBaseName,
+          discoveredAgentName: discoveredForSaved?.agentName ?? fullAgentName,
+          discoveredEnsName: discoveredForSaved?.ensName ?? fullAgentName,
+        });
+      } catch {
+        // ignore
+      }
+    }
+    if (validOwner) {
       const chatReady = await isA2aEndpointReachable(a2aHost);
       return NextResponse.json({
         ok: true,
@@ -269,12 +305,34 @@ export async function GET(req: Request) {
         },
         savedBaseName,
         pendingBaseName: null,
+        registrationRequired: false,
         fullAgentName,
         agentHandle: gymAgentLabelFromBaseName(savedBaseName),
         a2aHost,
+        agentId: discoveredForSaved?.agentId ?? null,
         agentAccount: agentAccount ?? null,
-        agentOwnerEoa: typeof owner === "string" ? owner : null,
+        agentOwnerEoa: resolvedOwnerEoa,
         chatReady,
+        ownerSource: owner ? "onchain" : "saved_profile",
+      });
+    }
+    if (canReadEns && agentAccount && !validOwner) {
+      const ownerText = owner ?? savedProfileEoa ?? "(unresolved)";
+      const agentAccountText = agentAccount || "(unresolved)";
+      return NextResponse.json({
+        ok: true,
+        accountAddress: auth.accountAddress,
+        eoaAddress,
+        chainId,
+        discovered: null,
+        savedBaseName,
+        pendingBaseName: savedBaseName,
+        registrationRequired: false,
+        fullAgentName,
+        agentHandle: gymAgentLabelFromBaseName(savedBaseName),
+        a2aHost,
+        chatReady: false,
+        note: `Saved gym agent registration EOA does not match the current Privy EOA. agentAccount=${agentAccountText} registeredEoa=${ownerText} currentEoa=${eoaAddress}`,
       });
     }
     if (!canReadEns) {
@@ -284,8 +342,9 @@ export async function GET(req: Request) {
         eoaAddress,
         chainId,
         discovered: null,
-        savedBaseName: null,
+        savedBaseName,
         pendingBaseName: savedBaseName,
+        registrationRequired: false,
         fullAgentName,
         agentHandle: gymAgentLabelFromBaseName(savedBaseName),
         a2aHost,
@@ -311,9 +370,9 @@ export async function GET(req: Request) {
   }
 
   const validBaseName = discovered?.baseName ?? null;
-  const activeBaseName = validBaseName || savedBaseName || null;
+  const activeBaseName = validBaseName ?? savedBaseName;
   const a2aHost = activeBaseName ? a2aHostForBaseName(activeBaseName) : null;
-  const discoveredOwner = discovered?.agentAccount ? await getAccountOwner(discovered.agentAccount, chainId).catch(() => null) : null;
+  const discoveredOwner = discovered?.agentAccount ? await readSmartAccountOwner(chainId, discovered.agentAccount).catch(() => null) : null;
   const chatReady = a2aHost ? await isA2aEndpointReachable(a2aHost) : false;
 
   return NextResponse.json({
@@ -324,10 +383,12 @@ export async function GET(req: Request) {
     discovered: discovered
       ? { agentName: discovered.agentName, ensName: discovered.ensName, baseName: discovered.baseName }
       : null,
+    agentId: discovered?.agentId ?? null,
     agentAccount: discovered?.agentAccount ?? null,
     agentOwnerEoa: typeof discoveredOwner === "string" ? discoveredOwner : null,
-    savedBaseName: validBaseName,
+    savedBaseName,
     pendingBaseName: !validBaseName && savedBaseName ? savedBaseName : null,
+    registrationRequired: !activeBaseName,
     fullAgentName: activeBaseName ? gymAgentNameFromBaseName(activeBaseName) : null,
     agentHandle: activeBaseName ? gymAgentLabelFromBaseName(activeBaseName) : null,
     a2aHost,

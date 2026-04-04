@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
-import { addToL1OrgPK, getAccountOwner, getAgenticTrustClient, getENSClient } from "@agentic-trust/core/server";
-import { requirePrivyAuth, eoaAddressForPrivyDid, telegramUserIdForPrivyDid } from "../../_lib/privy";
+import { addToL1OrgPK, getAgenticTrustClient, getENSClient } from "@agentic-trust/core/server";
+import { eoaAddressForPrivyDid, requirePrivyAuth, telegramUserIdForPrivyDid } from "../../_lib/privy";
 import { gymAgentLabelFromBaseName, gymAgentNameFromBaseName, safeBaseName } from "../_lib/gym-agent";
+import { createPublicClient, http } from "viem";
+import { sepolia } from "viem/chains";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -106,6 +108,39 @@ function normalizeAddress(value: unknown): `0x${string}` | null {
   return s as `0x${string}`;
 }
 
+function rpcUrlForChain(chainId: number): string {
+  if (chainId === 11155111) {
+    return String(process.env.AGENTIC_TRUST_RPC_URL_SEPOLIA ?? process.env.NEXT_PUBLIC_AGENTIC_TRUST_RPC_URL_SEPOLIA ?? "").trim();
+  }
+  return "";
+}
+
+async function readSmartAccountOwner(chainId: number, smartAccount: string): Promise<`0x${string}` | null> {
+  const account = normalizeAddress(smartAccount);
+  const rpcUrl = rpcUrlForChain(chainId);
+  if (!account || !rpcUrl) return null;
+  if (chainId !== 11155111) return null;
+  const client = createPublicClient({ chain: sepolia, transport: http(rpcUrl) });
+  try {
+    const owner = await client.readContract({
+      address: account,
+      abi: [
+        {
+          type: "function",
+          name: "owner",
+          stateMutability: "view",
+          inputs: [],
+          outputs: [{ type: "address" }],
+        },
+      ],
+      functionName: "owner",
+    });
+    return normalizeAddress(owner);
+  } catch {
+    return null;
+  }
+}
+
 async function ensNameHasOwner(fullName: string, chainId: number): Promise<boolean> {
   const withoutEth = fullName.trim().toLowerCase().replace(/\.eth$/i, "");
   const parts = withoutEth.split(".");
@@ -174,7 +209,7 @@ export async function POST(req: Request) {
 
   const eoaAddress = await eoaAddressForPrivyDid(auth.did);
   if (!eoaAddress) {
-    return NextResponse.json({ ok: false, error: "Missing embedded-wallet EOA for Privy user" }, { status: 400 });
+    return NextResponse.json({ ok: false, error: "Missing connected Ethereum wallet EOA for Privy user" }, { status: 400 });
   }
 
   const chainId = registrationChainId();
@@ -336,10 +371,9 @@ export async function POST(req: Request) {
 
   const client = await getAgenticTrustClient();
   const info = await client.getENSInfo(fullName, chainId).catch(() => null);
-  const hasOwner = await ensNameHasOwner(fullName, chainId).catch(() => false);
-  const resolvedAccount = normalizeAddress(info?.account) ?? (hasOwner ? agentAddress : null);
-  const owner = resolvedAccount ? await getAccountOwner(resolvedAccount, chainId).catch(() => null) : null;
-  const validOwner = hasOwner && typeof owner === "string" && owner.trim().toLowerCase() === eoaAddress.toLowerCase();
+  const resolvedAccount = normalizeAddress(info?.account) ?? agentAddress;
+  const owner = resolvedAccount ? await readSmartAccountOwner(chainId, resolvedAccount).catch(() => null) : null;
+  const validOwner = typeof owner === "string" && owner.trim().toLowerCase() === eoaAddress.toLowerCase();
 
   const out = await upsertProfile({
     accountAddress: auth.accountAddress,

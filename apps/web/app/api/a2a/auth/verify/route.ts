@@ -47,6 +47,19 @@ export async function POST(req: Request) {
       }),
     });
     const json = (await res.json().catch(() => ({}))) as unknown;
+    if (!res.ok) {
+      try {
+        console.error("[a2a auth verify]", {
+          status: res.status,
+          challengeId,
+          accountAddress: auth.accountAddress,
+          walletAddress,
+          response: json,
+        });
+      } catch {
+        // ignore
+      }
+    }
     return NextResponse.json(json, { status: res.status });
   } catch (e) {
     return NextResponse.json({ ok: false, error: "verify_proxy_failed", detail: e instanceof Error ? e.message : String(e ?? "") }, { status: 502 });

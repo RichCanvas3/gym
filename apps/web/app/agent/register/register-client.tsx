@@ -7,10 +7,11 @@ import {
   sendSponsoredUserOperation,
   waitForUserOperationReceipt,
 } from "@agentic-trust/core/client";
-import { useCreateWallet, useWallets } from "@privy-io/react-auth";
+import { useCreateWallet, useSignMessage, useSignTypedData, useWallets } from "@privy-io/react-auth";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/auth/AuthProvider";
+import { ensureA2AWebAuthSession } from "@/components/agentictrust/a2a-web-auth";
 import { setAgentictrustStatusCached } from "@/components/agentictrust/status-cache";
 
 type Status =
@@ -47,16 +48,27 @@ function embeddedEthereumWalletAddress(user: unknown): string | null {
   return null;
 }
 
-function connectedEmbeddedWallet(
+function connectedWalletByAddress(
   wallets: Array<{ address: string; walletClientType?: string; getEthereumProvider?: () => Promise<unknown>; switchChain?: (targetChainId: `0x${string}` | number) => Promise<void> }>,
   address: string | null,
 ) {
   const target = (address ?? "").trim().toLowerCase();
-  return wallets.find((wallet) => {
+  return wallets.find((wallet) => typeof wallet.address === "string" && wallet.address.trim().toLowerCase() === target);
+}
+
+function preferredConnectedWallet(
+  wallets: Array<{ address: string; walletClientType?: string; getEthereumProvider?: () => Promise<unknown>; switchChain?: (targetChainId: `0x${string}` | number) => Promise<void> }>,
+) {
+  const external = wallets.find((wallet) => {
     const walletClientType = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
-    if (walletClientType !== "privy" && walletClientType !== "privy-v2") return false;
-    return typeof wallet.address === "string" && wallet.address.trim().toLowerCase() === target;
+    return walletClientType && walletClientType !== "privy" && walletClientType !== "privy-v2";
   });
+  if (external) return external;
+  const embedded = wallets.find((wallet) => {
+    const walletClientType = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return walletClientType === "privy" || walletClientType === "privy-v2";
+  });
+  return embedded ?? null;
 }
 
 const SEPOLIA_CHAIN = {
@@ -77,10 +89,30 @@ export default function AgentRegisterClient() {
   const router = useRouter();
   const { ready, authenticated, accountAddress, user, getAccessToken, login } = useAuth();
   const { createWallet } = useCreateWallet();
+  const { signTypedData } = useSignTypedData();
+  const { signMessage } = useSignMessage();
   const { wallets } = useWallets();
   const [baseName, setBaseName] = useState("");
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [availability, setAvailability] = useState<Availability>({ kind: "idle" });
+
+  async function ensureDelegationAndEnter(nextFullName?: string) {
+    if (!accountAddress) throw new Error("Missing account address.");
+    const tok = await getAccessToken();
+    if (!tok) throw new Error("Missing Privy access token");
+    setStatus({ kind: "waiting", message: "Preparing delegated A2A session…" });
+    await ensureA2AWebAuthSession({
+      accountAddress,
+      accessToken: tok,
+      wallets: wallets as Array<{ address?: string; walletClientType?: string; getEthereumProvider?: () => Promise<unknown>; switchChain?: (targetChainId: `0x${string}` | number) => Promise<void> }>,
+      origin: window.location.origin,
+      force: true,
+      signTypedData: signTypedData as (input: unknown, options?: { address?: string }) => Promise<{ signature: string }>,
+      signMessage: signMessage as (input: { message: string }, options?: { address?: string }) => Promise<{ signature: string }>,
+    });
+    setStatus({ kind: "saved", ...(nextFullName ? { fullName: nextFullName } : {}) });
+    router.replace("/chat");
+  }
 
   useEffect(() => {
     if (!ready) return;
@@ -93,10 +125,12 @@ export default function AgentRegisterClient() {
         const json = (await res.json().catch(() => ({}))) as unknown;
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
         const saved = typeof rec.savedBaseName === "string" ? rec.savedBaseName.trim() : "";
-        if (saved) {
+        const discovered = rec.discovered && typeof rec.discovered === "object" ? (rec.discovered as Record<string, unknown>) : {};
+        const discoveredBaseName = typeof discovered.baseName === "string" ? discovered.baseName.trim() : "";
+        const effectiveBaseName = saved || discoveredBaseName;
+        if (effectiveBaseName) {
           const fullName = typeof rec.fullAgentName === "string" ? rec.fullAgentName.trim() : "";
-          setStatus({ kind: "saved", ...(fullName ? { fullName } : {}) });
-          router.replace("/chat");
+          await ensureDelegationAndEnter(fullName || undefined);
           return;
         }
         const pending = typeof rec.pendingBaseName === "string" ? rec.pendingBaseName.trim() : "";
@@ -111,7 +145,7 @@ export default function AgentRegisterClient() {
       }
     }
     void load();
-  }, [ready, authenticated, getAccessToken, router]);
+  }, [ready, authenticated, getAccessToken, router, accountAddress, wallets, signTypedData, signMessage]);
 
   useEffect(() => {
     if (!ready || !authenticated || status.kind !== "saved") return;
@@ -200,7 +234,9 @@ export default function AgentRegisterClient() {
       if (availability.kind !== "available") throw new Error("Pick an available name first");
       const tok = await getAccessToken();
       if (!tok) throw new Error("Missing Privy access token");
-      let signerAddress = embeddedEthereumWalletAddress(user);
+      let signerAddress =
+        typeof preferredConnectedWallet(wallets)?.address === "string" ? preferredConnectedWallet(wallets)?.address.trim() : null;
+      if (!signerAddress) signerAddress = embeddedEthereumWalletAddress(user);
       if (!signerAddress) {
         const newWallet = await createWallet().catch((e: unknown) => {
           throw new Error(e instanceof Error ? e.message : String(e ?? ""));
@@ -208,10 +244,10 @@ export default function AgentRegisterClient() {
         const walletAddress = typeof newWallet?.address === "string" ? newWallet.address.trim() : "";
         signerAddress = /^0x[a-fA-F0-9]{40}$/.test(walletAddress) ? walletAddress : null;
       }
-      if (!signerAddress) throw new Error("Embedded wallet could not be created yet. Try register again in a moment.");
-      const wallet = connectedEmbeddedWallet(wallets, signerAddress);
+      if (!signerAddress) throw new Error("No connected Ethereum wallet is available yet. Try again in a moment.");
+      const wallet = connectedWalletByAddress(wallets, signerAddress);
       if (!wallet || typeof wallet.getEthereumProvider !== "function") {
-        throw new Error("Embedded wallet provider is not ready yet. Try register again in a moment.");
+        throw new Error("Wallet provider is not ready yet. Try again in a moment.");
       }
       if (typeof wallet.switchChain === "function") {
         await wallet.switchChain(availability.chainId).catch(() => null);
@@ -311,7 +347,7 @@ export default function AgentRegisterClient() {
         ...(completedTxHash ? { txHash: completedTxHash } : {}),
       });
       setBaseName(baseName.trim());
-      router.replace("/chat");
+      await ensureDelegationAndEnter(completedFullName || undefined);
     } catch (e) {
       setStatus({ kind: "error", error: e instanceof Error ? e.message : String(e ?? "") });
     }
@@ -377,7 +413,18 @@ export default function AgentRegisterClient() {
         ) : null}
         {availability.kind === "available" ? (
           <div className="mt-3 text-xs text-emerald-600 dark:text-emerald-400">
-            {availability.fullName} was not found. It will route to {availability.a2aHost}.
+            <div>{availability.fullName} was not found. It will route to:</div>
+            <div className="mt-1 font-mono break-all">{availability.a2aHost}</div>
+            <div className="mt-2">
+              <a
+                href={availability.a2aHost}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-8 items-center rounded-xl border border-emerald-300 px-3 text-xs font-medium text-emerald-700 dark:border-emerald-700 dark:text-emerald-300"
+              >
+                View
+              </a>
+            </div>
           </div>
         ) : null}
         {status.kind === "saved" ? (

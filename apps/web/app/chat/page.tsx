@@ -6,7 +6,7 @@ import { useCart } from "@/components/cart/CartProvider";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { clearA2AWebAuthSession, ensureA2AWebAuthSession } from "@/components/agentictrust/a2a-web-auth";
 import { useRouter } from "next/navigation";
-import { useWallets } from "@privy-io/react-auth";
+import { useSignMessage, useSignTypedData, useWallets } from "@privy-io/react-auth";
 import { getAgentictrustStatusCached } from "@/components/agentictrust/status-cache";
 
 type ChatMessage = {
@@ -45,6 +45,8 @@ export default function ChatPage() {
   const { lines, addLine, removeSku, clear } = useCart();
   const { ready, authenticated, accountAddress, getAccessToken, login, logout } = useAuth();
   const { wallets } = useWallets();
+  const { signTypedData } = useSignTypedData();
+  const { signMessage } = useSignMessage();
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -156,8 +158,12 @@ export default function ChatPage() {
             }
           }
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) {
+          const msg = e instanceof Error && e.message.trim() ? e.message.trim() : "A2A session setup failed.";
+          setMessages([{ role: "assistant", text: msg }]);
+          loadedAny = true;
+        }
       }
 
       try {
@@ -165,8 +171,8 @@ export default function ChatPage() {
         if (!tok || tok.split(".").length !== 3) return;
         const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
-        const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
-        if (!gymName) {
+        const registrationRequired = stRec.registrationRequired === true;
+        if (registrationRequired) {
           return;
         }
         const { res, json } = await postAgentRun("__CHAT_HISTORY__", {
@@ -236,9 +242,20 @@ export default function ChatPage() {
         if (!tok || tok.split(".").length !== 3) return;
         const json = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
-        const saved = typeof rec.savedBaseName === "string" ? rec.savedBaseName.trim() : "";
         const ok = rec.ok === true;
-        if (ok && !saved && !cancelled) router.replace("/agent/register");
+        const registrationRequired = rec.registrationRequired === true;
+        if (ok && registrationRequired && !cancelled) router.replace("/agent/register");
+        if (ok && !registrationRequired) {
+          const statusRes = await fetch("/api/a2a/session/status", {
+            headers: { authorization: `Bearer ${tok}` },
+            cache: "no-store",
+          });
+          const statusJson = (await statusRes.json().catch(() => ({}))) as unknown;
+          const statusRec = statusJson && typeof statusJson === "object" ? (statusJson as Record<string, unknown>) : {};
+          if (statusRes.ok && statusRec.ok === true && statusRec.ready !== true && !cancelled) {
+            router.replace("/agent/register");
+          }
+        }
       } catch {
         // ignore
       }
@@ -257,7 +274,13 @@ export default function ChatPage() {
         }
         const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
-        const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+        const discovered = stRec.discovered && typeof stRec.discovered === "object" ? (stRec.discovered as Record<string, unknown>) : {};
+        const gymName =
+          typeof stRec.savedBaseName === "string" && stRec.savedBaseName.trim()
+            ? stRec.savedBaseName.trim()
+            : typeof discovered.baseName === "string" && discovered.baseName.trim()
+              ? discovered.baseName.trim()
+              : "";
         if (!gymName) {
           setProfileBusy(false);
           return;
@@ -371,6 +394,8 @@ export default function ChatPage() {
         wallets: wallets as Array<{ address?: string; walletClientType?: string; getEthereumProvider?: () => Promise<unknown>; switchChain?: (targetChainId: `0x${string}` | number) => Promise<void> }>,
         origin: window.location.origin,
         force,
+        signTypedData: signTypedData as (input: unknown, options?: { address?: string }) => Promise<{ signature: string }>,
+        signMessage: signMessage as (input: { message: string }, options?: { address?: string }) => Promise<{ signature: string }>,
       });
     })();
     authSessionPromiseRef.current = pending;

@@ -1,9 +1,11 @@
 import { createMcpHandler } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { recoverMessageAddress } from "viem";
 import { z } from "zod";
 
 export type Env = {
   MCP_API_KEY?: string;
+  MCP_DELEGATION_SHARED_SECRET?: string;
   DB: D1Database;
   // Optional: GraphDB access for FitnessCore graph queries (SPARQL).
   GRAPHDB_BASE_URL?: string;
@@ -14,6 +16,57 @@ export type Env = {
   GRAPHDB_CF_ACCESS_CLIENT_SECRET?: string;
 };
 
+type CoreMcpDelegationClaims = {
+  v: 1;
+  iss: "gym-a2a-agent";
+  aud: "urn:mcp:server:core";
+  sub: string;
+  accountAddress: string;
+  agentHandle: string;
+  principalSmartAccount: `0x${string}`;
+  principalOwnerEoa: `0x${string}`;
+  sessionAA: `0x${string}`;
+  sessionKeyAddress: `0x${string}`;
+  sessionValidAfter: number;
+  sessionValidUntil: number;
+  selector: `0x${string}`;
+  permissionsHash: string;
+  signedDelegation: {
+    delegate: `0x${string}`;
+    delegator: `0x${string}`;
+    authority: `0x${string}`;
+    caveats: unknown[];
+    salt: `0x${string}`;
+    signature: `0x${string}`;
+  };
+  issuedAtISO: string;
+  expiresAtISO: string;
+  nonce: string;
+};
+
+type CoreMcpDelegationEnvelope = {
+  claims: CoreMcpDelegationClaims;
+  sessionSignature: `0x${string}`;
+  issuerSignature: string;
+};
+
+type RequestAuth =
+  | { kind: "api_key" }
+  | {
+      kind: "delegated";
+      principal: {
+        accountAddress: string;
+        agentHandle: string;
+        principalSmartAccount: `0x${string}`;
+        principalOwnerEoa: `0x${string}`;
+        sessionAA: `0x${string}`;
+        sessionKeyAddress: `0x${string}`;
+        selector: `0x${string}`;
+        permissionsHash: string;
+        expiresAtISO: string;
+      };
+    };
+
 const AccountAddress = z.string().min(3);
 
 function nowISO() {
@@ -22,6 +75,94 @@ function nowISO() {
 
 function jsonText(obj: unknown) {
   return JSON.stringify(obj, null, 2);
+}
+
+function utf8Bytes(s: string): Uint8Array {
+  return new TextEncoder().encode(s);
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function base64UrlEncodeBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecodeBytes(value: string): Uint8Array {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function base64UrlDecodeText(value: string): string {
+  return new TextDecoder().decode(base64UrlDecodeBytes(value));
+}
+
+function normalizeHexString(value: unknown): `0x${string}` | null {
+  const s = String(value ?? "").trim();
+  if (!/^0x[0-9a-fA-F]+$/.test(s)) return null;
+  return s.toLowerCase() as `0x${string}`;
+}
+
+function normalizeAddress(value: unknown): `0x${string}` | null {
+  const s = String(value ?? "").trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(s)) return null;
+  return s as `0x${string}`;
+}
+
+function normalizeSignedDelegation(value: unknown): CoreMcpDelegationClaims["signedDelegation"] | null {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  const msg = raw && raw.message && typeof raw.message === "object" ? (raw.message as Record<string, unknown>) : raw;
+  if (!msg) return null;
+  const delegate = normalizeAddress(msg.delegate);
+  const delegator = normalizeAddress(msg.delegator);
+  const authority = normalizeAddress(msg.authority);
+  const salt = normalizeHexString(msg.salt);
+  const signature = normalizeHexString(raw?.signature ?? msg.signature);
+  const caveats = Array.isArray(msg.caveats) ? msg.caveats : [];
+  if (!delegate || !delegator || !authority || !salt || !signature) return null;
+  return { delegate, delegator, authority, caveats, salt, signature };
+}
+
+function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
+  return JSON.stringify({
+    v: claims.v,
+    iss: claims.iss,
+    aud: claims.aud,
+    sub: claims.sub,
+    accountAddress: claims.accountAddress,
+    agentHandle: claims.agentHandle,
+    principalSmartAccount: claims.principalSmartAccount,
+    principalOwnerEoa: claims.principalOwnerEoa,
+    sessionAA: claims.sessionAA,
+    sessionKeyAddress: claims.sessionKeyAddress,
+    sessionValidAfter: claims.sessionValidAfter,
+    sessionValidUntil: claims.sessionValidUntil,
+    selector: claims.selector,
+    permissionsHash: claims.permissionsHash,
+    signedDelegation: claims.signedDelegation,
+    issuedAtISO: claims.issuedAtISO,
+    expiresAtISO: claims.expiresAtISO,
+    nonce: claims.nonce,
+  });
+}
+
+async function mcpDelegationSecretKey(env: Env): Promise<CryptoKey> {
+  const secret = String(env.MCP_DELEGATION_SHARED_SECRET ?? "").trim();
+  if (!secret) throw new Error("missing_mcp_delegation_shared_secret");
+  return await crypto.subtle.importKey("raw", toArrayBuffer(utf8Bytes(secret)), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+}
+
+async function verifyIssuerSignature(env: Env, claims: CoreMcpDelegationClaims, issuerSignature: string): Promise<boolean> {
+  const key = await mcpDelegationSecretKey(env);
+  const sig = await crypto.subtle.sign("HMAC", key, toArrayBuffer(utf8Bytes(coreMcpClaimsCanonicalString(claims))));
+  return base64UrlEncodeBytes(new Uint8Array(sig)) === issuerSignature;
 }
 
 function basicAuthHeader(username: string, password: string) {
@@ -75,8 +216,132 @@ async function requireApiKey(request: Request, env: Env) {
   if (got !== want) throw new Error("Unauthorized (bad x-api-key)");
 }
 
+async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth> {
+  const authz = (request.headers.get("authorization") ?? "").trim();
+  if (authz.toLowerCase().startsWith("bearer ")) {
+    const token = authz.slice(7).trim();
+    if (!token) throw new Error("missing_bearer_token");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(base64UrlDecodeText(token));
+    } catch {
+      throw new Error("invalid_delegation_token");
+    }
+    const rec = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    const claimsRaw = rec?.claims && typeof rec.claims === "object" ? (rec.claims as Record<string, unknown>) : null;
+    const sessionSignature = normalizeHexString(rec?.sessionSignature);
+    const issuerSignature = typeof rec?.issuerSignature === "string" ? rec.issuerSignature.trim() : "";
+    const signedDelegation = normalizeSignedDelegation(claimsRaw?.signedDelegation);
+    const claims: CoreMcpDelegationClaims | null =
+      claimsRaw &&
+      claimsRaw.iss === "gym-a2a-agent" &&
+      claimsRaw.aud === "urn:mcp:server:core" &&
+      Number(claimsRaw.v) === 1 &&
+      signedDelegation &&
+      normalizeAddress(claimsRaw.principalSmartAccount) &&
+      normalizeAddress(claimsRaw.principalOwnerEoa) &&
+      normalizeAddress(claimsRaw.sessionAA) &&
+      normalizeAddress(claimsRaw.sessionKeyAddress) &&
+      normalizeHexString(claimsRaw.selector) &&
+      typeof claimsRaw.accountAddress === "string" &&
+      typeof claimsRaw.agentHandle === "string" &&
+      typeof claimsRaw.permissionsHash === "string" &&
+      typeof claimsRaw.issuedAtISO === "string" &&
+      typeof claimsRaw.expiresAtISO === "string" &&
+      typeof claimsRaw.nonce === "string" &&
+      Number.isFinite(Number(claimsRaw.sessionValidAfter)) &&
+      Number.isFinite(Number(claimsRaw.sessionValidUntil))
+        ? {
+            v: 1,
+            iss: "gym-a2a-agent",
+            aud: "urn:mcp:server:core",
+            sub: String(claimsRaw.sub ?? claimsRaw.accountAddress ?? "").trim(),
+            accountAddress: String(claimsRaw.accountAddress ?? "").trim(),
+            agentHandle: String(claimsRaw.agentHandle ?? "").trim(),
+            principalSmartAccount: normalizeAddress(claimsRaw.principalSmartAccount)!,
+            principalOwnerEoa: normalizeAddress(claimsRaw.principalOwnerEoa)!,
+            sessionAA: normalizeAddress(claimsRaw.sessionAA)!,
+            sessionKeyAddress: normalizeAddress(claimsRaw.sessionKeyAddress)!,
+            sessionValidAfter: Number(claimsRaw.sessionValidAfter),
+            sessionValidUntil: Number(claimsRaw.sessionValidUntil),
+            selector: normalizeHexString(claimsRaw.selector)!,
+            permissionsHash: String(claimsRaw.permissionsHash ?? "").trim(),
+            signedDelegation,
+            issuedAtISO: String(claimsRaw.issuedAtISO ?? "").trim(),
+            expiresAtISO: String(claimsRaw.expiresAtISO ?? "").trim(),
+            nonce: String(claimsRaw.nonce ?? "").trim(),
+          }
+        : null;
+    if (!claims || !sessionSignature || !issuerSignature) throw new Error("invalid_delegation_claims");
+    if (claims.aud !== "urn:mcp:server:core") throw new Error("invalid_delegation_audience");
+    const nowMs = Date.now();
+    const expMs = Date.parse(claims.expiresAtISO);
+    if (!Number.isFinite(expMs) || expMs <= nowMs) throw new Error("delegation_token_expired");
+    const validAfterMs = claims.sessionValidAfter * 1000;
+    const validUntilMs = claims.sessionValidUntil * 1000;
+    if (!Number.isFinite(validAfterMs) || !Number.isFinite(validUntilMs) || nowMs < validAfterMs || nowMs >= validUntilMs) {
+      throw new Error("delegation_session_window_invalid");
+    }
+    if (!(await verifyIssuerSignature(env, claims, issuerSignature))) throw new Error("delegation_issuer_signature_invalid");
+    const recovered = normalizeAddress(await recoverMessageAddress({ message: coreMcpClaimsCanonicalString(claims), signature: sessionSignature }));
+    if (!recovered || recovered !== claims.sessionKeyAddress) throw new Error("delegation_session_signature_invalid");
+    if (claims.signedDelegation.delegate !== claims.sessionAA) throw new Error("delegation_delegate_mismatch");
+    if (claims.signedDelegation.delegator !== claims.principalSmartAccount) throw new Error("delegation_principal_mismatch");
+    if (claims.selector !== "0x1626ba7e") throw new Error("delegation_selector_invalid");
+    return {
+      kind: "delegated",
+      principal: {
+        accountAddress: claims.accountAddress,
+        agentHandle: claims.agentHandle,
+        principalSmartAccount: claims.principalSmartAccount,
+        principalOwnerEoa: claims.principalOwnerEoa,
+        sessionAA: claims.sessionAA,
+        sessionKeyAddress: claims.sessionKeyAddress,
+        selector: claims.selector,
+        permissionsHash: claims.permissionsHash,
+        expiresAtISO: claims.expiresAtISO,
+      },
+    };
+  }
+  await requireApiKey(request, env);
+  return { kind: "api_key" };
+}
+
+function requireDelegatedPrincipal(auth: RequestAuth) {
+  if (auth.kind !== "delegated") throw new Error("delegated_auth_required");
+  return auth.principal;
+}
+
 function canonicalizeAddress(address: string) {
   return (address || "").trim();
+}
+
+function requirePrincipalMatch(auth: RequestAuth, canonicalAddress: string) {
+  const principal = requireDelegatedPrincipal(auth);
+  const expected = canonicalizeAddress(principal.accountAddress);
+  const got = canonicalizeAddress(canonicalAddress);
+  if (!got || got !== expected) throw new Error("principal_mismatch");
+  return principal;
+}
+
+async function threadCanonicalAddress(db: D1Database, threadId: string): Promise<string | null> {
+  const row = await db.prepare(
+    `SELECT a.canonical_address
+     FROM chat_threads t
+     JOIN accounts a ON a.account_id = t.account_id
+     WHERE t.thread_id = ? LIMIT 1`,
+  )
+    .bind(threadId.trim())
+    .first<{ canonical_address?: string }>();
+  return row?.canonical_address ? canonicalizeAddress(String(row.canonical_address)) : null;
+}
+
+async function requireThreadPrincipal(db: D1Database, auth: RequestAuth, threadId: string) {
+  const principal = requireDelegatedPrincipal(auth);
+  const canonical = await threadCanonicalAddress(db, threadId);
+  if (!canonical) throw new Error("thread_not_found");
+  if (canonical !== canonicalizeAddress(principal.accountAddress)) throw new Error("thread_principal_mismatch");
+  return principal;
 }
 
 async function ensureSchema(db: D1Database): Promise<void> {
@@ -236,7 +501,7 @@ async function upsertExternalIdentityAndProfile(
   return { account: acc, provider, externalUserId: externalUserId || null };
 }
 
-function createServer(env: Env) {
+function createServer(env: Env, auth: RequestAuth) {
   const server = new McpServer({ name: "Gym Core MCP (D1)", version: "0.1.0" });
 
   server.tool(
@@ -268,6 +533,7 @@ function createServer(env: Env) {
           phoneE164: z.string().min(7).optional(),
         })
         .parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const acc = await ensureAccount(env.DB, {
         canonicalAddress: parsed.canonicalAddress,
         email: parsed.email ?? null,
@@ -284,6 +550,7 @@ function createServer(env: Env) {
     { canonicalAddress: AccountAddress },
     async (args) => {
       const parsed = z.object({ canonicalAddress: AccountAddress }).parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const canonical = canonicalizeAddress(parsed.canonicalAddress);
       const row = await env.DB.prepare(
         `SELECT account_id, canonical_address, email, display_name, phone_e164 FROM accounts WHERE canonical_address = ? LIMIT 1`,
@@ -315,6 +582,7 @@ function createServer(env: Env) {
           email: z.string().min(3).optional(),
         })
         .parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const acc = await ensureAccount(env.DB, {
         canonicalAddress: parsed.canonicalAddress,
         email: parsed.email ?? null,
@@ -345,6 +613,7 @@ function createServer(env: Env) {
           bioSourceId: z.string().min(3).optional(),
         })
         .parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const acc = await ensureAccount(env.DB, {
         canonicalAddress: parsed.canonicalAddress,
         email: parsed.email ?? null,
@@ -374,6 +643,7 @@ function createServer(env: Env) {
           profile: z.any().optional(),
         })
         .parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const out = await upsertExternalIdentityAndProfile(env.DB, {
         canonicalAddress: parsed.canonicalAddress,
         provider: parsed.provider,
@@ -389,6 +659,7 @@ function createServer(env: Env) {
     "Lookup an account by external provider user id (e.g. telegram user id).",
     { provider: z.string().min(1), externalUserId: z.string().min(1) },
     async (args) => {
+      requireDelegatedPrincipal(auth);
       await ensureSchema(env.DB);
       const p = z.object({ provider: z.string().min(1), externalUserId: z.string().min(1) }).parse(args);
       const provider = p.provider.trim().toLowerCase();
@@ -409,6 +680,7 @@ function createServer(env: Env) {
             phoneE164: (row as any).phone_e164 ? String((row as any).phone_e164) : null,
           }
         : null;
+      if (account) requirePrincipalMatch(auth, String(account.canonicalAddress ?? ""));
       return { content: [{ type: "text", text: jsonText({ ok: true, provider, externalUserId, account }) }] };
     },
   );
@@ -420,6 +692,7 @@ function createServer(env: Env) {
     async (args) => {
       await ensureSchema(env.DB);
       const p = z.object({ canonicalAddress: AccountAddress, provider: z.string().min(1) }).parse(args);
+      requirePrincipalMatch(auth, p.canonicalAddress);
       const canonical = canonicalizeAddress(p.canonicalAddress);
       const provider = p.provider.trim().toLowerCase();
       const acc = await env.DB.prepare(`SELECT account_id FROM accounts WHERE canonical_address = ? LIMIT 1`).bind(canonical).first<{
@@ -634,6 +907,7 @@ function createServer(env: Env) {
       const parsed = z
         .object({ canonicalAddress: AccountAddress, threadId: z.string().min(3).optional(), title: z.string().min(1).optional() })
         .parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const acc = await ensureAccount(env.DB, { canonicalAddress: parsed.canonicalAddress });
       const threadId = (parsed.threadId ?? `thr_${acc.canonicalAddress}`).trim();
       const ts = nowISO();
@@ -656,6 +930,7 @@ function createServer(env: Env) {
       const parsed = z
         .object({ threadId: z.string().min(3), role: z.enum(["user", "assistant", "system"]), content: z.string().min(1) })
         .parse(args);
+      await requireThreadPrincipal(env.DB, auth, parsed.threadId);
       const messageId = `msg_${crypto.randomUUID()}`;
       const ts = nowISO();
       await env.DB.prepare(
@@ -674,6 +949,7 @@ function createServer(env: Env) {
     { threadId: z.string().min(3), limit: z.number().int().positive().max(100).optional() },
     async (args) => {
       const parsed = z.object({ threadId: z.string().min(3), limit: z.number().int().positive().max(100).optional() }).parse(args);
+      await requireThreadPrincipal(env.DB, auth, parsed.threadId);
       const limit = parsed.limit ?? 24;
       const res = await env.DB.prepare(
         `SELECT role, content, created_at_iso FROM chat_messages WHERE thread_id = ? ORDER BY created_at_iso DESC LIMIT ?`,
@@ -794,6 +1070,7 @@ function createServer(env: Env) {
           currency: z.string().min(3).optional(),
         })
         .parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const acc = await ensureAccount(env.DB, { canonicalAddress: parsed.canonicalAddress });
       const orderId = `ord_${crypto.randomUUID()}`;
       const ts = nowISO();
@@ -827,6 +1104,7 @@ function createServer(env: Env) {
           status: z.enum(["active", "cancelled"]).optional(),
         })
         .parse(args);
+      requirePrincipalMatch(auth, parsed.canonicalAddress);
       const acc = await ensureAccount(env.DB, { canonicalAddress: parsed.canonicalAddress });
       const id = `resrec_${crypto.randomUUID()}`;
       const ts = nowISO();
@@ -898,12 +1176,17 @@ function createServer(env: Env) {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
+    let auth: RequestAuth;
     try {
-      await requireApiKey(request, env);
-    } catch {
+      auth = await authorizeRequest(request, env);
+    } catch (error) {
+      console.warn("[gym-core-mcp] auth denied", {
+        path: url.pathname,
+        detail: String((error as Error)?.message ?? error),
+      });
       return new Response("Unauthorized", { status: 401 });
     }
-    const server = createServer(env);
+    const server = createServer(env, auth);
     return createMcpHandler(server, { route: "/mcp" })(request, env, ctx);
   },
 };

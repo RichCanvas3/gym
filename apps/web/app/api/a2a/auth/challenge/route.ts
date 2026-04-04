@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requirePrivyAuth, eoaAddressForPrivyDid } from "../../../_lib/privy";
+import { requirePrivyAuth } from "../../../_lib/privy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -24,8 +24,6 @@ export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
 
-  const privyWalletAddress = await eoaAddressForPrivyDid(auth.did);
-
   const body = (await req.json().catch(() => null)) as Body | null;
   const reqOrigin = typeof body?.origin === "string" ? body.origin.trim() : "";
   const origin = reqOrigin || new URL(req.url).origin;
@@ -46,12 +44,23 @@ export async function POST(req: Request) {
   const principalSmartAccount = typeof stRec.agentAccount === "string" ? stRec.agentAccount.trim() : "";
   const chainId = typeof stRec.chainId === "number" ? stRec.chainId : 11155111;
   const agentOwnerEoa = typeof stRec.agentOwnerEoa === "string" ? stRec.agentOwnerEoa.trim() : "";
-  const walletAddress = agentOwnerEoa || privyWalletAddress || "";
-  if (!walletAddress) {
-    return NextResponse.json({ ok: false, error: "missing_wallet_eoa" }, { status: 409 });
-  }
-  if (!agentHandle || !a2aHost || !principalSmartAccount) {
-    return NextResponse.json({ ok: false, error: "invalid_gym_agent", detail: "Missing agent handle, A2A host, or principal smart account." }, { status: 409 });
+  if (!agentHandle || !a2aHost || !principalSmartAccount || !agentOwnerEoa) {
+    const missing = [
+      !agentHandle ? "agentHandle" : null,
+      !a2aHost ? "a2aHost" : null,
+      !principalSmartAccount ? "agentAccount" : null,
+      !agentOwnerEoa ? "agentOwnerEoa" : null,
+    ].filter(Boolean);
+    const detail =
+      typeof stRec.note === "string" && stRec.note.trim()
+        ? stRec.note.trim()
+        : typeof stRec.detail === "string" && stRec.detail.trim()
+          ? stRec.detail.trim()
+          : "Missing agent handle, A2A host, principal smart account, or agent owner EOA.";
+    return NextResponse.json(
+      { ok: false, error: "invalid_gym_agent", detail, missing },
+      { status: 409 },
+    );
   }
 
   try {
@@ -60,7 +69,7 @@ export async function POST(req: Request) {
       headers: { "content-type": "application/json", "x-admin-key": a2aAdminKey() },
       body: JSON.stringify({
         accountAddress: auth.accountAddress,
-        walletAddress,
+        walletAddress: agentOwnerEoa,
         principalSmartAccount,
         agentHandle,
         a2aHost,

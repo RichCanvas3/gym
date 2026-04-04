@@ -39,9 +39,10 @@ export async function POST(req: Request) {
     const stJson = (await stRes.json().catch(() => ({}))) as unknown;
     const stRec = stJson && typeof stJson === "object" ? (stJson as Record<string, unknown>) : {};
     const gymName = typeof stRec.savedBaseName === "string" ? stRec.savedBaseName.trim() : "";
+    const registrationRequired = stRec.registrationRequired === true;
     agentHandle = typeof stRec.agentHandle === "string" ? stRec.agentHandle.trim() : "";
     a2aHost = typeof stRec.a2aHost === "string" ? stRec.a2aHost.trim() : "";
-    if (!gymName) {
+    if (registrationRequired || !gymName) {
       return NextResponse.json(
         {
           error: "invalid_gym_agent",

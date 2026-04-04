@@ -63,6 +63,7 @@ export function AppHeader() {
   const [gymAgentBaseName, setGymAgentBaseName] = useState<string | null>(null);
   const [gymAgentPendingBaseName, setGymAgentPendingBaseName] = useState<string | null>(null);
   const [gymAgentChecked, setGymAgentChecked] = useState(false);
+  const [gymAgentRegistrationRequired, setGymAgentRegistrationRequired] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -151,7 +152,9 @@ export function AppHeader() {
       if (!authenticated) {
         if (!cancelled) {
           setGymAgentBaseName(null);
+          setGymAgentPendingBaseName(null);
           setGymAgentChecked(false);
+          setGymAgentRegistrationRequired(false);
         }
         return;
       }
@@ -159,27 +162,40 @@ export function AppHeader() {
       if (!accountAddress || !String(accountAddress).trim()) {
         if (!cancelled) {
           setGymAgentBaseName(null);
+          setGymAgentPendingBaseName(null);
           setGymAgentChecked(false);
+          setGymAgentRegistrationRequired(false);
         }
         return;
+      }
+      if (!cancelled) {
+        setGymAgentChecked(false);
+        setGymAgentRegistrationRequired(false);
       }
       try {
         const tok = await getAccessToken();
         const j = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
         const rec = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
         const saved = rec.savedBaseName;
+        const discovered = rec.discovered && typeof rec.discovered === "object" ? (rec.discovered as Record<string, unknown>) : {};
         const pending = rec.pendingBaseName;
-        const name = typeof saved === "string" && saved.trim() ? saved.trim() : null;
+        const registrationRequired = rec.registrationRequired === true;
+        const discoveredName = typeof discovered.baseName === "string" && discovered.baseName.trim() ? discovered.baseName.trim() : null;
+        const name = typeof saved === "string" && saved.trim() ? saved.trim() : discoveredName;
         const pendingName = typeof pending === "string" && pending.trim() ? pending.trim() : null;
         if (!cancelled) {
-          setGymAgentBaseName(name);
+          setGymAgentBaseName(registrationRequired ? null : name);
           setGymAgentPendingBaseName(pendingName);
+          setGymAgentRegistrationRequired(registrationRequired);
           setGymAgentChecked(true);
         }
       } catch {
         // If the status check fails, don't force a redirect loop.
         // We'll retry on the next render/TTL rather than treating it as "no name set".
-        if (!cancelled) setGymAgentChecked(false);
+        if (!cancelled) {
+          setGymAgentChecked(false);
+          setGymAgentRegistrationRequired(false);
+        }
       }
     }
     void run();
@@ -192,10 +208,10 @@ export function AppHeader() {
     if (!authenticated) return;
     if (!accountAddress || !String(accountAddress).trim()) return;
     if (!gymAgentChecked) return;
-    if (gymAgentBaseName) return;
+    if (!gymAgentRegistrationRequired) return;
     if ((pathname ?? "").startsWith("/agent/register")) return;
     router.replace("/agent/register");
-  }, [authenticated, accountAddress, gymAgentChecked, gymAgentBaseName, pathname, router]);
+  }, [authenticated, accountAddress, gymAgentChecked, gymAgentRegistrationRequired, pathname, router]);
 
   return (
     <div className="sticky top-0 z-20 border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-white/10 dark:bg-black/60">

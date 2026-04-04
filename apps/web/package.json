@@ -16,10 +16,11 @@
     "e2e:live": "playwright test -c playwright.live.config.ts"
   },
   "dependencies": {
-    "@agentic-trust/agentic-trust-sdk": "1.0.44",
-    "@agentic-trust/core": "1.0.44",
+    "@agentic-trust/agentic-trust-sdk": "1.0.46",
+    "@agentic-trust/core": "1.0.46",
     "@climb-gym/agent": "workspace:*",
     "@climb-gym/ops": "workspace:*",
+    "@metamask/smart-accounts-kit": "^1.0.0",
     "@noble/hashes": "^1.8.0",
     "@privy-io/node": "^0.11.0",
     "@privy-io/react-auth": "^3.18.0",
