@@ -535,3 +535,170 @@ This architecture differs in several important ways:
 - authorization is audience-scoped and principal-scoped for MCP execution, rather than being a broad session token pattern
 
 In short, OWS-style models are typically service-session centric, while this model is delegation-chain centric and wallet-rooted.
+
+## Technical Architecture And Standards
+
+This protocol is not a single existing standard. It is a composed architecture that combines wallet authentication, smart-account delegation, session-key custody, account-abstraction execution, and MCP audience authorization into one end-to-end trust chain.
+
+The main technical pieces are:
+
+- wallet authentication for the human-controlled or organization-controlled signer
+- principal smart-account delegation to a constrained session account
+- secure server-side custody of the session wallet private key inside the A2A agent service
+- account-abstraction compatible session execution
+- audience-scoped bearer authorization for downstream MCP services
+- principal-scoped authorization enforcement inside each domain MCP
+
+### Standards And Primitives Used
+
+#### EIP-4361 / SIWE
+
+SIWE is the conceptual entry point for wallet-rooted authentication in this architecture.
+
+It answers the initial question:
+
+- which wallet is logging in
+- which session is being established
+
+By itself, SIWE is not sufficient for delegated agent execution, but it is a useful starting point for the wallet-auth layer.
+
+#### EIP-712 Typed Structured Data
+
+EIP-712 is the preferred signing format for:
+
+- A2A authentication challenges
+- delegation payloads
+- typed claims that need wallet-verifiable integrity
+
+Its role here is to make signatures explicit, structured, replay-resistant, and machine-verifiable.
+
+#### ERC-1271 Contract Signature Validation
+
+ERC-1271 is required when the acting principal is represented by a smart account rather than only by an EOA.
+
+Its role here is to let the Agent Gateway and downstream services verify that:
+
+- a principal smart account accepted the challenge signature path
+- a smart-account-based principal is the real authority behind the authenticated session
+
+#### ERC-4337 Account Abstraction
+
+ERC-4337 provides the account-abstraction execution model used by smart accounts in this design.
+
+Its role here is to support:
+
+- principal smart accounts
+- session smart accounts
+- programmable validation logic
+- bundler-based execution
+- compatibility with modern smart-wallet flows
+
+This architecture is designed to fit naturally into an ERC-4337 environment even though the downstream MCP authorization artifact is offchain.
+
+#### ERC-7710 Smart Contract Delegation
+
+ERC-7710 is a strong conceptual fit for the delegation layer of this protocol and should be treated as the closest standards-track reference for smart-account delegation in this document.
+
+Its role here is to describe the delegation relationship between:
+
+- the principal smart account as delegator
+- the session smart account as delegate
+- a constrained capability scope
+- bounded validity windows
+
+Important note: ERC-7710 is currently draft, so this document should treat it as an emerging standard that informs the delegation model rather than as a finalized dependency.
+
+#### Session Keys
+
+Session keys are the runtime authority used after delegation is granted.
+
+In this architecture:
+
+- the session wallet private key is generated for the delegated session
+- it is securely stored only inside the A2A agent service
+- it is never passed to the browser
+- it is never passed to LangChain or LangGraph
+- it is never passed to the downstream MCP
+
+This is one of the core security properties of the architecture.
+
+#### MCP
+
+Model Context Protocol is the service invocation boundary used for domain tools and domain data access.
+
+Its role here is to provide:
+
+- a standard tool invocation surface
+- a clean downstream authorization boundary
+- a place to enforce audience-scoped and principal-scoped access rules
+
+This document extends MCP with a delegated bearer-auth pattern so the target Principal Domain MCP can validate the upstream wallet-to-delegation-to-session chain before serving a request.
+
+### Architecture Layering
+
+The full stack can be viewed in layers:
+
+```mermaid
+flowchart TD
+  l1[Wallet Authentication Layer<br>EIP-4361 and EIP-712]
+  l2[Principal Validation Layer<br>ERC-1271]
+  l3[Delegation Layer<br>ERC-7710 aligned]
+  l4[Execution Layer<br>ERC-4337 smart accounts and bundlers]
+  l5[Session Custody Layer<br>A2A service stores session private key]
+  l6[Service Authorization Layer<br>Audience scoped MCP bearer token]
+  l7[Domain Enforcement Layer<br>Principal Domain MCP authorization]
+
+  l1 --> l2 --> l3 --> l4 --> l5 --> l6 --> l7
+```
+
+### Technical Responsibilities By Component
+
+#### Web Client
+
+- obtains the auth challenge
+- asks the wallet or smart account path to sign
+- requests delegation to the session account
+- never receives the session wallet private key
+
+#### A2A Agent Service
+
+- verifies wallet and smart-account authentication
+- generates the session wallet and session account
+- securely stores the session wallet private key
+- assembles and encrypts the session package
+- mints short-lived MCP audience tokens from the stored session package
+
+#### LangChain Or LangGraph Runtime
+
+- receives runtime-scoped MCP auth metadata from the A2A service
+- forwards the delegated bearer artifact to the correct MCP target
+- does not hold root authority for the principal
+
+#### Principal Domain MCP
+
+- validates audience, expiry, issuer signature, session-key signature, and delegation binding
+- derives the validated principal from auth context
+- rejects any attempt to act outside the validated principal scope
+
+### What Is Standardized Versus Protocol-Specific
+
+The architecture intentionally composes both standardized and protocol-specific layers.
+
+Standardized or standards-aligned layers:
+
+- EIP-4361 for wallet sign-in concepts
+- EIP-712 for typed signing
+- ERC-1271 for smart-account signature validation
+- ERC-4337 for account-abstraction execution
+- ERC-7710 as an emerging reference for delegation semantics
+- MCP for downstream tool invocation boundaries
+
+Protocol-specific layers in this document:
+
+- the session package format and storage model
+- the audience-scoped MCP bearer token format
+- the issuer-signature and claims-canonicalization rules
+- the principal-domain audience naming conventions
+- the exact fail-closed authorization behavior inside Principal Domain MCP services
+
+This split is important: the protocol builds on familiar web3 standards, but the full delegated agent-to-MCP trust chain still requires application-layer standardization on top of them.

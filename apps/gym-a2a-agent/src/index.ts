@@ -1,6 +1,7 @@
 import { keccak_256 } from "@noble/hashes/sha3";
 import { Point, recoverPublicKey } from "@noble/secp256k1";
-import { createPublicClient, hashTypedData, http, recoverTypedDataAddress } from "viem";
+import { hashDelegation } from "@metamask/smart-accounts-kit/utils";
+import { createPublicClient, hashTypedData, http, parseAbi, recoverTypedDataAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { sepolia } from "viem/chains";
 
@@ -136,6 +137,7 @@ type CoreMcpDelegationClaims = {
   iss: "gym-a2a-agent";
   aud: "urn:mcp:server:core";
   sub: string;
+  chainId: number;
   accountAddress: string;
   agentHandle: string;
   principalSmartAccount: `0x${string}`;
@@ -537,6 +539,7 @@ function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
     iss: claims.iss,
     aud: claims.aud,
     sub: claims.sub,
+    chainId: claims.chainId,
     accountAddress: claims.accountAddress,
     agentHandle: claims.agentHandle,
     principalSmartAccount: claims.principalSmartAccount,
@@ -611,6 +614,7 @@ async function mintCoreMcpDelegationToken(env: Env, accountAddress: string): Pro
     iss: "gym-a2a-agent",
     aud: "urn:mcp:server:core",
     sub: runtime.row.account_address,
+    chainId: runtime.row.chain_id,
     accountAddress: runtime.row.account_address,
     agentHandle: runtime.row.agent_handle,
     principalSmartAccount: runtime.row.principal_smart_account as `0x${string}`,
@@ -647,6 +651,7 @@ const A2A_WEB_AUTH_SCOPE = "a2a:chat";
 const A2A_WEB_AUTH_MAGIC_VALUE = "0x1626ba7e";
 const A2A_WEB_AUTH_DOMAIN_NAME = "GymA2AWebAuth";
 const A2A_WEB_AUTH_DOMAIN_VERSION = "1";
+const ERC1271_ABI = parseAbi(["function isValidSignature(bytes32,bytes) view returns (bytes4)"]);
 const DEFAULT_CHAIN_ID = 11155111;
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const SESSION_TTL_MS = 15 * 60 * 1000;
@@ -979,6 +984,7 @@ async function upsertSessionPackage(db: D1Database, env: Env, args: {
   const signedDelegation = (args.sessionPackage.signedDelegation ?? {}) as Record<string, unknown>;
   const sessionKeyAddress = normalizeAddress(String(sessionKey.address ?? ""));
   const sessionAA = normalizeAddress(String(args.sessionPackage.sessionAA ?? "")) || null;
+  const normalizedSignedDelegation = normalizeSignedDelegation(signedDelegation);
   const expiresAtISO = (() => {
     const validUntil = Number(sessionKey.validUntil ?? 0);
     return Number.isFinite(validUntil) && validUntil > 0 ? new Date(validUntil * 1000).toISOString() : "";
@@ -987,6 +993,13 @@ async function upsertSessionPackage(db: D1Database, env: Env, args: {
   if (!expiresAtISO) throw new Error("invalid_session_expiry");
   if (!String(sessionKey.privateKey ?? "").trim()) throw new Error("missing_session_private_key");
   if (!String(signedDelegation.signature ?? "").trim()) throw new Error("missing_signed_delegation");
+  if (!sessionAA) throw new Error("invalid_session_aa");
+  if (!normalizedSignedDelegation) throw new Error("invalid_signed_delegation");
+  if (normalizedSignedDelegation.delegate !== sessionAA) throw new Error("session_package_delegate_mismatch");
+  if (normalizedSignedDelegation.delegator !== normalizeAddress(args.principalSmartAccount)) throw new Error("session_package_principal_mismatch");
+  if (!(await verifyOriginalDelegationSignature(args.chainId, normalizeAddress(args.principalSmartAccount) as `0x${string}`, normalizedSignedDelegation))) {
+    throw new Error("invalid_original_signed_delegation");
+  }
   const permissionsHash = await requiredPermissionsHash();
   const encryptedPackageJson = await encryptSessionPackage(env, args.sessionPackage);
   const now = nowISO();
@@ -1054,20 +1067,34 @@ async function verifyWebAuthErc1271(row: A2AWebAuthChallengeRow, signature: stri
   const client = publicClientForChain(row.chain_id);
   const result = await client.readContract({
     address: row.principal_smart_account as `0x${string}`,
-    abi: [{
-      type: "function",
-      stateMutability: "view",
-      name: "isValidSignature",
-      inputs: [
-        { name: "hash", type: "bytes32" },
-        { name: "signature", type: "bytes" },
-      ],
-      outputs: [{ name: "magicValue", type: "bytes4" }],
-    }],
+    abi: ERC1271_ABI,
     functionName: "isValidSignature",
     args: [digest, signature as `0x${string}`],
   });
   return { digest, ok: String(result).toLowerCase() === A2A_WEB_AUTH_MAGIC_VALUE };
+}
+
+async function verifyOriginalDelegationSignature(
+  chainId: number,
+  principalSmartAccount: `0x${string}`,
+  signedDelegation: RuntimeSessionPackage["signedDelegation"],
+): Promise<boolean> {
+  const client = publicClientForChain(chainId);
+  const delegationHash = hashDelegation({
+    delegate: signedDelegation.delegate,
+    delegator: signedDelegation.delegator,
+    authority: signedDelegation.authority,
+    caveats: signedDelegation.caveats as never,
+    salt: signedDelegation.salt,
+    signature: signedDelegation.signature,
+  });
+  const result = await client.readContract({
+    address: principalSmartAccount,
+    abi: ERC1271_ABI,
+    functionName: "isValidSignature",
+    args: [delegationHash, signedDelegation.signature],
+  });
+  return String(result).toLowerCase() === A2A_WEB_AUTH_MAGIC_VALUE;
 }
 
 async function upsertGymAgentProfile(

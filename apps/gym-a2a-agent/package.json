@@ -8,6 +8,7 @@
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@metamask/smart-accounts-kit": "^1.0.0",
     "@noble/hashes": "^1.8.0",
     "@noble/secp256k1": "^3.0.0",
     "viem": "^2.47.6"

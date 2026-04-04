@@ -1,11 +1,14 @@
 import { createMcpHandler } from "agents/mcp";
+import { hashDelegation } from "@metamask/smart-accounts-kit/utils";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { recoverMessageAddress } from "viem";
+import { createPublicClient, http, parseAbi, recoverMessageAddress } from "viem";
+import { sepolia } from "viem/chains";
 import { z } from "zod";
 
 export type Env = {
   MCP_API_KEY?: string;
   MCP_DELEGATION_SHARED_SECRET?: string;
+  AGENTIC_TRUST_RPC_URL_SEPOLIA?: string;
   DB: D1Database;
   // Optional: GraphDB access for FitnessCore graph queries (SPARQL).
   GRAPHDB_BASE_URL?: string;
@@ -21,6 +24,7 @@ type CoreMcpDelegationClaims = {
   iss: "gym-a2a-agent";
   aud: "urn:mcp:server:core";
   sub: string;
+  chainId: number;
   accountAddress: string;
   agentHandle: string;
   principalSmartAccount: `0x${string}`;
@@ -55,6 +59,7 @@ type RequestAuth =
   | {
       kind: "delegated";
       principal: {
+        chainId: number;
         accountAddress: string;
         agentHandle: string;
         principalSmartAccount: `0x${string}`;
@@ -68,6 +73,8 @@ type RequestAuth =
     };
 
 const AccountAddress = z.string().min(3);
+const ERC1271_ABI = parseAbi(["function isValidSignature(bytes32,bytes) view returns (bytes4)"]);
+const ERC1271_MAGIC_VALUE = "0x1626ba7e";
 
 function nowISO() {
   return new Date().toISOString();
@@ -136,6 +143,7 @@ function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
     iss: claims.iss,
     aud: claims.aud,
     sub: claims.sub,
+    chainId: claims.chainId,
     accountAddress: claims.accountAddress,
     agentHandle: claims.agentHandle,
     principalSmartAccount: claims.principalSmartAccount,
@@ -163,6 +171,41 @@ async function verifyIssuerSignature(env: Env, claims: CoreMcpDelegationClaims, 
   const key = await mcpDelegationSecretKey(env);
   const sig = await crypto.subtle.sign("HMAC", key, toArrayBuffer(utf8Bytes(coreMcpClaimsCanonicalString(claims))));
   return base64UrlEncodeBytes(new Uint8Array(sig)) === issuerSignature;
+}
+
+function rpcUrlForChain(env: Env, chainId: number): string {
+  if (chainId === 11155111) {
+    return String(env.AGENTIC_TRUST_RPC_URL_SEPOLIA ?? "").trim();
+  }
+  return "";
+}
+
+function publicClientForChain(env: Env, chainId: number) {
+  const rpcUrl = rpcUrlForChain(env, chainId);
+  if (!rpcUrl) throw new Error(`missing_rpc_url_for_chain_${chainId}`);
+  if (chainId === 11155111) {
+    return createPublicClient({ chain: sepolia, transport: http(rpcUrl) });
+  }
+  return createPublicClient({ transport: http(rpcUrl) });
+}
+
+async function verifyOriginalDelegationSignature(env: Env, claims: CoreMcpDelegationClaims): Promise<boolean> {
+  const delegationHash = hashDelegation({
+    delegate: claims.signedDelegation.delegate,
+    delegator: claims.signedDelegation.delegator,
+    authority: claims.signedDelegation.authority,
+    caveats: claims.signedDelegation.caveats as never,
+    salt: claims.signedDelegation.salt,
+    signature: claims.signedDelegation.signature,
+  });
+  const client = publicClientForChain(env, claims.chainId);
+  const result = await client.readContract({
+    address: claims.principalSmartAccount,
+    abi: ERC1271_ABI,
+    functionName: "isValidSignature",
+    args: [delegationHash, claims.signedDelegation.signature],
+  });
+  return String(result).toLowerCase() === ERC1271_MAGIC_VALUE;
 }
 
 function basicAuthHeader(username: string, password: string) {
@@ -249,6 +292,7 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
       typeof claimsRaw.issuedAtISO === "string" &&
       typeof claimsRaw.expiresAtISO === "string" &&
       typeof claimsRaw.nonce === "string" &&
+      Number.isFinite(Number(claimsRaw.chainId)) &&
       Number.isFinite(Number(claimsRaw.sessionValidAfter)) &&
       Number.isFinite(Number(claimsRaw.sessionValidUntil))
         ? {
@@ -256,6 +300,7 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
             iss: "gym-a2a-agent",
             aud: "urn:mcp:server:core",
             sub: String(claimsRaw.sub ?? claimsRaw.accountAddress ?? "").trim(),
+            chainId: Number(claimsRaw.chainId),
             accountAddress: String(claimsRaw.accountAddress ?? "").trim(),
             agentHandle: String(claimsRaw.agentHandle ?? "").trim(),
             principalSmartAccount: normalizeAddress(claimsRaw.principalSmartAccount)!,
@@ -287,10 +332,12 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
     if (!recovered || recovered !== claims.sessionKeyAddress) throw new Error("delegation_session_signature_invalid");
     if (claims.signedDelegation.delegate !== claims.sessionAA) throw new Error("delegation_delegate_mismatch");
     if (claims.signedDelegation.delegator !== claims.principalSmartAccount) throw new Error("delegation_principal_mismatch");
-    if (claims.selector !== "0x1626ba7e") throw new Error("delegation_selector_invalid");
+    if (claims.selector !== ERC1271_MAGIC_VALUE) throw new Error("delegation_selector_invalid");
+    if (!(await verifyOriginalDelegationSignature(env, claims))) throw new Error("delegation_signature_invalid");
     return {
       kind: "delegated",
       principal: {
+        chainId: claims.chainId,
         accountAddress: claims.accountAddress,
         agentHandle: claims.agentHandle,
         principalSmartAccount: claims.principalSmartAccount,
