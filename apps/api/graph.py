@@ -1,20 +1,31 @@
 from __future__ import annotations
 
-from typing import Any, TypedDict, Optional
+from typing import Any, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.graph import END, StateGraph
+from langgraph.runtime import Runtime
 
 from apps.api.agent import Input, Session, run
 
 
+# Temporary compatibility shim for LangGraph Platform runtimes that can call
+# Runtime.patch_execution_info() before execution_info has been populated.
+_orig_patch_execution_info = Runtime.patch_execution_info
+
+
+def _safe_patch_execution_info(self: Runtime, **overrides: Any) -> Runtime:
+    if getattr(self, "execution_info", None) is None:
+        return self
+    return _orig_patch_execution_info(self, **overrides)
+
+
+Runtime.patch_execution_info = _safe_patch_execution_info
 
 
 class GraphState(TypedDict, total=False):
     message: str
     session: dict[str, Any]
     output: dict[str, Any]
-    messages: list[BaseMessage]
 
 
 async def assistant_node(state: GraphState) -> GraphState:
@@ -23,12 +34,12 @@ async def assistant_node(state: GraphState) -> GraphState:
 
     if not message:
         out = {"answer": "Missing message.", "citations": []}
-        return {"output": out, "messages": [AIMessage(content=out["answer"])]}
+        return {"output": out}
 
     session = Session(**session_dict) if isinstance(session_dict, dict) else None
     result = await run(Input(message=message, session=session))
     out = result.model_dump()
-    return {"output": out, "messages": [AIMessage(content=out.get("answer", ""))]}
+    return {"output": out}
 
 
 builder: StateGraph = StateGraph(GraphState)

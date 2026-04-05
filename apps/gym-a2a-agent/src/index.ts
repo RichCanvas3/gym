@@ -1440,6 +1440,11 @@ async function forwardToLangGraph(env: Env, args: {
     const detail = json && typeof json === "object" ? json : { raw: String(json ?? "") };
     throw new Error(`langgraph_error:${res.status}:${JSON.stringify(detail).slice(0, 500)}`);
   }
+  if (json && typeof json === "object" && json.__error__) {
+    const err = json.__error__ && typeof json.__error__ === "object" ? json.__error__ : { value: json.__error__ };
+    const msg = typeof err.message === "string" ? err.message : typeof err.error === "string" ? err.error : JSON.stringify(err);
+    throw new Error(`langgraph_error:200:${msg.slice(0, 500)}`);
+  }
   const out = json?.output;
   const answer = typeof out?.answer === "string" ? out.answer : typeof out?.output === "string" ? out.output : null;
   return { ok: true, answer, output: out ?? null, raw: json };
