@@ -74,14 +74,6 @@ def _session_participant(session: Optional["Session"]) -> str:
     return _waiver_participant(session)
 
 
-def _session_telegram_user_id(session: Optional["Session"]) -> str:
-    if session and isinstance(getattr(session, "telegramUserId", None), str):
-        v = str(getattr(session, "telegramUserId") or "").strip()
-        if v:
-            return v
-    return ""
-
-
 def _runtime_mcp_overrides_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
     if not session or not isinstance(getattr(session, "mcpAuth", None), dict):
         return None
@@ -1026,6 +1018,7 @@ def build_system_prompt() -> str:
             "- For confirmations and reminders, use the messaging/notifications tools when available.",
             "- For future outdoor planning, prefer a forecast tool when available (not just current conditions).",
             "- For class reservations, reserve seats via the scheduling MCP using canonical account addresses, record a reservation ledger entry in gym-core, then send a confirmation email when possible.",
+            "- Identity for private data and actions comes from the authenticated accountAddress/session principal. Do not ask for Telegram user ids and do not use Telegram ids as identity scope.",
             "- For checkout, provide a concise receipt and send an email receipt when possible.",
             "- If discussing a specific outdoor class that is scheduled in the future, include forecast context for that class time when possible.",
             "- When asked about policies, class descriptions, coach bios, or general FAQs, use the knowledge search tool (RAG).",
@@ -1272,18 +1265,12 @@ def _parse_weight_from_text(text: str) -> tuple[Optional[float], Optional[float]
 
 def _weight_scope_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
     acct = _session_account_address(session)
-    tg_user_id = _session_telegram_user_id(session)
-    if acct:
-        return {"accountAddress": acct, **({"telegramUserId": tg_user_id} if tg_user_id else {})}
-    return {"telegramUserId": tg_user_id} if tg_user_id else None
+    return {"accountAddress": acct} if acct else None
 
 
 def _strava_identity_from_session(session: Optional["Session"]) -> dict[str, Any]:
     acct = _session_account_address(session)
-    if acct:
-        return {"accountAddress": acct}
-    tg_user_id = _session_telegram_user_id(session)
-    return {"telegramUserId": tg_user_id} if tg_user_id else {}
+    return {"accountAddress": acct} if acct else {}
 
 
 async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1291,9 +1278,7 @@ async def _auto_import_telegram_meal_texts(session: Optional["Session"], bundle:
     Scan the Telegram chat titled "Smart Agent" for meal-like texts and import them into weight-mcp as food entries.
     Uses GoalBundle.integrations to remember the last imported message id.
     """
-    scope = _weight_scope_from_session(session)
-    if not scope:
-        return bundle, []
+    return bundle, []
 
     integrations = bundle.get("integrations") if isinstance(bundle.get("integrations"), dict) else {}
     tg_state = integrations.get("telegramMeals") if isinstance(integrations.get("telegramMeals"), dict) else {}
@@ -1415,9 +1400,7 @@ async def _auto_import_telegram_weight_texts(session: Optional["Session"], bundl
     Scan the Telegram chat titled "Smart Agent" for weigh-in-like texts and import them into weight-mcp.
     Uses GoalBundle.integrations to remember the last imported message id.
     """
-    scope = _weight_scope_from_session(session)
-    if not scope:
-        return bundle, []
+    return bundle, []
 
     integrations = bundle.get("integrations") if isinstance(bundle.get("integrations"), dict) else {}
     tg_state = integrations.get("telegramWeights") if isinstance(integrations.get("telegramWeights"), dict) else {}
@@ -1838,26 +1821,21 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
     class FitnessSnapshotArgs(BaseModel):
         accountAddress: Optional[str] = Field(
             default=None,
-            description="Preferred canonical id (Privy accountAddress), e.g. acct:privy_... (used as scope id).",
-        )
-        telegramUserId: Optional[str] = Field(
-            default=None,
-            description="Back-compat Telegram numeric user id as string (used as weight-management scope id).",
+            description="Canonical id (Privy accountAddress), e.g. acct:privy_.... Usually supplied by authenticated session context.",
         )
         dateISO: Optional[str] = Field(default=None, description="Local date (YYYY-MM-DD). Defaults to today in tzName.")
         tzName: Optional[str] = Field(default="America/Denver", description="IANA timezone name for date defaulting.")
 
-    async def fitness_snapshot(accountAddress: Optional[str] = None, telegramUserId: Optional[str] = None, dateISO: Optional[str] = None, tzName: str = "America/Denver") -> str:
+    async def fitness_snapshot(accountAddress: Optional[str] = None, dateISO: Optional[str] = None, tzName: str = "America/Denver") -> str:
         tz = ZoneInfo(tzName or "UTC")
         if not dateISO or not isinstance(dateISO, str) or not dateISO.strip():
             dateISO = datetime.now(tz=tz).date().isoformat()
         acct = str(accountAddress or "").strip()
-        tg = str(telegramUserId or "").strip()
-        if not acct and not tg:
-            raise ValueError("Provide accountAddress (preferred) or telegramUserId")
-        scope = {"accountAddress": acct, **({"telegramUserId": tg} if tg else {})} if acct else {"telegramUserId": tg}
+        if not acct:
+            raise ValueError("Provide accountAddress")
+        scope = {"accountAddress": acct}
         day = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": dateISO, "tzName": tzName}) or {}
-        workout = await _strava_call_json("strava_latest_workout", {"accountAddress": acct} if acct else {"telegramUserId": tg}) or {}
+        workout = await _strava_call_json("strava_latest_workout", {"accountAddress": acct}) or {}
         return json.dumps(
             {
                 "asOfISO": _now_iso(),
@@ -2009,10 +1987,9 @@ async def _run_impl(input: Input) -> Output:
     # UI helper: get current weight-management profile for this user.
     if msg == "__WEIGHT_PROFILE_GET__":
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
-        if not tg_user_id:
-            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
-        prof = await _weight_call_json("weight_profile_get", {"scope": {"telegramUserId": tg_user_id}})
+        if not acct:
+            return Output(answer="I need you signed in to do that.", citations=[], data={"error": "missing_account_address"})
+        prof = await _weight_call_json("weight_profile_get", {"scope": {"accountAddress": acct}})
         if prof is None:
             return Output(
                 answer="Weight Management MCP profile_get failed.",
@@ -2021,7 +1998,7 @@ async def _run_impl(input: Input) -> Output:
                     "ok": False,
                     "error": "weight_profile_get_failed",
                     "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_profile_get and Weight MCP server is healthy.",
-                    "telegramUserId": tg_user_id,
+                    "accountAddress": acct,
                 },
             )
         return Output(
@@ -2029,15 +2006,15 @@ async def _run_impl(input: Input) -> Output:
             citations=[],
             data={
                 "ok": True,
-                "telegramUserId": tg_user_id,
+                "accountAddress": acct,
                 "profile": prof.get("profile") if isinstance(prof, dict) else None,
             },
         )
 
     if msg.startswith("__WEIGHT_PROFILE_UPSERT__:"):
-        tg_user_id = _session_telegram_user_id(input.session)
-        if not tg_user_id:
-            return Output(answer="I need you signed in with Telegram to do that.", citations=[], data={"error": "missing_telegram_user_id"})
+        acct = _session_account_address(input.session)
+        if not acct:
+            return Output(answer="I need you signed in to do that.", citations=[], data={"error": "missing_account_address"})
         try:
             payload = json.loads(msg.split(":", 1)[1].strip())
         except Exception:
@@ -2045,7 +2022,7 @@ async def _run_impl(input: Input) -> Output:
         profile = payload.get("profile") if isinstance(payload, dict) else {}
         if not isinstance(profile, dict):
             profile = {}
-        out = await _weight_call_json("weight_profile_upsert", {"scope": {"telegramUserId": tg_user_id}, "profile": profile})
+        out = await _weight_call_json("weight_profile_upsert", {"scope": {"accountAddress": acct}, "profile": profile})
         if out is None:
             return Output(
                 answer="Weight Management MCP profile_upsert failed.",
@@ -2054,7 +2031,7 @@ async def _run_impl(input: Input) -> Output:
                     "ok": False,
                     "error": "weight_profile_upsert_failed",
                     "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_profile_upsert and Weight MCP server is healthy.",
-                    "telegramUserId": tg_user_id,
+                    "accountAddress": acct,
                 },
             )
         return Output(
@@ -2062,7 +2039,7 @@ async def _run_impl(input: Input) -> Output:
             citations=[],
             data={
                 "ok": True,
-                "telegramUserId": tg_user_id,
+                "accountAddress": acct,
                 "updated_at": out.get("updated_at") if isinstance(out, dict) else None,
             },
         )
@@ -2469,9 +2446,8 @@ async def _run_impl(input: Input) -> Output:
 
         items: list[dict[str, Any]] = []
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
-        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and acct:
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2646,14 +2622,13 @@ SELECT ?t ?desc ?cal ?p ?c ?f WHERE {{
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
-        graph_mode = _fitnesscore_use_graphdb() and bool(acct or tg_user_id)
+        graph_mode = _fitnesscore_use_graphdb() and bool(acct)
         g_intake_kcal = 0.0
         g_ex_kcal = 0.0
         workouts_today: list[dict[str, Any]] = []
 
         if graph_mode:
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2830,10 +2805,9 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
         from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
 
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
         ex_out = 0.0
-        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and acct:
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -2858,18 +2832,18 @@ SELECT (SUM(?k) AS ?exerciseKcal) (COUNT(?w) AS ?workouts) WHERE {{
                     except Exception:
                         ex_out = 0.0
 
-        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and (acct or tg_user_id)):
+        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and acct):
             day0 = await _weight_call_json("weight_day_summary", {"scope": scope, "dateISO": date_iso, "tzName": tz_name}) or {}
             totals = day0.get("totals") if isinstance(day0, dict) else None
             totals = totals if isinstance(totals, dict) else {}
             ex_kcal = totals.get("exercise_kcal")
             ex_out = float(ex_kcal) if isinstance(ex_kcal, (int, float)) else 0.0
 
-        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and (acct or tg_user_id)):
-            if acct or tg_user_id:
+        if ex_out <= 0.0 and not (_fitnesscore_graphdb_only() and _fitnesscore_use_graphdb() and acct):
+            if acct:
                 str0 = await _strava_call_json(
                     "strava_list_workouts",
-                    {"accountAddress": acct, "limit": 200} if acct else {"telegramUserId": tg_user_id, "limit": 200},
+                    {"accountAddress": acct, "limit": 200},
                 ) or {}
                 workouts = str0.get("workouts") if isinstance(str0, dict) else None
                 wlist = [w for w in workouts if isinstance(w, dict)] if isinstance(workouts, list) else []
@@ -2941,11 +2915,10 @@ SELECT (SUM(?k) AS ?exerciseKcal) (COUNT(?w) AS ?workouts) WHERE {{
 
         intake = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
 
         # Prefer GraphDB for intake (food)
-        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and acct:
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q_food = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3012,8 +2985,8 @@ SELECT ?cal ?p ?c ?f WHERE {{
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
         wlist: list[dict[str, Any]] = []
-        if _fitnesscore_use_graphdb():
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and acct:
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q_w = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3155,12 +3128,10 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         height_in = _num(prof.get("height_in"))
         activity = str(prof.get("activity_level") or "").strip().lower()
 
-        tg_user_id = _session_telegram_user_id(input.session)
-
         # Intake (food) - prefer GraphDB
         intake_kcal = 0.0
-        if _fitnesscore_use_graphdb() and (acct or tg_user_id):
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and acct:
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q_in = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3219,8 +3190,8 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
         wlist: list[dict[str, Any]] = []
-        if _fitnesscore_use_graphdb():
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and acct:
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q_w = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3373,17 +3344,16 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
         _set_last_date_context(base_goal_bundle, date_iso, tz_name)
 
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
-        if not (acct or tg_user_id):
+        if not acct:
             answer = "I can list workouts, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
             return Output(answer=answer, citations=[], uiActions=[])
         today_workouts: list[dict[str, Any]] = []
-        if _fitnesscore_use_graphdb():
+        if _fitnesscore_use_graphdb() and acct:
             from_iso, to_iso = _day_window_utc_from_local_date(date_iso, tz_name)
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3507,12 +3477,11 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters ?activeEnergyKcal
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
 
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
-        if not (acct or tg_user_id):
+        if not acct:
             return Output(answer="I need you signed in to do that.", citations=[], data={"error": "missing_identity"})
 
-        if _fitnesscore_use_graphdb():
-            g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        if _fitnesscore_use_graphdb() and acct:
+            g = _fitnesscore_graph_iri_for_account_address(acct)
             q = f"""
 PREFIX fc: <https://ontology.fitnesscore.ai/fc#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
@@ -3665,8 +3634,7 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters WHERE {{
     if fitness_intent == "fitness_metric_period":
         tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
         acct = _session_account_address(input.session)
-        tg_user_id = _session_telegram_user_id(input.session)
-        if not (acct or tg_user_id):
+        if not acct:
             return Output(answer="I need you signed in to do that.", citations=[], data={"error": "missing_identity"})
 
         from_iso, to_iso, label = _resolve_period_window_utc(msg, tz_name)
@@ -3679,7 +3647,7 @@ SELECT ?activityType ?started ?durationSeconds ?distanceMeters WHERE {{
         wants_exercise_kcal = any(k in mlow2 for k in ["exercise", "workout", "burn", "burned", "spent", "calories out"])
         wants_net = "net" in mlow2
 
-        g = _fitnesscore_graph_iri_for_account_address(acct) if acct else _fitnesscore_graph_iri_for_telegram_user_id(str(tg_user_id))
+        g = _fitnesscore_graph_iri_for_account_address(acct)
 
         # Workout count
         workouts_n = 0

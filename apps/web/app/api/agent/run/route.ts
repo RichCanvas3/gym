@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { requirePrivyAuth, telegramUserIdForPrivyDid } from "../../_lib/privy";
-import { mcpToolCall } from "../../_lib/mcp";
+import { requirePrivyAuth } from "../../_lib/privy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -99,18 +98,7 @@ export async function POST(req: Request) {
 
   const sessionOut: Record<string, unknown> = { ...(session ?? {}) };
   sessionOut.accountAddress = auth.accountAddress;
-  let telegramUserId = await telegramUserIdForPrivyDid(auth.did);
-  if (!telegramUserId) {
-    try {
-      const st = await mcpToolCall("telegram", "telegram_link_status", { accountAddress: auth.accountAddress });
-      const rec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
-      const v = rec.telegramUserId;
-      telegramUserId = typeof v === "string" && v.trim() ? v.trim() : null;
-    } catch {
-      // ok: Telegram is optional (user can connect later)
-    }
-  }
-  if (telegramUserId) sessionOut.telegramUserId = telegramUserId;
+  if ("telegramUserId" in sessionOut) delete sessionOut.telegramUserId;
   if ("waiver" in sessionOut) delete sessionOut["waiver"];
   const derivedThreadId = `thr_${auth.accountAddress.replace(/[^a-zA-Z0-9_]/g, "_")}`;
   const threadIdRaw = sessionOut["threadId"];
@@ -124,7 +112,6 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         handle: agentHandle,
         accountAddress: auth.accountAddress,
-        telegramUserId: telegramUserId ?? null,
       }),
     });
   } catch {

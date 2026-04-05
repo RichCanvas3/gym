@@ -1,0 +1,12 @@
+---
+description: Use principal/account identity only
+alwaysApply: true
+---
+
+# Principal Identity Only
+
+- For authenticated web, A2A, LangGraph, and MCP flows, use the validated principal context and canonical `accountAddress` as identity.
+- Do not use `telegramUserId` as an identity key, private-data lookup key, or fallback scope for weight, workout, profile, reservation, or memory operations.
+- Do not ask the user for Telegram user id to retrieve private data when authenticated principal context already exists.
+- If authenticated principal context is missing, fail clearly and ask for sign-in or session repair, not alternate identity handles.
+- Telegram may still be used for messaging/integration features, but never as the source of truth for identity or authorization.
