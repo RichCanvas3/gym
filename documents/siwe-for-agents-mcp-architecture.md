@@ -47,7 +47,8 @@ flowchart LR
   wallet[Wallet Auth] --> principal[Principal Smart Account]
   principal --> delegation[Delegation To Session Smart Account]
   delegation --> gateway[Agent Gateway]
-  gateway --> token[Audience Scoped MCP Token]
+  gateway --> ws[A2A Web Session Token<br>Opaque session token]
+  gateway --> token[Audience Scoped MCP Bearer Envelope<br>Base64url JSON, not JWT]
   token --> domain[Principal Domain MCP]
   domain --> data[Principal Data And Actions]
 ```
@@ -90,6 +91,7 @@ This document does not define:
 - the session wallet private key is generated and securely stored only inside the trusted Agent Gateway
 - the original principal-to-session delegation is verified by the Agent Gateway before storage
 - the Agent Gateway mints only short-lived, audience-scoped MCP authorization artifacts
+- the implementation currently uses an opaque A2A web session token plus a base64url-encoded MCP bearer envelope, not a standards-format JWT
 - the LangChain runtime carries auth metadata but never receives the underlying session private key
 - the downstream Principal Domain MCP validates the token, session proof, and original delegation before serving principal-scoped data or actions
 - the protocol fails closed when verification does not succeed
@@ -231,8 +233,9 @@ Terminology used in this document:
 flowchart LR
   web[WebClient] --> auth[WalletAuthChallenge]
   auth --> gateway[AgentGateway]
+  gateway --> webSession[A2A Web Session Token<br>Generated after challenge verification]
   gateway --> sessionPkg[EncryptedSessionPackage]
-  sessionPkg --> runtimeToken[AudienceScopedMcpToken]
+  sessionPkg --> runtimeToken[Audience Scoped MCP Bearer Envelope<br>Generated per MCP invocation]
   runtimeToken --> langchain[LangChainRuntime]
   langchain --> profileMcp[PrincipalDomainMcp]
   profileMcp --> principalStore[PrincipalDataAndCapabilities]
@@ -325,6 +328,25 @@ The client signs typed data as the principal smart account path, not as an arbit
 
 If successful, the Agent Gateway issues a short-lived A2A web session token.
 
+Implementation note:
+
+- this token is currently an opaque random session token, not a JWT
+- it is generated after successful challenge verification and persisted in the Agent Gateway session store
+- the stored session record binds:
+  - `sessionId`
+  - `challengeId`
+  - `accountAddress`
+  - `walletAddress`
+  - `principalSmartAccount`
+  - `agentHandle`
+  - `a2aHost`
+  - `chainId`
+  - `scope`
+  - `verifiedAtISO`
+  - `expiresAtISO`
+- the browser later sends this token as `x-a2a-web-session` on A2A chat requests
+- the Agent Gateway resolves the token server-side and restores the authenticated principal context from the stored row
+
 ### 2. Session Smart Account Initialization
 
 Once a valid agent is available, the web client triggers session bootstrap.
@@ -388,6 +410,39 @@ That artifact includes:
 - signed delegation
 - issued / expiry timestamps
 
+Implementation note:
+
+- this artifact is currently a base64url-encoded JSON envelope, not a JWT/JWS
+- the envelope contains:
+  - `v`
+  - `typ`
+  - `alg`
+  - `kid`
+  - `claims`
+  - `sessionSignature`
+  - `issuerSignature`
+- `claims` currently include:
+  - `iss`
+  - `aud`
+  - `sub`
+  - `chainId`
+  - `sessionGeneration`
+  - `accountAddress`
+  - `agentHandle`
+  - `principalSmartAccount`
+  - `principalOwnerEoa`
+  - `sessionAA`
+  - `sessionKeyAddress`
+  - `sessionValidAfter`
+  - `sessionValidUntil`
+  - `selector`
+  - `permissionsHash`
+  - `signedDelegation`
+  - `issuedAtISO`
+  - `expiresAtISO`
+  - `jti`
+  - `usageLimit`
+
 It is signed in two ways:
 
 - by the session key, proving possession of the delegated runtime key
@@ -400,6 +455,12 @@ The Agent Gateway forwards the user request to LangChain/LangGraph and attaches 
 The LangChain MCP loader converts that metadata into a per-request `Authorization: Bearer ...` header for the target Principal Domain MCP.
 
 Static process-wide MCP headers are not used for this A2A-to-core path.
+
+In the current implementation:
+
+- `session.mcpAuth.core.bearerToken` carries the minted MCP bearer envelope
+- LangChain does not inspect or re-sign the envelope
+- LangChain only forwards it to the target MCP as bearer auth for the specific request
 
 ### 7. Principal Domain MCP Authorization
 
@@ -418,6 +479,17 @@ Validation checks include:
 - signed delegation delegator equals principal smart account
 - selector matches the expected delegated function scope
 
+In the current implementation, the Principal Domain MCP:
+
+- base64url-decodes the bearer token into the delegation envelope
+- checks `typ` and `alg`
+- extracts `claims`, `sessionSignature`, and `issuerSignature`
+- validates issuer signature over canonical claims serialization
+- validates the session signature against `sessionKeyAddress`
+- validates expiry and session validity windows
+- validates the original principal-to-session delegation
+- derives the request principal from validated claims instead of trusting caller-supplied identifiers
+
 If validation succeeds, the MCP derives the request principal and uses it for principal-scoped authorization.
 
 ## End-To-End Sequence
@@ -435,7 +507,8 @@ sequenceDiagram
   WebClient->>PrincipalWallet: Sign typed auth challenge
   PrincipalWallet-->>WebClient: Signature
   WebClient->>AgentGateway: Verify challenge signature
-  AgentGateway-->>WebClient: A2A web session
+  AgentGateway->>AgentGateway: Generate opaque A2A web session token
+  AgentGateway-->>WebClient: A2A web session token
 
   WebClient->>AgentGateway: Session init
   AgentGateway-->>WebClient: sessionAA, chainId
@@ -447,10 +520,11 @@ sequenceDiagram
 
   WebClient->>AgentGateway: Chat request with A2A session
   AgentGateway->>AgentGateway: Decrypt and validate session package
-  AgentGateway->>AgentGateway: Mint Principal Domain MCP bearer token
-  AgentGateway->>LangChainRuntime: Run request + session.mcpAuth.principalDomain
-  LangChainRuntime->>PrincipalDomainMcp: MCP request with Authorization Bearer token
-  PrincipalDomainMcp->>PrincipalDomainMcp: Validate token + session proof + original delegation + principal
+  AgentGateway->>AgentGateway: Mint MCP bearer envelope from session package
+  AgentGateway->>LangChainRuntime: Run request + session.mcpAuth.core.bearerToken
+  LangChainRuntime->>PrincipalDomainMcp: MCP request with Authorization Bearer envelope
+  PrincipalDomainMcp->>PrincipalDomainMcp: Decode envelope + validate issuerSignature
+  PrincipalDomainMcp->>PrincipalDomainMcp: Validate sessionSignature + original delegation + principal
   PrincipalDomainMcp-->>LangChainRuntime: MCP tool result
   LangChainRuntime-->>AgentGateway: Final answer
   AgentGateway-->>WebClient: Chat response
@@ -475,6 +549,12 @@ Suggested fields:
 - `scope`
 - `verifiedAtISO`
 - `expiresAtISO`
+
+Current implementation format:
+
+- opaque random session token persisted in the Agent Gateway database
+- transmitted by the web client as `x-a2a-web-session`
+- not self-describing and not locally verifiable by the browser
 
 ### Session Package
 
@@ -521,6 +601,19 @@ Core claims:
 - `expiresAtISO`
 - `nonce`
 
+Current implementation format:
+
+- base64url-encoded JSON envelope
+- not a JWT
+- envelope fields:
+  - `v`
+  - `typ`
+  - `alg`
+  - `kid`
+  - `claims`
+  - `sessionSignature`
+  - `issuerSignature`
+
 ## Authorization Model
 
 ### Authentication
@@ -548,6 +641,14 @@ MCP authorization answers:
 - Did the trusted Agent Gateway mint this runtime artifact?
 - Is the original principal-to-session delegation cryptographically valid?
 - Which principal should this MCP request run as?
+
+Important token-format note:
+
+- this document often refers to "bearer token" as a transport role, not as a commitment to JWT specifically
+- in the current implementation:
+  - the A2A web session token is opaque
+  - the MCP bearer artifact is a base64url JSON envelope with dual signatures
+- a future standards profile could map the MCP bearer artifact into JWT/JWS, but that is not what the current system emits
 
 ## Principal-Scoped Data Enforcement
 
@@ -665,6 +766,70 @@ The main technical pieces are:
 - account-abstraction compatible session execution
 - audience-scoped bearer authorization for downstream MCP services
 - principal-scoped authorization enforcement inside each domain MCP
+
+### Token Artifacts In The Current Implementation
+
+There are two different auth artifacts in the live flow.
+
+#### 1. A2A Web Session Token
+
+Generated by:
+
+- the Agent Gateway after the A2A typed-data challenge is verified
+
+Format:
+
+- opaque random session token
+
+Stored server-side with:
+
+- challenge linkage
+- `accountAddress`
+- `walletAddress`
+- `principalSmartAccount`
+- `agentHandle`
+- `a2aHost`
+- `chainId`
+- `scope`
+- verification and expiry timestamps
+
+Used by:
+
+- the web client when calling the per-user A2A endpoint
+- the Agent Gateway to recover authenticated principal context before chat execution
+
+#### 2. MCP Bearer Envelope
+
+Generated by:
+
+- the Agent Gateway on each chat/runtime request after it decrypts and validates the stored session package
+
+Format:
+
+- base64url-encoded JSON envelope
+- not JWT
+
+Contains:
+
+- envelope metadata: `v`, `typ`, `alg`, `kid`
+- delegation claims
+- `sessionSignature`
+- `issuerSignature`
+
+Used by:
+
+- LangChain/LangGraph as a forwarded bearer artifact only
+- the Principal Domain MCP as the object it decodes and verifies before serving principal-scoped data
+
+#### Where JWT Fits
+
+JWT is not currently the token format emitted in this implementation.
+
+If the protocol is later standardized around JWT/JWS:
+
+- the opaque A2A web session token could remain opaque
+- the MCP bearer envelope is the more likely candidate for JWT-style standardization
+- the claim set and dual-signature semantics defined here should be preserved even if the wire format changes
 
 ### Standards And Primitives Used
 

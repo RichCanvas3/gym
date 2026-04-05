@@ -1058,6 +1058,12 @@ def build_session_prompt(session: Optional[Session]) -> str:
     gym_name = (session.gymName if session else None) or "Erie Community Center"
     tz = (session.timezone if session else None) or "America/Denver"
     lines = [f"Gym: {gym_name}", f"Timezone: {tz}"]
+    acct = _session_account_address(session)
+    if acct:
+        lines.append(f"AuthenticatedAccountAddress: {acct}")
+        lines.append("PrivateDataScope: authenticated accountAddress is already available in this session; do not ask the user to provide it again.")
+    else:
+        lines.append("AuthenticatedAccountAddress: missing")
     # Default gym coordinates (Boulder, CO) for weather MCP calls.
     lines.append("GymLatLon: 40.03781, -105.05228")
     if session and session.userName:
