@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { Suspense, useEffect, useMemo, useState } from "react";
+import { useWallets } from "@privy-io/react-auth";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -73,6 +74,21 @@ function isISODate(s: string) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
+function preferredWalletAddress(
+  wallets: Array<{ address?: string; walletClientType?: string }>,
+): string | null {
+  const external = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return Boolean(kind) && kind !== "privy" && kind !== "privy-v2" && typeof wallet.address === "string" && wallet.address.trim();
+  });
+  if (external?.address) return external.address.trim();
+  const embedded = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return (kind === "privy" || kind === "privy-v2") && typeof wallet.address === "string" && wallet.address.trim();
+  });
+  return embedded?.address?.trim() || null;
+}
+
 function addDaysISO(isoDate: string, days: number) {
   const d = new Date(`${isoDate}T00:00:00.000Z`);
   const ms = d.getTime();
@@ -142,7 +158,9 @@ function CalendarInner() {
   const router = useRouter();
   const params = useSearchParams();
   const { ready, authenticated, accountAddress, getAccessToken, login, logout } = useAuth();
+  const { wallets } = useWallets();
   const { reservations, addReservation, clearReservations } = useReservations();
+  const statusWalletAddress = useMemo(() => preferredWalletAddress(wallets), [wallets]);
 
   const [classes, setClasses] = useState<GymClass[]>([]);
   const [classAsOfISO, setClassAsOfISO] = useState<string>("");
@@ -687,6 +705,7 @@ function CalendarInner() {
                                           headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
                                           body: JSON.stringify({
                                             message: `__RESERVE_CLASS__:${c.id}`,
+                                            walletAddress: statusWalletAddress,
                                             session: {
                                               gymName: "Erie Community Center",
                                               timezone: clientTz || "America/Denver",

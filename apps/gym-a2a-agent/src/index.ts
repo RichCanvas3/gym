@@ -1,7 +1,8 @@
 import { keccak_256 } from "@noble/hashes/sha3";
 import { Point, recoverPublicKey } from "@noble/secp256k1";
 import { hashDelegation } from "@metamask/smart-accounts-kit/utils";
-import { createPublicClient, hashTypedData, http, parseAbi, recoverTypedDataAddress } from "viem";
+import { getSmartAccountsEnvironment } from "@metamask/smart-accounts-kit";
+import { concatHex, createPublicClient, hashTypedData, http, keccak256 as keccak256Hex, parseAbi, recoverTypedDataAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { sepolia } from "viem/chains";
 
@@ -106,6 +107,10 @@ type SessionPackageRow = {
   permissions_version: string;
   permissions_hash: string;
   encrypted_package_json: string;
+  encryption_key_id: string | null;
+  session_generation: number;
+  revoked_at_iso: string | null;
+  revocation_reason: string | null;
   expires_at_iso: string;
   created_at_iso: string;
   updated_at_iso: string;
@@ -122,6 +127,7 @@ type RuntimeSessionPackage = {
     validAfter: number;
     validUntil: number;
   };
+  sessionGeneration: number;
   signedDelegation: {
     delegate: `0x${string}`;
     delegator: `0x${string}`;
@@ -138,6 +144,7 @@ type CoreMcpDelegationClaims = {
   aud: "urn:mcp:server:core";
   sub: string;
   chainId: number;
+  sessionGeneration: number;
   accountAddress: string;
   agentHandle: string;
   principalSmartAccount: `0x${string}`;
@@ -151,13 +158,23 @@ type CoreMcpDelegationClaims = {
   signedDelegation: RuntimeSessionPackage["signedDelegation"];
   issuedAtISO: string;
   expiresAtISO: string;
-  nonce: string;
+  jti: string;
+  usageLimit: number;
 };
 
 type CoreMcpDelegationEnvelope = {
+  v: 2;
+  typ: "urn:agentic-trust:mcp-delegation-envelope";
+  alg: "session-message+hmac-sha256";
+  kid: string;
   claims: CoreMcpDelegationClaims;
   sessionSignature: `0x${string}`;
   issuerSignature: string;
+};
+
+type VersionedSecretBundle = {
+  activeKid: string;
+  keys: Record<string, string>;
 };
 
 type SessionInitRow = {
@@ -235,25 +252,37 @@ function bytesToHex(bytes: Uint8Array): string {
 }
 
 function normalizeAddress(addr: string): string {
-  const a = (addr ?? "").trim().toLowerCase();
-  if (!a.startsWith("0x")) return "";
-  if (a.length !== 42) return "";
-  if (!/^0x[0-9a-f]{40}$/.test(a)) return "";
-  return a;
+  const raw = (addr ?? "").trim().toLowerCase();
+  if (!raw) return "";
+  const a = raw.startsWith("0x") ? raw.slice(2) : raw;
+  if (!/^[0-9a-f]+$/.test(a)) return "";
+  if (a.length === 40) return `0x${a}`;
+  if (a.length === 64) return `0x${a.slice(-40)}`;
+  return "";
+}
+
+function addressLike(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const rec = value as Record<string, unknown>;
+    const nested = rec.address ?? rec.account ?? rec.value ?? rec.hex;
+    if (typeof nested === "string") return nested;
+  }
+  return "";
 }
 
 function utf8Bytes(s: string): Uint8Array {
   return new TextEncoder().encode(s);
 }
 
-function keccak256(bytes: Uint8Array): Uint8Array {
+function keccak256Bytes(bytes: Uint8Array): Uint8Array {
   return keccak_256.create().update(bytes).digest();
 }
 
 function ethPersonalMessageHash(message: string): Uint8Array {
   const msgBytes = utf8Bytes(message);
   const prefix = utf8Bytes(`\u0019Ethereum Signed Message:\n${msgBytes.length}`);
-  return keccak256(new Uint8Array([...prefix, ...msgBytes]));
+  return keccak256Bytes(new Uint8Array([...prefix, ...msgBytes]));
 }
 
 function pubkeyToEthAddress(pubkey: Uint8Array): string {
@@ -268,7 +297,7 @@ function pubkeyToEthAddress(pubkey: Uint8Array): string {
     uncompressed65 = pubkey;
   }
   const raw = uncompressed65[0] === 4 ? uncompressed65.slice(1) : uncompressed65;
-  const h = keccak256(raw);
+  const h = keccak256Bytes(raw);
   const addr = h.slice(h.length - 20);
   return bytesToHex(addr);
 }
@@ -394,6 +423,10 @@ async function ensureSchema(db: D1Database) {
       updated_at_iso TEXT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_a2a_session_packages_handle ON a2a_session_packages(agent_handle, updated_at_iso DESC)`,
+    `ALTER TABLE a2a_session_packages ADD COLUMN encryption_key_id TEXT`,
+    `ALTER TABLE a2a_session_packages ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE a2a_session_packages ADD COLUMN revoked_at_iso TEXT`,
+    `ALTER TABLE a2a_session_packages ADD COLUMN revocation_reason TEXT`,
     `CREATE TABLE IF NOT EXISTS a2a_session_inits (
       account_address TEXT PRIMARY KEY,
       agent_handle TEXT NOT NULL,
@@ -407,6 +440,15 @@ async function ensureSchema(db: D1Database) {
       updated_at_iso TEXT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_a2a_session_inits_handle ON a2a_session_inits(agent_handle, updated_at_iso DESC)`,
+    `CREATE TABLE IF NOT EXISTS a2a_session_package_revocations (
+      revocation_id TEXT PRIMARY KEY,
+      account_address TEXT NOT NULL,
+      session_generation INTEGER,
+      reason TEXT,
+      revoked_at_iso TEXT NOT NULL,
+      created_at_iso TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_a2a_session_package_revocations_account ON a2a_session_package_revocations(account_address, revoked_at_iso DESC)`,
   ];
   for (const sql of stmts) {
     try {
@@ -455,6 +497,8 @@ async function sha256Base64Url(value: string): Promise<string> {
   return base64UrlEncodeBytes(new Uint8Array(digest));
 }
 
+const MCP_TOKEN_USAGE_LIMIT = 64;
+
 async function sessionPackageSecretKey(env: Env): Promise<CryptoKey> {
   const secret = String(env.A2A_SESSION_PACKAGE_SECRET ?? "").trim();
   if (!secret) throw new Error("missing_session_package_secret");
@@ -501,22 +545,92 @@ function base64UrlDecodeText(value: string): string {
 }
 
 function normalizeHexString(value: unknown): `0x${string}` | null {
-  const s = String(value ?? "").trim();
-  if (!/^0x[0-9a-fA-F]+$/.test(s)) return null;
-  return s.toLowerCase() as `0x${string}`;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return `0x${Math.trunc(value).toString(16)}` as `0x${string}`;
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return null;
+    if (s === "0x" || s === "0X") return "0x00";
+    if (/^0x[0-9a-fA-F]+$/i.test(s)) return `0x${s.slice(2).toLowerCase()}` as `0x${string}`;
+    if (/^[0-9a-fA-F]+$/.test(s)) return `0x${s.toLowerCase()}` as `0x${string}`;
+    if (/^\d+$/.test(s)) return `0x${BigInt(s).toString(16)}` as `0x${string}`;
+    return null;
+  }
+  if (value && typeof value === "object") {
+    const rec = value as Record<string, unknown>;
+    const nested = rec.hex ?? rec.value ?? rec._hex ?? rec.data;
+    if (nested !== undefined) return normalizeHexString(nested);
+  }
+  if (Array.isArray(value) && value.every((part) => typeof part === "number" && Number.isFinite(part) && part >= 0 && part <= 255)) {
+    return bytesToHex(Uint8Array.from(value)) as `0x${string}`;
+  }
+  return null;
+}
+
+function signedDelegationShape(value: unknown): Record<string, unknown> {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  const msg =
+    raw && raw.message && typeof raw.message === "object"
+      ? (raw.message as Record<string, unknown>)
+      : raw && raw.delegation && typeof raw.delegation === "object"
+        ? (raw.delegation as Record<string, unknown>)
+        : raw;
+  return {
+    rawKeys: raw ? Object.keys(raw).slice(0, 12) : [],
+    msgKeys: msg ? Object.keys(msg).slice(0, 12) : [],
+    delegateType: typeof msg?.delegate,
+    delegatorType: typeof msg?.delegator,
+    authorityType: typeof msg?.authority,
+    saltType: typeof msg?.salt,
+    signatureType: typeof (raw?.signature ?? raw?.sig ?? msg?.signature ?? msg?.sig),
+    delegatePreview: typeof msg?.delegate === "string" ? String(msg.delegate).slice(0, 18) : null,
+    delegatorPreview: typeof msg?.delegator === "string" ? String(msg.delegator).slice(0, 18) : null,
+    authorityPreview: typeof msg?.authority === "string" ? String(msg.authority).slice(0, 18) : null,
+    saltPreview: typeof msg?.salt === "string" ? String(msg.salt).slice(0, 18) : null,
+    signaturePreview: typeof (raw?.signature ?? raw?.sig ?? msg?.signature ?? msg?.sig) === "string"
+      ? String(raw?.signature ?? raw?.sig ?? msg?.signature ?? msg?.sig).slice(0, 18)
+      : null,
+    delegateLength: typeof msg?.delegate === "string" ? String(msg.delegate).length : null,
+    delegatorLength: typeof msg?.delegator === "string" ? String(msg.delegator).length : null,
+    authorityLength: typeof msg?.authority === "string" ? String(msg.authority).length : null,
+    saltLength: typeof msg?.salt === "string" ? String(msg.salt).length : null,
+    signatureLength: typeof (raw?.signature ?? raw?.sig ?? msg?.signature ?? msg?.sig) === "string"
+      ? String(raw?.signature ?? raw?.sig ?? msg?.signature ?? msg?.sig).length
+      : null,
+  };
 }
 
 function normalizeSignedDelegation(value: unknown): RuntimeSessionPackage["signedDelegation"] | null {
   const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
-  const msg = raw && raw.message && typeof raw.message === "object" ? (raw.message as Record<string, unknown>) : raw;
+  const msg =
+    raw && raw.message && typeof raw.message === "object"
+      ? (raw.message as Record<string, unknown>)
+      : raw && raw.delegation && typeof raw.delegation === "object"
+        ? (raw.delegation as Record<string, unknown>)
+        : raw;
   if (!msg) return null;
-  const delegate = normalizeAddress(String(msg.delegate ?? ""));
-  const delegator = normalizeAddress(String(msg.delegator ?? ""));
-  const authority = normalizeAddress(String(msg.authority ?? ""));
+  const delegate = normalizeAddress(addressLike(msg.delegate));
+  const delegator = normalizeAddress(addressLike(msg.delegator));
+  const authority = normalizeHexString(msg.authority);
   const salt = normalizeHexString(msg.salt);
-  const signature = normalizeHexString(raw?.signature ?? msg.signature);
+  const signature = normalizeHexString(raw?.signature ?? raw?.sig ?? msg.signature ?? msg.sig);
   const caveats = Array.isArray(msg.caveats) ? msg.caveats : [];
-  if (!delegate || !delegator || !authority || !salt || !signature) return null;
+  if (!delegate || !delegator || !authority || !salt || !signature) {
+    try {
+      console.log("[a2a-session-package] invalid signed delegation details", {
+        delegateOk: Boolean(delegate),
+        delegatorOk: Boolean(delegator),
+        authorityOk: Boolean(authority),
+        saltOk: Boolean(salt),
+        signatureOk: Boolean(signature),
+        shape: signedDelegationShape(value),
+      });
+    } catch {
+      // ignore logging failures
+    }
+    return null;
+  }
   return {
     delegate: delegate as `0x${string}`,
     delegator: delegator as `0x${string}`,
@@ -540,6 +654,7 @@ function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
     aud: claims.aud,
     sub: claims.sub,
     chainId: claims.chainId,
+    sessionGeneration: claims.sessionGeneration,
     accountAddress: claims.accountAddress,
     agentHandle: claims.agentHandle,
     principalSmartAccount: claims.principalSmartAccount,
@@ -553,7 +668,8 @@ function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
     signedDelegation: claims.signedDelegation,
     issuedAtISO: claims.issuedAtISO,
     expiresAtISO: claims.expiresAtISO,
-    nonce: claims.nonce,
+    jti: claims.jti,
+    usageLimit: claims.usageLimit,
   });
 }
 
@@ -568,6 +684,7 @@ async function loadRuntimeSessionPackage(env: Env, accountAddress: string): Prom
   const status = await sessionPackageStatus(env.DB, accountAddress);
   if (!status.hasPackage) throw new Error("missing_session_package");
   if (status.expired) throw new Error("session_package_expired");
+  if (status.revoked) throw new Error("session_package_revoked");
   if (!status.ready) throw new Error("session_package_not_ready");
   const row = await getSessionPackageRow(env.DB, accountAddress);
   if (!row) throw new Error("missing_session_package_row");
@@ -599,6 +716,7 @@ async function loadRuntimeSessionPackage(env: Env, accountAddress: string): Prom
       validAfter: sessionValidAfter,
       validUntil: sessionValidUntil,
     },
+    sessionGeneration: Number(row.session_generation ?? 1),
     signedDelegation,
   };
 }
@@ -615,6 +733,7 @@ async function mintCoreMcpDelegationToken(env: Env, accountAddress: string): Pro
     aud: "urn:mcp:server:core",
     sub: runtime.row.account_address,
     chainId: runtime.row.chain_id,
+    sessionGeneration: runtime.sessionGeneration,
     accountAddress: runtime.row.account_address,
     agentHandle: runtime.row.agent_handle,
     principalSmartAccount: runtime.row.principal_smart_account as `0x${string}`,
@@ -628,13 +747,18 @@ async function mintCoreMcpDelegationToken(env: Env, accountAddress: string): Pro
     signedDelegation: runtime.signedDelegation,
     issuedAtISO,
     expiresAtISO: new Date(maxExpiresAtMs).toISOString(),
-    nonce: `core_${crypto.randomUUID()}`,
+    jti: `core_${crypto.randomUUID()}`,
+    usageLimit: MCP_TOKEN_USAGE_LIMIT,
   };
   const signer = privateKeyToAccount(runtime.sessionKey.privateKey);
   const canonical = coreMcpClaimsCanonicalString(claims);
   const sessionSignature = await signer.signMessage({ message: canonical });
   const issuerSignature = await signCoreMcpClaimsWithIssuer(env, claims);
   const envelope: CoreMcpDelegationEnvelope = {
+    v: 2,
+    typ: "urn:agentic-trust:mcp-delegation-envelope",
+    alg: "session-message+hmac-sha256",
+    kid: "default",
     claims,
     sessionSignature,
     issuerSignature,
@@ -652,6 +776,11 @@ const A2A_WEB_AUTH_MAGIC_VALUE = "0x1626ba7e";
 const A2A_WEB_AUTH_DOMAIN_NAME = "GymA2AWebAuth";
 const A2A_WEB_AUTH_DOMAIN_VERSION = "1";
 const ERC1271_ABI = parseAbi(["function isValidSignature(bytes32,bytes) view returns (bytes4)"]);
+const DELEGATION_MANAGER_ABI = parseAbi([
+  "function getDomainHash() view returns (bytes32)",
+  "function getDelegationHash((address delegate,address delegator,bytes32 authority,(address enforcer,bytes terms,bytes args)[] caveats,uint256 salt,bytes signature) _input) view returns (bytes32)",
+  "function isValidSignature(bytes32,bytes) view returns (bytes4)",
+]);
 const DEFAULT_CHAIN_ID = 11155111;
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const SESSION_TTL_MS = 15 * 60 * 1000;
@@ -861,6 +990,7 @@ async function getSessionPackageRow(db: D1Database, accountAddress: string): Pro
   const row = await db.prepare(
     `SELECT account_address, agent_handle, principal_smart_account, principal_owner_eoa, agent_id, chain_id,
       session_key_address, session_aa, permissions_version, permissions_hash, encrypted_package_json,
+      encryption_key_id, session_generation, revoked_at_iso, revocation_reason,
       expires_at_iso, created_at_iso, updated_at_iso
      FROM a2a_session_packages WHERE account_address = ? LIMIT 1`
   )
@@ -945,11 +1075,13 @@ async function sessionPackageStatus(db: D1Database, accountAddress: string) {
   const nowMs = Date.now();
   const expiresAtMs = row?.expires_at_iso ? Date.parse(row.expires_at_iso) : Number.NaN;
   const expired = !row?.expires_at_iso || Number.isNaN(expiresAtMs) || expiresAtMs <= nowMs;
-  const ready = !!row && !expired && row.permissions_hash === permissionsHash && row.permissions_version === SESSION_PACKAGE_PERMISSIONS_VERSION;
+  const revoked = !!row?.revoked_at_iso;
+  const ready = !!row && !expired && !revoked && row.permissions_hash === permissionsHash && row.permissions_version === SESSION_PACKAGE_PERMISSIONS_VERSION;
   return {
     ready,
     hasPackage: !!row,
     expired,
+    revoked,
     permissionsVersion: SESSION_PACKAGE_PERMISSIONS_VERSION,
     permissionsHash,
     requiredPermissions: SESSION_PACKAGE_REQUIRED_PERMISSIONS,
@@ -961,8 +1093,11 @@ async function sessionPackageStatus(db: D1Database, accountAddress: string) {
           principalOwnerEoa: row.principal_owner_eoa,
           agentId: row.agent_id,
           chainId: row.chain_id,
+          sessionGeneration: Number(row.session_generation ?? 1),
           sessionKeyAddress: row.session_key_address,
           sessionAA: row.session_aa,
+          revokedAtISO: row.revoked_at_iso,
+          revocationReason: row.revocation_reason,
           expiresAtISO: row.expires_at_iso,
           createdAtISO: row.created_at_iso,
           updatedAtISO: row.updated_at_iso,
@@ -994,12 +1129,14 @@ async function upsertSessionPackage(db: D1Database, env: Env, args: {
   if (!String(sessionKey.privateKey ?? "").trim()) throw new Error("missing_session_private_key");
   if (!String(signedDelegation.signature ?? "").trim()) throw new Error("missing_signed_delegation");
   if (!sessionAA) throw new Error("invalid_session_aa");
-  if (!normalizedSignedDelegation) throw new Error("invalid_signed_delegation");
+  if (!normalizedSignedDelegation) throw new Error(`invalid_signed_delegation:${JSON.stringify(signedDelegationShape(signedDelegation))}`);
   if (normalizedSignedDelegation.delegate !== sessionAA) throw new Error("session_package_delegate_mismatch");
   if (normalizedSignedDelegation.delegator !== normalizeAddress(args.principalSmartAccount)) throw new Error("session_package_principal_mismatch");
   if (!(await verifyOriginalDelegationSignature(args.chainId, normalizeAddress(args.principalSmartAccount) as `0x${string}`, normalizedSignedDelegation))) {
     throw new Error("invalid_original_signed_delegation");
   }
+  const existing = await getSessionPackageRow(db, args.accountAddress);
+  const nextGeneration = existing ? Number(existing.session_generation ?? 1) + 1 : 1;
   const permissionsHash = await requiredPermissionsHash();
   const encryptedPackageJson = await encryptSessionPackage(env, args.sessionPackage);
   const now = nowISO();
@@ -1007,8 +1144,8 @@ async function upsertSessionPackage(db: D1Database, env: Env, args: {
     `INSERT INTO a2a_session_packages (
       account_address, agent_handle, principal_smart_account, principal_owner_eoa, agent_id, chain_id,
       session_key_address, session_aa, permissions_version, permissions_hash, encrypted_package_json,
-      expires_at_iso, created_at_iso, updated_at_iso
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      session_generation, revoked_at_iso, revocation_reason, expires_at_iso, created_at_iso, updated_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(account_address) DO UPDATE SET
       agent_handle = excluded.agent_handle,
       principal_smart_account = excluded.principal_smart_account,
@@ -1020,6 +1157,9 @@ async function upsertSessionPackage(db: D1Database, env: Env, args: {
       permissions_version = excluded.permissions_version,
       permissions_hash = excluded.permissions_hash,
       encrypted_package_json = excluded.encrypted_package_json,
+      session_generation = excluded.session_generation,
+      revoked_at_iso = NULL,
+      revocation_reason = NULL,
       expires_at_iso = excluded.expires_at_iso,
       updated_at_iso = excluded.updated_at_iso`
   )
@@ -1035,6 +1175,9 @@ async function upsertSessionPackage(db: D1Database, env: Env, args: {
       SESSION_PACKAGE_PERMISSIONS_VERSION,
       permissionsHash,
       encryptedPackageJson,
+      nextGeneration,
+      null,
+      null,
       expiresAtISO,
       now,
       now,
@@ -1042,6 +1185,24 @@ async function upsertSessionPackage(db: D1Database, env: Env, args: {
     .run();
   await clearSessionInit(db, args.accountAddress).catch(() => null);
   return await sessionPackageStatus(db, args.accountAddress);
+}
+
+async function revokeSessionPackage(db: D1Database, accountAddress: string, reason?: string | null) {
+  const row = await getSessionPackageRow(db, accountAddress);
+  if (!row) throw new Error("missing_session_package");
+  const revokedAtISO = nowISO();
+  const revocationReason = okOrNull(reason ?? null);
+  await db.prepare(
+    `UPDATE a2a_session_packages
+     SET revoked_at_iso = ?, revocation_reason = ?, updated_at_iso = ?
+     WHERE account_address = ?`,
+  ).bind(revokedAtISO, revocationReason, revokedAtISO, accountAddress.trim()).run();
+  await db.prepare(
+    `INSERT INTO a2a_session_package_revocations (
+      revocation_id, account_address, session_generation, reason, revoked_at_iso, created_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(`rev_${crypto.randomUUID()}`, accountAddress.trim(), Number(row.session_generation ?? 1), revocationReason, revokedAtISO, revokedAtISO).run();
+  return await sessionPackageStatus(db, accountAddress);
 }
 
 async function recoverWebAuthSigner(row: A2AWebAuthChallengeRow, signature: string): Promise<string> {
@@ -1080,21 +1241,62 @@ async function verifyOriginalDelegationSignature(
   signedDelegation: RuntimeSessionPackage["signedDelegation"],
 ): Promise<boolean> {
   const client = publicClientForChain(chainId);
-  const delegationHash = hashDelegation({
-    delegate: signedDelegation.delegate,
-    delegator: signedDelegation.delegator,
-    authority: signedDelegation.authority,
-    caveats: signedDelegation.caveats as never,
-    salt: signedDelegation.salt,
-    signature: signedDelegation.signature,
+  const env = getSmartAccountsEnvironment(chainId);
+  const delegationManager = normalizeAddress(String((env as any)?.DelegationManager ?? "")) as `0x${string}` | "";
+  if (!delegationManager) throw new Error(`missing_delegation_manager_for_chain_${chainId}`);
+
+  const delegationHash = await (async () => {
+    try {
+      const saltUint = BigInt(signedDelegation.salt);
+      return await client.readContract({
+        address: delegationManager,
+        abi: DELEGATION_MANAGER_ABI,
+        functionName: "getDelegationHash",
+        args: [
+          {
+            delegate: signedDelegation.delegate,
+            delegator: signedDelegation.delegator,
+            authority: signedDelegation.authority as `0x${string}`,
+            caveats: signedDelegation.caveats as never,
+            salt: saltUint,
+            signature: signedDelegation.signature,
+          } as never,
+        ],
+      });
+    } catch {
+      return hashDelegation({
+        delegate: signedDelegation.delegate,
+        delegator: signedDelegation.delegator,
+        authority: signedDelegation.authority,
+        caveats: signedDelegation.caveats as never,
+        salt: signedDelegation.salt,
+        signature: signedDelegation.signature,
+      });
+    }
+  })();
+
+  // Delegation signatures are over EIP-712 typed-data hash:
+  // keccak256(0x1901 ++ DelegationManager.domainSeparator ++ delegationStructHash)
+  const domainHash = await client.readContract({
+    address: delegationManager,
+    abi: DELEGATION_MANAGER_ABI,
+    functionName: "getDomainHash",
+    args: [],
   });
-  const result = await client.readContract({
-    address: principalSmartAccount,
-    abi: ERC1271_ABI,
-    functionName: "isValidSignature",
-    args: [delegationHash, signedDelegation.signature],
-  });
-  return String(result).toLowerCase() === A2A_WEB_AUTH_MAGIC_VALUE;
+  const typedDataHash = keccak256Hex(concatHex(["0x1901", domainHash, delegationHash]));
+
+  // Validate via delegator (principal smart account) ERC-1271.
+  try {
+    const result = await client.readContract({
+      address: principalSmartAccount,
+      abi: ERC1271_ABI,
+      functionName: "isValidSignature",
+      args: [typedDataHash, signedDelegation.signature],
+    });
+    return String(result).toLowerCase() === A2A_WEB_AUTH_MAGIC_VALUE;
+  } catch {
+    return false;
+  }
 }
 
 async function upsertGymAgentProfile(
@@ -1590,6 +1792,23 @@ export default {
       }
     }
 
+    if (url.pathname === "/api/a2a/session/revoke" && req.method === "POST") {
+      const want = (env.A2A_ADMIN_KEY ?? "").trim();
+      const got = (req.headers.get("x-admin-key") ?? "").trim();
+      if (!want || got !== want) return unauthorized("Unauthorized (bad x-admin-key)");
+      const body = await readBodyJson(req).catch((e) => ({ __error__: String((e as any)?.message ?? e) }));
+      if (body?.__error__) return badRequest("Bad JSON body", { detail: body.__error__ });
+      const accountAddress = String(body?.accountAddress ?? "").trim();
+      const reason = String(body?.reason ?? "").trim() || null;
+      if (!accountAddress) return badRequest("Missing accountAddress");
+      try {
+        const status = await revokeSessionPackage(env.DB, accountAddress, reason);
+        return json({ ok: true, ...status });
+      } catch (e) {
+        return badRequest("Failed to revoke session package", { detail: String((e as any)?.message ?? e) });
+      }
+    }
+
     if (url.pathname === "/api/a2a" && req.method === "POST") {
       if (!handle) return notFound("Missing handle in host.");
       try {
@@ -1678,7 +1897,20 @@ export default {
           raw: webSession ? undefined : forwarded.raw ?? null,
         });
       } catch (e) {
-        return json({ ok: false, error: "forward_failed", detail: String((e as any)?.message ?? e) }, 502);
+        const msg = String((e as any)?.message ?? e);
+        if (msg === "missing_langgraph_env") {
+          return json({ ok: false, error: "missing_langgraph_env", detail: "Worker is missing LANGGRAPH_DEPLOYMENT_URL and/or LANGSMITH_API_KEY." }, 500);
+        }
+        if (msg.startsWith("langgraph_error:")) {
+          const m = msg.match(/^langgraph_error:(\d+):(.+)$/);
+          const upstreamStatus = m ? Number(m[1]) : null;
+          const upstream = m ? m[2] : msg;
+          return json(
+            { ok: false, error: "langgraph_error", upstreamStatus, detail: upstream.slice(0, 800) },
+            upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : 502,
+          );
+        }
+        return json({ ok: false, error: "forward_failed", detail: msg }, 502);
       }
     }
 

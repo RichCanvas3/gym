@@ -6,6 +6,7 @@ export const dynamic = "force-dynamic";
 
 type Body = {
   sessionPackage?: unknown;
+  walletAddress?: unknown;
 };
 
 function a2aAgentBaseUrl(): string {
@@ -28,11 +29,15 @@ export async function POST(req: Request) {
   const authz = req.headers.get("authorization") ?? "";
   const body = (await req.json().catch(() => null)) as Body | null;
   const sessionPackage = body?.sessionPackage && typeof body.sessionPackage === "object" ? body.sessionPackage : null;
+  const walletAddress = typeof body?.walletAddress === "string" ? body.walletAddress.trim() : "";
   if (!sessionPackage) {
     return NextResponse.json({ ok: false, error: "missing_session_package" }, { status: 400 });
   }
 
-  const statusRes = await fetch(`${origin}/api/a2a/session/status`, {
+  const statusUrl = walletAddress
+    ? `${origin}/api/a2a/session/status?walletAddress=${encodeURIComponent(walletAddress)}`
+    : `${origin}/api/a2a/session/status`;
+  const statusRes = await fetch(statusUrl, {
     headers: { authorization: authz },
     cache: "no-store",
   });

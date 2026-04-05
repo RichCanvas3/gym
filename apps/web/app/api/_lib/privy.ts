@@ -243,31 +243,45 @@ function extractEmbeddedEoaFromPrivyUser(user: unknown): `0x${string}` | null {
   return null;
 }
 
-export async function eoaAddressForPrivyDid(did: string): Promise<`0x${string}` | null> {
+function linkedWalletAddress(user: unknown, preferredAddress: unknown): `0x${string}` | null {
+  const preferred = normalizeEthAddress(preferredAddress);
+  if (!preferred) return null;
+  const wallets = extractEthereumWalletsFromPrivyUser(user);
+  for (const rec of wallets) {
+    if (walletAddressOf(rec) === preferred) return preferred;
+  }
+  return null;
+}
+
+async function privyUserForDid(did: string): Promise<unknown | null> {
   const clean = String(did ?? "").trim();
   if (!clean) return null;
   try {
     const privy = privyClient();
-    const user = await (privy as unknown as { users: () => { _get: (id: string) => Promise<unknown> } })
+    return await (privy as unknown as { users: () => { _get: (id: string) => Promise<unknown> } })
       .users()
       ._get(clean);
-    return extractEoaFromPrivyUser(user);
   } catch {
     return null;
   }
 }
 
-export async function embeddedEoaAddressForPrivyDid(did: string): Promise<`0x${string}` | null> {
-  const clean = String(did ?? "").trim();
-  if (!clean) return null;
-  try {
-    const privy = privyClient();
-    const user = await (privy as unknown as { users: () => { _get: (id: string) => Promise<unknown> } })
-      .users()
-      ._get(clean);
-    return extractEmbeddedEoaFromPrivyUser(user);
-  } catch {
-    return null;
+export async function resolveEoaAddressForPrivyDid(did: string, preferredAddress?: unknown): Promise<`0x${string}` | null> {
+  const user = await privyUserForDid(did);
+  if (!user) return null;
+  const preferred = normalizeEthAddress(preferredAddress);
+  if (preferred) {
+    return linkedWalletAddress(user, preferred);
   }
+  return extractEoaFromPrivyUser(user);
+}
+
+export async function eoaAddressForPrivyDid(did: string): Promise<`0x${string}` | null> {
+  return resolveEoaAddressForPrivyDid(did);
+}
+
+export async function embeddedEoaAddressForPrivyDid(did: string): Promise<`0x${string}` | null> {
+  const user = await privyUserForDid(did);
+  return user ? extractEmbeddedEoaFromPrivyUser(user) : null;
 }
 

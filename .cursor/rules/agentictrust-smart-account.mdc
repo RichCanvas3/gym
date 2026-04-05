@@ -1,13 +1,18 @@
 ---
-description: Use Agentic Trust MetaMask smart account, not Privy smart account
+description: Use MetaMask toolkit smart account and wallet signing only
 alwaysApply: true
 ---
 
 # Agent Smart Account Rule
 
-- Do not use Privy built-in smart accounts for this project.
-- Use Privy only as the user's EOA wallet/auth source.
-- The smart account used for auth, delegation, and session packaging must be the MetaMask-based smart account associated with the registered gym agent.
+- Use the MetaMask Smart Accounts Toolkit (old MetaMask Delegation Toolkit) for all smart-account and delegation behavior.
+- Do not use Privy built-in smart accounts, Privy delegation helpers, or any Privy-specific smart-account abstraction in this project.
+- Use Privy only for auth plus wallet access.
+- The smart account used for auth, delegation, session packaging, and downstream authorization must be the MetaMask-toolkit smart account associated with the registered gym agent.
+- Wallet signing priority is strict:
+  1. Use the connected MetaMask EOA wallet when available.
+  2. Only if MetaMask is not connected, use the Privy embedded social wallet EOA.
+- Never fall back to a Privy smart account or Privy delegation path.
 - Treat agent registration and delegation/session-package bootstrap as separate flows.
 - If the registered agent exists but delegation/session state is missing, do not redirect to registration. Fail explicitly or start the delegation bootstrap flow.
-- When validating auth, target the registered agent smart account and its associated owner EOA, not a Privy smart account abstraction.
+- When validating auth, target the registered MetaMask-toolkit smart account and its associated owner EOA, not a Privy smart account abstraction.

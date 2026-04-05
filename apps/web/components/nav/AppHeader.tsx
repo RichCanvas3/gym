@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { useWallets } from "@privy-io/react-auth";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { useCart } from "@/components/cart/CartProvider";
 import { useReservations } from "@/components/reservations/ReservationsProvider";
@@ -46,16 +47,33 @@ function extractTelegramUserId(user: unknown): string | null {
   return null;
 }
 
+function preferredWalletAddress(
+  wallets: Array<{ address?: string; walletClientType?: string }>,
+): string | null {
+  const external = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return Boolean(kind) && kind !== "privy" && kind !== "privy-v2" && typeof wallet.address === "string" && wallet.address.trim();
+  });
+  if (external?.address) return external.address.trim();
+  const embedded = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return (kind === "privy" || kind === "privy-v2") && typeof wallet.address === "string" && wallet.address.trim();
+  });
+  return embedded?.address?.trim() || null;
+}
+
 export function AppHeader() {
   const router = useRouter();
   const pathname = usePathname();
   const { authenticated, accountAddress, user, login, logout, getAccessToken } = useAuth();
+  const { wallets } = useWallets();
   const { lines, clear } = useCart();
   const { reservations, clearReservations } = useReservations();
 
   const cartCount = useMemo(() => lines.reduce((n, l) => n + (l.quantity || 0), 0), [lines]);
   const resCount = reservations.length;
   const telegramUserId = useMemo(() => extractTelegramUserId(user), [user]);
+  const statusWalletAddress = useMemo(() => preferredWalletAddress(wallets), [wallets]);
   const [stravaConnected, setStravaConnected] = useState<boolean | null>(null);
   const [googleCalendarConnected, setGoogleCalendarConnected] = useState<boolean | null>(null);
   const [telegramConnected, setTelegramConnected] = useState<boolean | null>(null);
@@ -174,7 +192,7 @@ export function AppHeader() {
       }
       try {
         const tok = await getAccessToken();
-        const j = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
+        const j = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, walletAddress: statusWalletAddress, cacheMs: 60_000 });
         const rec = j && typeof j === "object" ? (j as Record<string, unknown>) : {};
         const saved = rec.savedBaseName;
         const discovered = rec.discovered && typeof rec.discovered === "object" ? (rec.discovered as Record<string, unknown>) : {};
@@ -202,7 +220,7 @@ export function AppHeader() {
     return () => {
       cancelled = true;
     };
-  }, [authenticated, getAccessToken, accountAddress]);
+  }, [authenticated, getAccessToken, accountAddress, statusWalletAddress]);
 
   useEffect(() => {
     if (!authenticated) return;

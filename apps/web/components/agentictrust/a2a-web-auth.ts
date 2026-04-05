@@ -7,6 +7,7 @@ import {
 import { signAgentChallengeWithSmartAccount } from "./session-package-builder";
 
 const STORAGE_KEY = "climb_gym_a2a_web_auth_v1";
+const inFlightAuthSessions = new Map<string, Promise<string>>();
 
 type WalletLike = {
   address?: string;
@@ -143,6 +144,11 @@ async function providerAccounts(provider: {
 function preferredWallet(wallets: WalletLike[], walletAddress: string) {
   const target = normalizeAddress(walletAddress);
   const eligible = wallets.filter((wallet) => normalizeAddress(wallet.address) === target && typeof wallet.getEthereumProvider === "function");
+  const external = eligible.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return Boolean(kind) && kind !== "privy" && kind !== "privy-v2";
+  });
+  if (external) return external;
   const embedded = eligible.find((wallet) => {
     const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
     return kind === "privy" || kind === "privy-v2";
@@ -150,11 +156,24 @@ function preferredWallet(wallets: WalletLike[], walletAddress: string) {
   return embedded ?? null;
 }
 
+function preferredWalletAddress(wallets: WalletLike[]): string | null {
+  const external = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return Boolean(kind) && kind !== "privy" && kind !== "privy-v2" && normalizeAddress(wallet.address);
+  });
+  if (external?.address) return external.address.trim();
+  const embedded = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return (kind === "privy" || kind === "privy-v2") && normalizeAddress(wallet.address);
+  });
+  return embedded?.address?.trim() || null;
+}
+
 async function ethereumProviderForWallet(wallets: WalletLike[], walletAddress: string, chainId: number) {
   const target = normalizeAddress(walletAddress);
   const wallet = preferredWallet(wallets, walletAddress);
   if (!wallet) {
-    throw new Error(`No connected Privy wallet matches ${walletAddress}.`);
+    throw new Error(`No connected wallet matches ${walletAddress}.`);
   }
   if (wallet && typeof wallet.switchChain === "function") {
     await wallet.switchChain(chainId).catch(() => null);
@@ -169,11 +188,15 @@ async function ethereumProviderForWallet(wallets: WalletLike[], walletAddress: s
       }
     }
   }
-  throw new Error(`Privy wallet provider for ${walletAddress} is not ready or does not expose that account.`);
+  throw new Error(`Connected wallet provider for ${walletAddress} is not ready or does not expose that account.`);
 }
 
 async function ensureA2ADelegationPackage(args: EnsureArgs) {
-  const statusRes = await fetch("/api/a2a/session/status", {
+  const requestedWalletAddress = preferredWalletAddress(args.wallets);
+  const statusUrl = requestedWalletAddress
+    ? `/api/a2a/session/status?walletAddress=${encodeURIComponent(requestedWalletAddress)}`
+    : "/api/a2a/session/status";
+  const statusRes = await fetch(statusUrl, {
     headers: { authorization: `Bearer ${args.accessToken}` },
     cache: "no-store",
   });
@@ -207,7 +230,8 @@ async function ensureA2ADelegationPackage(args: EnsureArgs) {
 
   const initRes = await fetch("/api/a2a/session/init", {
     method: "POST",
-    headers: { authorization: `Bearer ${args.accessToken}` },
+    headers: { "content-type": "application/json", authorization: `Bearer ${args.accessToken}` },
+    body: JSON.stringify({ walletAddress: requestedWalletAddress }),
   });
   const initJson = (await initRes.json().catch(() => ({}))) as Record<string, unknown>;
   if (!initRes.ok || initJson.ok !== true) {
@@ -237,52 +261,66 @@ async function ensureA2ADelegationPackage(args: EnsureArgs) {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${args.accessToken}` },
     body: JSON.stringify({
+      walletAddress: requestedWalletAddress,
       selector: delegation.selector,
       signedDelegation: delegation.signedDelegation,
     }),
   });
   const storeJson = (await storeRes.json().catch(() => ({}))) as Record<string, unknown>;
   if (!storeRes.ok || storeJson.ok !== true) {
-    const err = typeof storeJson.error === "string" ? storeJson.error : "Failed to complete A2A session package.";
+    const err =
+      typeof storeJson.detail === "string" && storeJson.detail.trim()
+        ? storeJson.detail.trim()
+        : typeof storeJson.error === "string"
+          ? storeJson.error
+          : "Failed to complete A2A session package.";
     throw new Error(err);
   }
 }
 
 export async function ensureA2AWebAuthSession(args: EnsureArgs): Promise<string> {
-  const cached = !args.force ? getStoredA2AWebAuthSession(args.accountAddress) : null;
-  if (cached?.sessionToken) {
-    await ensureA2ADelegationPackage(args);
-    return cached.sessionToken;
-  }
+  const key = args.accountAddress.trim();
+  const existingInFlight = inFlightAuthSessions.get(key);
+  if (existingInFlight) return await existingInFlight;
 
-  console.info("[a2a-web-auth] creating challenge", { accountAddress: args.accountAddress });
-  const challengeRes = await fetch("/api/a2a/auth/challenge", {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${args.accessToken}` },
-    body: JSON.stringify({ origin: args.origin }),
-  });
-  const challengeJson = (await challengeRes.json().catch(() => ({}))) as ChallengeResponse;
-  if (!challengeRes.ok || challengeJson.ok !== true) {
-    const rec = challengeJson as Record<string, unknown>;
-    const err =
-      typeof rec.detail === "string" && rec.detail.trim()
-        ? rec.detail.trim()
-        : typeof rec.error === "string"
-          ? String(rec.error)
-          : "Failed to create A2A auth challenge.";
-    throw new Error(err);
-  }
+  const run = (async () => {
+    const cached = !args.force ? getStoredA2AWebAuthSession(args.accountAddress) : null;
+    if (cached?.sessionToken) {
+      await ensureA2ADelegationPackage(args);
+      return cached.sessionToken;
+    }
+    const requestedWalletAddress = preferredWalletAddress(args.wallets);
 
-  const challengeId = typeof challengeJson.challengeId === "string" ? challengeJson.challengeId.trim() : "";
-  const walletAddress = typeof challengeJson.challenge?.walletAddress === "string" ? challengeJson.challenge.walletAddress.trim() : "";
-  const chainId = typeof challengeJson.challenge?.chainId === "number" ? challengeJson.challenge.chainId : 11155111;
-  if (!walletAddress || !challengeId || !challengeJson.typedData) {
-    throw new Error("Challenge response was incomplete.");
-  }
+    console.info("[a2a-web-auth] creating challenge", { accountAddress: args.accountAddress });
+    const challengeRes = await fetch("/api/a2a/auth/challenge", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${args.accessToken}` },
+      body: JSON.stringify({ origin: args.origin, walletAddress: requestedWalletAddress }),
+    });
+    const challengeJson = (await challengeRes.json().catch(() => ({}))) as ChallengeResponse;
+    if (!challengeRes.ok || challengeJson.ok !== true) {
+      const rec = challengeJson as Record<string, unknown>;
+      const err =
+        typeof rec.detail === "string" && rec.detail.trim()
+          ? rec.detail.trim()
+          : typeof rec.error === "string"
+            ? String(rec.error)
+            : "Failed to create A2A auth challenge.";
+      throw new Error(err);
+    }
 
-  console.info("[a2a-web-auth] challenge ready", { challengeId, walletAddress, chainId });
-  const wallet = preferredWallet(args.wallets, walletAddress);
-  if (wallet) {
+    const challengeId = typeof challengeJson.challengeId === "string" ? challengeJson.challengeId.trim() : "";
+    const walletAddress = typeof challengeJson.challenge?.walletAddress === "string" ? challengeJson.challenge.walletAddress.trim() : "";
+    const chainId = typeof challengeJson.challenge?.chainId === "number" ? challengeJson.challenge.chainId : 11155111;
+    if (!walletAddress || !challengeId || !challengeJson.typedData) {
+      throw new Error("Challenge response was incomplete.");
+    }
+
+    console.info("[a2a-web-auth] challenge ready", { challengeId, walletAddress, chainId });
+    const wallet = preferredWallet(args.wallets, walletAddress);
+    if (!wallet) {
+      throw new Error(`No connected wallet matches ${walletAddress}.`);
+    }
     console.info("[a2a-web-auth] matched wallet", {
       walletAddress,
       walletClientType: typeof wallet.walletClientType === "string" ? wallet.walletClientType : null,
@@ -291,87 +329,94 @@ export async function ensureA2AWebAuthSession(args: EnsureArgs): Promise<string>
       console.info("[a2a-web-auth] switching chain", { chainId });
       await wallet.switchChain(chainId).catch(() => null);
     }
-  } else {
-    console.info("[a2a-web-auth] no matching wallet object; using Privy signTypedData hook", { walletAddress });
-  }
-  const typed = challengeJson.typedData as {
-    domain: Record<string, unknown>;
-    types: Record<string, Array<Record<string, unknown>>>;
-    primaryType: string;
-    message: Record<string, unknown>;
-  };
-  console.info("[a2a-web-auth] signing typed data", { primaryType: typed.primaryType });
-  const statusRes = await fetch("/api/a2a/session/status", {
-    headers: { authorization: `Bearer ${args.accessToken}` },
-    cache: "no-store",
-  });
-  const statusJson = (await statusRes.json().catch(() => ({}))) as SessionStatusResponse & Record<string, unknown>;
-  if (!statusRes.ok || statusJson.ok !== true) {
-    const err = typeof statusJson.detail === "string" ? statusJson.detail : typeof statusJson.error === "string" ? statusJson.error : "Failed to read A2A session status.";
-    throw new Error(err);
-  }
-  const challengePrincipalSmartAccount = typeof statusJson.principalSmartAccount === "string" ? statusJson.principalSmartAccount.trim() : "";
-  const rpcUrl = typeof statusJson.rpcUrl === "string" ? statusJson.rpcUrl.trim() : "";
-  if (!args.signTypedData || !args.signMessage) throw new Error("Privy signing hooks are unavailable.");
-  if (!challengePrincipalSmartAccount || !rpcUrl) throw new Error("Missing principal smart account or RPC URL for challenge signing.");
-  const signature = await signAgentChallengeWithSmartAccount({
-    chainId,
-    principalSmartAccount: challengePrincipalSmartAccount as `0x${string}`,
-    ownerAddress: walletAddress as `0x${string}`,
-    rpcUrl,
-    typedData: typed,
-    signTypedData: args.signTypedData,
-    signMessage: args.signMessage,
-  });
-  if (!signature.trim()) throw new Error("Smart account did not return a typed-data signature.");
-  console.info("[a2a-web-auth] signature received");
-
-  console.info("[a2a-web-auth] verifying challenge");
-  const verifyRes = await fetch("/api/a2a/auth/verify", {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${args.accessToken}` },
-    body: JSON.stringify({ challengeId, signature: signature.trim(), walletAddress }),
-  });
-  const verifyJson = (await verifyRes.json().catch(() => ({}))) as VerifyResponse;
-  if (!verifyRes.ok || verifyJson.ok !== true) {
-    const serialized =
-      (() => {
-        try {
-          return JSON.stringify(verifyJson);
-        } catch {
-          return "[unserializable]";
-        }
-      })();
-    console.error("[a2a-web-auth] verify failed", {
-      status: verifyRes.status,
-      challengeId,
-      walletAddress,
-      response: verifyJson,
-      serialized,
+    const typed = challengeJson.typedData as {
+      domain: Record<string, unknown>;
+      types: Record<string, Array<Record<string, unknown>>>;
+      primaryType: string;
+      message: Record<string, unknown>;
+    };
+    console.info("[a2a-web-auth] signing typed data", { primaryType: typed.primaryType });
+    const statusUrl = requestedWalletAddress
+      ? `/api/a2a/session/status?walletAddress=${encodeURIComponent(requestedWalletAddress)}`
+      : "/api/a2a/session/status";
+    const statusRes = await fetch(statusUrl, {
+      headers: { authorization: `Bearer ${args.accessToken}` },
+      cache: "no-store",
     });
-    const rec = verifyJson as Record<string, unknown>;
-    const err =
-      typeof rec.detail === "string" && rec.detail.trim()
-        ? rec.detail.trim()
-        : typeof rec.error === "string"
-          ? String(rec.error)
-          : `Failed to verify A2A auth challenge. response=${serialized}`;
-    throw new Error(err);
-  }
+    const statusJson = (await statusRes.json().catch(() => ({}))) as SessionStatusResponse & Record<string, unknown>;
+    if (!statusRes.ok || statusJson.ok !== true) {
+      const err = typeof statusJson.detail === "string" ? statusJson.detail : typeof statusJson.error === "string" ? statusJson.error : "Failed to read A2A session status.";
+      throw new Error(err);
+    }
+    const challengePrincipalSmartAccount = typeof statusJson.principalSmartAccount === "string" ? statusJson.principalSmartAccount.trim() : "";
+    const rpcUrl = typeof statusJson.rpcUrl === "string" ? statusJson.rpcUrl.trim() : "";
+    if (!args.signTypedData || !args.signMessage) throw new Error("Wallet signing hooks are unavailable.");
+    if (!challengePrincipalSmartAccount || !rpcUrl) throw new Error("Missing principal smart account or RPC URL for challenge signing.");
+    const signature = await signAgentChallengeWithSmartAccount({
+      chainId,
+      principalSmartAccount: challengePrincipalSmartAccount as `0x${string}`,
+      ownerAddress: walletAddress as `0x${string}`,
+      rpcUrl,
+      typedData: typed,
+      signTypedData: args.signTypedData,
+      signMessage: args.signMessage,
+    });
+    if (!signature.trim()) throw new Error("Smart account did not return a typed-data signature.");
+    console.info("[a2a-web-auth] signature received");
 
-  const sessionToken = typeof verifyJson.session?.sessionToken === "string" ? verifyJson.session.sessionToken.trim() : "";
-  const expiresAtISO = typeof verifyJson.session?.expiresAtISO === "string" ? verifyJson.session.expiresAtISO.trim() : "";
-  const sessionPrincipalSmartAccount = typeof verifyJson.session?.principalSmartAccount === "string" ? verifyJson.session.principalSmartAccount.trim() : "";
-  const agentHandle = typeof verifyJson.session?.agentHandle === "string" ? verifyJson.session.agentHandle.trim() : "";
-  if (!sessionToken || !expiresAtISO) throw new Error("A2A auth verify response was incomplete.");
-  saveStoredSession({
-    accountAddress: args.accountAddress,
-    sessionToken,
-    expiresAtISO,
-    walletAddress,
-    principalSmartAccount: sessionPrincipalSmartAccount,
-    agentHandle,
-  });
-  await ensureA2ADelegationPackage(args);
-  return sessionToken;
+    console.info("[a2a-web-auth] verifying challenge");
+    const verifyRes = await fetch("/api/a2a/auth/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${args.accessToken}` },
+      body: JSON.stringify({ challengeId, signature: signature.trim(), walletAddress }),
+    });
+    const verifyJson = (await verifyRes.json().catch(() => ({}))) as VerifyResponse;
+    if (!verifyRes.ok || verifyJson.ok !== true) {
+      const serialized =
+        (() => {
+          try {
+            return JSON.stringify(verifyJson);
+          } catch {
+            return "[unserializable]";
+          }
+        })();
+      console.error("[a2a-web-auth] verify failed", {
+        status: verifyRes.status,
+        challengeId,
+        walletAddress,
+        response: verifyJson,
+        serialized,
+      });
+      const rec = verifyJson as Record<string, unknown>;
+      const err =
+        typeof rec.detail === "string" && rec.detail.trim()
+          ? rec.detail.trim()
+          : typeof rec.error === "string"
+            ? String(rec.error)
+            : `Failed to verify A2A auth challenge. response=${serialized}`;
+      throw new Error(err);
+    }
+
+    const sessionToken = typeof verifyJson.session?.sessionToken === "string" ? verifyJson.session.sessionToken.trim() : "";
+    const expiresAtISO = typeof verifyJson.session?.expiresAtISO === "string" ? verifyJson.session.expiresAtISO.trim() : "";
+    const sessionPrincipalSmartAccount = typeof verifyJson.session?.principalSmartAccount === "string" ? verifyJson.session.principalSmartAccount.trim() : "";
+    const agentHandle = typeof verifyJson.session?.agentHandle === "string" ? verifyJson.session.agentHandle.trim() : "";
+    if (!sessionToken || !expiresAtISO) throw new Error("A2A auth verify response was incomplete.");
+    saveStoredSession({
+      accountAddress: args.accountAddress,
+      sessionToken,
+      expiresAtISO,
+      walletAddress,
+      principalSmartAccount: sessionPrincipalSmartAccount,
+      agentHandle,
+    });
+    await ensureA2ADelegationPackage(args);
+    return sessionToken;
+  })();
+  inFlightAuthSessions.set(key, run);
+  try {
+    return await run;
+  } finally {
+    if (inFlightAuthSessions.get(key) === run) inFlightAuthSessions.delete(key);
+  }
 }

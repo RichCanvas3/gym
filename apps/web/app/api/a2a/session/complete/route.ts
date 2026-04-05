@@ -6,6 +6,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type Body = {
+  walletAddress?: unknown;
   selector?: unknown;
   signedDelegation?: unknown;
   scDelegation?: unknown;
@@ -30,6 +31,7 @@ export async function POST(req: Request) {
   const origin = new URL(req.url).origin;
   const authz = req.headers.get("authorization") ?? "";
   const body = (await req.json().catch(() => null)) as Body | null;
+  const walletAddress = typeof body?.walletAddress === "string" ? body.walletAddress.trim() : "";
   const selector = typeof body?.selector === "string" ? body.selector.trim() : "";
   const signedDelegation = body?.signedDelegation && typeof body.signedDelegation === "object" ? body.signedDelegation : null;
   const scDelegation = body?.scDelegation && typeof body.scDelegation === "object" ? body.scDelegation : undefined;
@@ -37,7 +39,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: "missing_delegation" }, { status: 400 });
   }
 
-  const statusRes = await fetch(`${origin}/api/a2a/session/status`, {
+  const statusUrl = walletAddress
+    ? `${origin}/api/a2a/session/status?walletAddress=${encodeURIComponent(walletAddress)}`
+    : `${origin}/api/a2a/session/status`;
+  const statusRes = await fetch(statusUrl, {
     headers: { authorization: authz },
     cache: "no-store",
   });
@@ -89,11 +94,14 @@ export async function POST(req: Request) {
   const storeRes = await fetch(`${origin}/api/a2a/session/package`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: authz },
-    body: JSON.stringify({ sessionPackage }),
+    body: JSON.stringify({ sessionPackage, walletAddress }),
   });
   const storeJson = (await storeRes.json().catch(() => ({}))) as Record<string, unknown>;
   if (!storeRes.ok || storeJson.ok !== true) {
-    return NextResponse.json({ ok: false, error: "a2a_session_store_failed", detail: storeJson.error ?? storeJson }, { status: 502 });
+    return NextResponse.json(
+      { ok: false, error: "a2a_session_store_failed", detail: storeJson.detail ?? storeJson.error ?? storeJson },
+      { status: 502 },
+    );
   }
 
   return NextResponse.json(storeJson, { status: 200 });

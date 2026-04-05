@@ -5,6 +5,10 @@ import { requirePrivyAuth } from "../../../_lib/privy";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+type Body = {
+  walletAddress?: unknown;
+};
+
 function a2aAgentBaseUrl(): string {
   const u = String(process.env.A2A_AGENT_URL ?? "").trim();
   if (!u) throw new Error("Missing A2A_AGENT_URL");
@@ -27,9 +31,14 @@ export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
 
+  const body = (await req.json().catch(() => null)) as Body | null;
+  const walletAddress = typeof body?.walletAddress === "string" ? body.walletAddress.trim() : "";
   const origin = new URL(req.url).origin;
   const authz = req.headers.get("authorization") ?? "";
-  const statusRes = await fetch(`${origin}/api/a2a/session/status`, {
+  const statusUrl = walletAddress
+    ? `${origin}/api/a2a/session/status?walletAddress=${encodeURIComponent(walletAddress)}`
+    : `${origin}/api/a2a/session/status`;
+  const statusRes = await fetch(statusUrl, {
     headers: { authorization: authz },
     cache: "no-store",
   });

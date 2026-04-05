@@ -40,6 +40,21 @@ type SuggestedCartItem = {
   note?: string;
 };
 
+function preferredWalletAddress(
+  wallets: Array<{ address?: string; walletClientType?: string }>,
+): string | null {
+  const external = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return Boolean(kind) && kind !== "privy" && kind !== "privy-v2" && typeof wallet.address === "string" && wallet.address.trim();
+  });
+  if (external?.address) return external.address.trim();
+  const embedded = wallets.find((wallet) => {
+    const kind = typeof wallet.walletClientType === "string" ? wallet.walletClientType : "";
+    return (kind === "privy" || kind === "privy-v2") && typeof wallet.address === "string" && wallet.address.trim();
+  });
+  return embedded?.address?.trim() || null;
+}
+
 export default function ChatPage() {
   const router = useRouter();
   const { lines, addLine, removeSku, clear } = useCart();
@@ -72,6 +87,7 @@ export default function ChatPage() {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const didInitialScrollRef = useRef(false);
   const authSessionPromiseRef = useRef<Promise<string> | null>(null);
+  const statusWalletAddress = useMemo(() => preferredWalletAddress(wallets), [wallets]);
 
   const threadId = useMemo(() => {
     const safeAddr = accountAddress ? accountAddress.replace(/[^a-zA-Z0-9_]/g, "_") : "anon";
@@ -169,7 +185,7 @@ export default function ChatPage() {
       try {
         const tok = await getAccessToken();
         if (!tok || tok.split(".").length !== 3) return;
-        const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
+        const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, walletAddress: statusWalletAddress, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
         const registrationRequired = stRec.registrationRequired === true;
         if (registrationRequired) {
@@ -229,7 +245,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [threadId, clientTz, accountAddress, getAccessToken, wallets]);
+  }, [threadId, clientTz, accountAddress, getAccessToken, wallets, statusWalletAddress]);
 
   useEffect(() => {
     let cancelled = false;
@@ -240,13 +256,16 @@ export default function ChatPage() {
       try {
         const tok = await getAccessToken();
         if (!tok || tok.split(".").length !== 3) return;
-        const json = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
+        const json = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, walletAddress: statusWalletAddress, cacheMs: 60_000 });
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
         const ok = rec.ok === true;
         const registrationRequired = rec.registrationRequired === true;
         if (ok && registrationRequired && !cancelled) router.replace("/agent/register");
         if (ok && !registrationRequired) {
-          const statusRes = await fetch("/api/a2a/session/status", {
+          const sessionStatusUrl = statusWalletAddress
+            ? `/api/a2a/session/status?walletAddress=${encodeURIComponent(statusWalletAddress)}`
+            : "/api/a2a/session/status";
+          const statusRes = await fetch(sessionStatusUrl, {
             headers: { authorization: `Bearer ${tok}` },
             cache: "no-store",
           });
@@ -272,7 +291,7 @@ export default function ChatPage() {
           setProfileError("Missing access token. Please log in again.");
           return;
         }
-        const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, cacheMs: 60_000 });
+        const st = await getAgentictrustStatusCached({ accountAddress, accessToken: tok, walletAddress: statusWalletAddress, cacheMs: 60_000 });
         const stRec = st && typeof st === "object" ? (st as Record<string, unknown>) : {};
         const discovered = stRec.discovered && typeof stRec.discovered === "object" ? (stRec.discovered as Record<string, unknown>) : {};
         const gymName =
@@ -353,7 +372,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [hydrated, accountAddress, clientTz, threadId, getAccessToken, authenticated, router, wallets]);
+  }, [hydrated, accountAddress, clientTz, threadId, getAccessToken, authenticated, router, wallets, statusWalletAddress]);
 
   useEffect(() => {
     const tid = threadId || "thr_demo";
@@ -414,7 +433,7 @@ export default function ChatPage() {
       const res = await fetch("/api/agent/run", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-        body: JSON.stringify({ message: messageText, session: sessionBody, a2aAuthSessionToken }),
+        body: JSON.stringify({ message: messageText, session: sessionBody, a2aAuthSessionToken, walletAddress: statusWalletAddress }),
       });
       const json = (await res.json().catch(() => ({}))) as unknown;
       return { res, json };

@@ -1,7 +1,8 @@
 import { createMcpHandler } from "agents/mcp";
 import { hashDelegation } from "@metamask/smart-accounts-kit/utils";
+import { getSmartAccountsEnvironment } from "@metamask/smart-accounts-kit";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createPublicClient, http, parseAbi, recoverMessageAddress } from "viem";
+import { concatHex, createPublicClient, http, keccak256, parseAbi, recoverMessageAddress } from "viem";
 import { sepolia } from "viem/chains";
 import { z } from "zod";
 
@@ -25,6 +26,7 @@ type CoreMcpDelegationClaims = {
   aud: "urn:mcp:server:core";
   sub: string;
   chainId: number;
+  sessionGeneration: number;
   accountAddress: string;
   agentHandle: string;
   principalSmartAccount: `0x${string}`;
@@ -45,10 +47,15 @@ type CoreMcpDelegationClaims = {
   };
   issuedAtISO: string;
   expiresAtISO: string;
-  nonce: string;
+  jti: string;
+  usageLimit: number;
 };
 
 type CoreMcpDelegationEnvelope = {
+  v?: 2;
+  typ?: "urn:agentic-trust:mcp-delegation-envelope";
+  alg?: "session-message+hmac-sha256";
+  kid?: string;
   claims: CoreMcpDelegationClaims;
   sessionSignature: `0x${string}`;
   issuerSignature: string;
@@ -75,6 +82,11 @@ type RequestAuth =
 const AccountAddress = z.string().min(3);
 const ERC1271_ABI = parseAbi(["function isValidSignature(bytes32,bytes) view returns (bytes4)"]);
 const ERC1271_MAGIC_VALUE = "0x1626ba7e";
+const DELEGATION_MANAGER_ABI = parseAbi([
+  "function getDomainHash() view returns (bytes32)",
+  "function getDelegationHash((address delegate,address delegator,bytes32 authority,(address enforcer,bytes terms,bytes args)[] caveats,uint256 salt,bytes signature) _input) view returns (bytes32)",
+  "function isValidSignature(bytes32,bytes) view returns (bytes4)",
+]);
 
 function nowISO() {
   return new Date().toISOString();
@@ -112,26 +124,64 @@ function base64UrlDecodeText(value: string): string {
 }
 
 function normalizeHexString(value: unknown): `0x${string}` | null {
-  const s = String(value ?? "").trim();
-  if (!/^0x[0-9a-fA-F]+$/.test(s)) return null;
-  return s.toLowerCase() as `0x${string}`;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return `0x${Math.trunc(value).toString(16)}` as `0x${string}`;
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return null;
+    if (s === "0x" || s === "0X") return "0x00";
+    if (/^0x[0-9a-fA-F]+$/i.test(s)) return `0x${s.slice(2).toLowerCase()}` as `0x${string}`;
+    if (/^[0-9a-fA-F]+$/.test(s)) return `0x${s.toLowerCase()}` as `0x${string}`;
+    if (/^\d+$/.test(s)) return `0x${BigInt(s).toString(16)}` as `0x${string}`;
+    return null;
+  }
+  if (value && typeof value === "object") {
+    const rec = value as Record<string, unknown>;
+    const nested = rec.hex ?? rec.value ?? rec._hex ?? rec.data;
+    if (nested !== undefined) return normalizeHexString(nested);
+  }
+  if (Array.isArray(value) && value.every((part) => typeof part === "number" && Number.isFinite(part) && part >= 0 && part <= 255)) {
+    let hex = "";
+    for (const part of value) hex += Math.trunc(part).toString(16).padStart(2, "0");
+    return `0x${hex}` as `0x${string}`;
+  }
+  return null;
 }
 
 function normalizeAddress(value: unknown): `0x${string}` | null {
-  const s = String(value ?? "").trim().toLowerCase();
-  if (!/^0x[0-9a-f]{40}$/.test(s)) return null;
-  return s as `0x${string}`;
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return null;
+  const s = raw.startsWith("0x") ? raw.slice(2) : raw;
+  if (!/^[0-9a-f]+$/.test(s)) return null;
+  if (s.length === 40) return `0x${s}` as `0x${string}`;
+  if (s.length === 64) return `0x${s.slice(-40)}` as `0x${string}`;
+  return null;
+}
+
+function addressLike(value: unknown): unknown {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const rec = value as Record<string, unknown>;
+    return rec.address ?? rec.account ?? rec.value ?? rec.hex ?? value;
+  }
+  return value;
 }
 
 function normalizeSignedDelegation(value: unknown): CoreMcpDelegationClaims["signedDelegation"] | null {
   const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
-  const msg = raw && raw.message && typeof raw.message === "object" ? (raw.message as Record<string, unknown>) : raw;
+  const msg =
+    raw && raw.message && typeof raw.message === "object"
+      ? (raw.message as Record<string, unknown>)
+      : raw && raw.delegation && typeof raw.delegation === "object"
+        ? (raw.delegation as Record<string, unknown>)
+        : raw;
   if (!msg) return null;
-  const delegate = normalizeAddress(msg.delegate);
-  const delegator = normalizeAddress(msg.delegator);
-  const authority = normalizeAddress(msg.authority);
+  const delegate = normalizeAddress(addressLike(msg.delegate));
+  const delegator = normalizeAddress(addressLike(msg.delegator));
+  const authority = normalizeHexString(msg.authority);
   const salt = normalizeHexString(msg.salt);
-  const signature = normalizeHexString(raw?.signature ?? msg.signature);
+  const signature = normalizeHexString(raw?.signature ?? raw?.sig ?? msg.signature ?? msg.sig);
   const caveats = Array.isArray(msg.caveats) ? msg.caveats : [];
   if (!delegate || !delegator || !authority || !salt || !signature) return null;
   return { delegate, delegator, authority, caveats, salt, signature };
@@ -144,6 +194,7 @@ function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
     aud: claims.aud,
     sub: claims.sub,
     chainId: claims.chainId,
+    sessionGeneration: claims.sessionGeneration,
     accountAddress: claims.accountAddress,
     agentHandle: claims.agentHandle,
     principalSmartAccount: claims.principalSmartAccount,
@@ -157,7 +208,8 @@ function coreMcpClaimsCanonicalString(claims: CoreMcpDelegationClaims): string {
     signedDelegation: claims.signedDelegation,
     issuedAtISO: claims.issuedAtISO,
     expiresAtISO: claims.expiresAtISO,
-    nonce: claims.nonce,
+    jti: claims.jti,
+    usageLimit: claims.usageLimit,
   });
 }
 
@@ -190,22 +242,103 @@ function publicClientForChain(env: Env, chainId: number) {
 }
 
 async function verifyOriginalDelegationSignature(env: Env, claims: CoreMcpDelegationClaims): Promise<boolean> {
-  const delegationHash = hashDelegation({
-    delegate: claims.signedDelegation.delegate,
-    delegator: claims.signedDelegation.delegator,
-    authority: claims.signedDelegation.authority,
-    caveats: claims.signedDelegation.caveats as never,
-    salt: claims.signedDelegation.salt,
-    signature: claims.signedDelegation.signature,
-  });
   const client = publicClientForChain(env, claims.chainId);
-  const result = await client.readContract({
-    address: claims.principalSmartAccount,
-    abi: ERC1271_ABI,
-    functionName: "isValidSignature",
-    args: [delegationHash, claims.signedDelegation.signature],
+  const envCfg = getSmartAccountsEnvironment(claims.chainId);
+  const delegationManager = normalizeAddress((envCfg as any)?.DelegationManager);
+  if (!delegationManager) throw new Error(`missing_delegation_manager_for_chain_${claims.chainId}`);
+
+  const delegationHash = await (async () => {
+    try {
+      const saltUint = BigInt(claims.signedDelegation.salt);
+      return await client.readContract({
+        address: delegationManager,
+        abi: DELEGATION_MANAGER_ABI,
+        functionName: "getDelegationHash",
+        args: [
+          {
+            delegate: claims.signedDelegation.delegate,
+            delegator: claims.signedDelegation.delegator,
+            authority: claims.signedDelegation.authority as `0x${string}`,
+            caveats: claims.signedDelegation.caveats as never,
+            salt: saltUint,
+            signature: claims.signedDelegation.signature,
+          } as never,
+        ],
+      });
+    } catch {
+      return hashDelegation({
+        delegate: claims.signedDelegation.delegate,
+        delegator: claims.signedDelegation.delegator,
+        authority: claims.signedDelegation.authority,
+        caveats: claims.signedDelegation.caveats as never,
+        salt: claims.signedDelegation.salt,
+        signature: claims.signedDelegation.signature,
+      });
+    }
+  })();
+
+  // Delegation signatures are over EIP-712 typed-data hash:
+  // keccak256(0x1901 ++ DelegationManager.domainSeparator ++ delegationStructHash)
+  const domainHash = await client.readContract({
+    address: delegationManager,
+    abi: DELEGATION_MANAGER_ABI,
+    functionName: "getDomainHash",
+    args: [],
   });
-  return String(result).toLowerCase() === ERC1271_MAGIC_VALUE;
+  const typedDataHash = keccak256(concatHex(["0x1901", domainHash, delegationHash]));
+
+  // Validate via delegator (principal smart account) ERC-1271.
+  try {
+    const result = await client.readContract({
+      address: claims.principalSmartAccount,
+      abi: ERC1271_ABI,
+      functionName: "isValidSignature",
+      args: [typedDataHash, claims.signedDelegation.signature],
+    });
+    return String(result).toLowerCase() === ERC1271_MAGIC_VALUE;
+  } catch {
+    return false;
+  }
+}
+
+async function consumeDelegationJti(db: D1Database, claims: CoreMcpDelegationClaims): Promise<void> {
+  const jti = claims.jti.trim();
+  if (!jti) throw new Error("delegation_jti_missing");
+  const usageLimit = Number.isFinite(claims.usageLimit) && claims.usageLimit > 0 ? Math.floor(claims.usageLimit) : 64;
+  const now = nowISO();
+  const existing = await db
+    .prepare(`SELECT jti, usage_count, usage_limit, expires_at_iso FROM delegated_token_jti_uses WHERE jti = ? LIMIT 1`)
+    .bind(jti)
+    .first<{ jti: string; usage_count: number; usage_limit: number; expires_at_iso: string }>();
+  if (!existing) {
+    await db
+      .prepare(
+        `INSERT INTO delegated_token_jti_uses (jti, usage_count, usage_limit, expires_at_iso, created_at_iso, updated_at_iso)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(jti, 1, usageLimit, claims.expiresAtISO, now, now)
+      .run();
+    return;
+  }
+  const expiresAtMs = Date.parse(String(existing.expires_at_iso ?? ""));
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+    await db
+      .prepare(
+        `UPDATE delegated_token_jti_uses
+         SET usage_count = ?, usage_limit = ?, expires_at_iso = ?, updated_at_iso = ?
+         WHERE jti = ?`,
+      )
+      .bind(1, usageLimit, claims.expiresAtISO, now, jti)
+      .run();
+    return;
+  }
+  const nextUsageCount = Number(existing.usage_count ?? 0) + 1;
+  const effectiveLimit = Number(existing.usage_limit ?? usageLimit) > 0 ? Number(existing.usage_limit ?? usageLimit) : usageLimit;
+  if (nextUsageCount > effectiveLimit) throw new Error("delegation_jti_usage_exceeded");
+  await db
+    .prepare(`UPDATE delegated_token_jti_uses SET usage_count = ?, updated_at_iso = ? WHERE jti = ?`)
+    .bind(nextUsageCount, now, jti)
+    .run();
 }
 
 function basicAuthHeader(username: string, password: string) {
@@ -271,6 +404,8 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
       throw new Error("invalid_delegation_token");
     }
     const rec = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    if (rec?.typ && rec.typ !== "urn:agentic-trust:mcp-delegation-envelope") throw new Error("invalid_delegation_token_type");
+    if (rec?.alg && rec.alg !== "session-message+hmac-sha256") throw new Error("invalid_delegation_token_alg");
     const claimsRaw = rec?.claims && typeof rec.claims === "object" ? (rec.claims as Record<string, unknown>) : null;
     const sessionSignature = normalizeHexString(rec?.sessionSignature);
     const issuerSignature = typeof rec?.issuerSignature === "string" ? rec.issuerSignature.trim() : "";
@@ -291,8 +426,10 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
       typeof claimsRaw.permissionsHash === "string" &&
       typeof claimsRaw.issuedAtISO === "string" &&
       typeof claimsRaw.expiresAtISO === "string" &&
-      typeof claimsRaw.nonce === "string" &&
+      typeof (claimsRaw.jti ?? claimsRaw.nonce) === "string" &&
       Number.isFinite(Number(claimsRaw.chainId)) &&
+      Number.isFinite(Number(claimsRaw.sessionGeneration ?? 1)) &&
+      Number.isFinite(Number(claimsRaw.usageLimit ?? 64)) &&
       Number.isFinite(Number(claimsRaw.sessionValidAfter)) &&
       Number.isFinite(Number(claimsRaw.sessionValidUntil))
         ? {
@@ -301,6 +438,7 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
             aud: "urn:mcp:server:core",
             sub: String(claimsRaw.sub ?? claimsRaw.accountAddress ?? "").trim(),
             chainId: Number(claimsRaw.chainId),
+            sessionGeneration: Number(claimsRaw.sessionGeneration ?? 1),
             accountAddress: String(claimsRaw.accountAddress ?? "").trim(),
             agentHandle: String(claimsRaw.agentHandle ?? "").trim(),
             principalSmartAccount: normalizeAddress(claimsRaw.principalSmartAccount)!,
@@ -314,7 +452,8 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
             signedDelegation,
             issuedAtISO: String(claimsRaw.issuedAtISO ?? "").trim(),
             expiresAtISO: String(claimsRaw.expiresAtISO ?? "").trim(),
-            nonce: String(claimsRaw.nonce ?? "").trim(),
+            jti: String(claimsRaw.jti ?? claimsRaw.nonce ?? "").trim(),
+            usageLimit: Math.max(1, Math.min(128, Number(claimsRaw.usageLimit ?? 64))),
           }
         : null;
     if (!claims || !sessionSignature || !issuerSignature) throw new Error("invalid_delegation_claims");
@@ -334,6 +473,7 @@ async function authorizeRequest(request: Request, env: Env): Promise<RequestAuth
     if (claims.signedDelegation.delegator !== claims.principalSmartAccount) throw new Error("delegation_principal_mismatch");
     if (claims.selector !== ERC1271_MAGIC_VALUE) throw new Error("delegation_selector_invalid");
     if (!(await verifyOriginalDelegationSignature(env, claims))) throw new Error("delegation_signature_invalid");
+    await consumeDelegationJti(env.DB, claims);
     return {
       kind: "delegated",
       principal: {
@@ -436,6 +576,20 @@ async function ensureSchema(db: D1Database): Promise<void> {
       )`,
     )
     .run();
+
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS delegated_token_jti_uses (
+        jti TEXT PRIMARY KEY,
+        usage_count INTEGER NOT NULL,
+        usage_limit INTEGER NOT NULL,
+        expires_at_iso TEXT NOT NULL,
+        created_at_iso TEXT NOT NULL,
+        updated_at_iso TEXT NOT NULL
+      )`,
+    )
+    .run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_delegated_token_jti_uses_expires ON delegated_token_jti_uses(expires_at_iso)`).run();
 }
 
 async function ensureAccount(
@@ -1225,6 +1379,7 @@ export default {
     const url = new URL(request.url);
     let auth: RequestAuth;
     try {
+      await ensureSchema(env.DB);
       auth = await authorizeRequest(request, env);
     } catch (error) {
       console.warn("[gym-core-mcp] auth denied", {

@@ -9,6 +9,7 @@ type Body = {
   message?: unknown;
   session?: unknown;
   a2aAuthSessionToken?: unknown;
+  walletAddress?: unknown;
 };
 
 function a2aAgentBaseUrl(): string {
@@ -27,12 +28,17 @@ export async function POST(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
+  const body = (await req.json().catch(() => null)) as Body | null;
   let agentHandle = "";
   let a2aHost = "";
   try {
     const origin = new URL(req.url).origin;
     const authz = req.headers.get("authorization") ?? "";
-    const stRes = await fetch(`${origin}/api/agentictrust/status`, {
+    const walletAddress = typeof body?.walletAddress === "string" ? body.walletAddress.trim() : "";
+    const statusUrl = walletAddress
+      ? `${origin}/api/agentictrust/status?walletAddress=${encodeURIComponent(walletAddress)}`
+      : `${origin}/api/agentictrust/status`;
+    const stRes = await fetch(statusUrl, {
       headers: { authorization: authz },
       cache: "no-store",
     });
@@ -81,7 +87,6 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: (e as Error)?.message ?? String(e ?? "") }, { status: 500 });
   }
 
-  const body = (await req.json().catch(() => null)) as Body | null;
   const message = typeof body?.message === "string" ? body.message.trim() : "";
   const a2aAuthSessionToken = typeof body?.a2aAuthSessionToken === "string" ? body.a2aAuthSessionToken.trim() : "";
 
@@ -127,19 +132,26 @@ export async function POST(req: Request) {
   }
 
   const a2aEndpoint = `${a2aHost}/api/a2a`;
-  const res = await fetch(a2aEndpoint, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-a2a-web-session": a2aAuthSessionToken },
-    body: JSON.stringify({
-      fromAgentId: "web",
-      toAgentId: "gym-a2a-agent",
-      message,
-      metadata: {
-        session: sessionOut,
-        webThreadId: threadId,
-      },
-    }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(a2aEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-a2a-web-session": a2aAuthSessionToken },
+      body: JSON.stringify({
+        fromAgentId: "web",
+        toAgentId: "gym-a2a-agent",
+        message,
+        metadata: {
+          session: sessionOut,
+          webThreadId: threadId,
+        },
+      }),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e ?? "");
+    console.error("[a2a] forward network error", { accountAddress: auth.accountAddress, agentHandle, a2aHost, a2aEndpoint, detail: msg });
+    return NextResponse.json({ error: "a2a_forward_network_error", detail: msg, a2aEndpoint }, { status: 502 });
+  }
 
   const json = (await res.json().catch(() => ({}))) as unknown;
   const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
@@ -152,13 +164,22 @@ export async function POST(req: Request) {
       status: res.status,
       body: json,
     });
+    const upstreamError = typeof rec.error === "string" ? rec.error : "";
+    const authish =
+      upstreamError === "a2a_auth_required" ||
+      upstreamError === "a2a_auth_invalid" ||
+      upstreamError === "a2a_auth_expired" ||
+      upstreamError === "a2a_auth_account_mismatch" ||
+      upstreamError === "a2a_auth_agent_mismatch";
+    const status = authish ? 401 : res.status;
     return NextResponse.json(
       {
-        error: "a2a_forward_failed",
+        error: authish ? upstreamError || "a2a_auth_required" : "a2a_forward_failed",
         detail: rec?.error ?? json,
         a2aEndpoint,
+        upstreamStatus: res.status,
       },
-      { status: 502 },
+      { status },
     );
   }
   if (rec.ok !== true) {
@@ -169,14 +190,16 @@ export async function POST(req: Request) {
       a2aEndpoint,
       body: json,
     });
-    return NextResponse.json(
-      {
-        error: "a2a_forward_failed",
-        detail: json,
-        a2aEndpoint,
-      },
-      { status: 502 },
-    );
+    const upstreamError = typeof rec.error === "string" ? rec.error : "";
+    const authish =
+      upstreamError === "a2a_auth_required" ||
+      upstreamError === "a2a_auth_invalid" ||
+      upstreamError === "a2a_auth_expired" ||
+      upstreamError === "session_handle_mismatch" ||
+      upstreamError === "session_account_mismatch" ||
+      upstreamError === "session_agent_mismatch";
+    const status = authish ? 401 : 502;
+    return NextResponse.json({ error: authish ? upstreamError || "a2a_auth_required" : "a2a_forward_failed", detail: json, a2aEndpoint }, { status });
   }
 
   const agentOutput = rec.agentOutput;

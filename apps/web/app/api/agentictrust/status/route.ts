@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { extractAgentAccountFromDiscovery, getAgenticTrustClient, getDiscoveryClient } from "@agentic-trust/core/server";
-import { requirePrivyAuth, eoaAddressForPrivyDid } from "../../_lib/privy";
+import { requirePrivyAuth, resolveEoaAddressForPrivyDid } from "../../_lib/privy";
 import { baseNameFromGymAgentName, gymAgentLabelFromBaseName, gymAgentNameFromBaseName, nameCandidatesFromAgentRecord } from "../_lib/gym-agent";
 import { createPublicClient, http } from "viem";
 import { sepolia } from "viem/chains";
@@ -222,7 +222,9 @@ export async function GET(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
 
-  const eoaAddress = await eoaAddressForPrivyDid(auth.did);
+  const url = new URL(req.url);
+  const requestedWalletAddress = url.searchParams.get("walletAddress");
+  const eoaAddress = await resolveEoaAddressForPrivyDid(auth.did, requestedWalletAddress);
   const chainId = registrationChainId();
   try {
     console.log("[agentictrust] eoaAddress", { accountAddress: auth.accountAddress, eoaAddress });
@@ -276,7 +278,6 @@ export async function GET(req: Request) {
     const liveOwnerMatches = Boolean(owner) && owner === eoaAddress.toLowerCase();
     const savedOwnerMatchesCurrent = Boolean(savedProfileEoa) && savedProfileEoa === eoaAddress.toLowerCase();
     const validOwner = Boolean(agentAccount) && (liveOwnerMatches || (!owner && savedOwnerMatchesCurrent));
-    const discoveredOwnedAgent = Boolean(discoveredForSaved?.agentAccount);
     const resolvedOwnerEoa = owner ?? (savedOwnerMatchesCurrent ? savedProfileEoa : null);
     if (owner && savedProfileEoa !== owner) {
       try {
@@ -327,7 +328,7 @@ export async function GET(req: Request) {
         discovered: null,
         savedBaseName,
         pendingBaseName: savedBaseName,
-        registrationRequired: false,
+        registrationRequired: true,
         fullAgentName,
         agentHandle: gymAgentLabelFromBaseName(savedBaseName),
         a2aHost,
@@ -344,7 +345,7 @@ export async function GET(req: Request) {
         discovered: null,
         savedBaseName,
         pendingBaseName: savedBaseName,
-        registrationRequired: false,
+        registrationRequired: true,
         fullAgentName,
         agentHandle: gymAgentLabelFromBaseName(savedBaseName),
         a2aHost,

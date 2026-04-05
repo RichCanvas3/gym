@@ -27,9 +27,14 @@ export async function GET(req: Request) {
   const auth = await requirePrivyAuth(req);
   if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
 
-  const origin = new URL(req.url).origin;
+  const requestUrl = new URL(req.url);
+  const origin = requestUrl.origin;
+  const walletAddress = requestUrl.searchParams.get("walletAddress")?.trim() || "";
   const authz = req.headers.get("authorization") ?? "";
-  const statusRes = await fetch(`${origin}/api/agentictrust/status`, {
+  const statusUrl = walletAddress
+    ? `${origin}/api/agentictrust/status?walletAddress=${encodeURIComponent(walletAddress)}`
+    : `${origin}/api/agentictrust/status`;
+  const statusRes = await fetch(statusUrl, {
     headers: { authorization: authz },
     cache: "no-store",
   });

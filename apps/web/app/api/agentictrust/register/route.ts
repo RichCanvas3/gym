@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { addToL1OrgPK, getAgenticTrustClient, getENSClient } from "@agentic-trust/core/server";
-import { eoaAddressForPrivyDid, requirePrivyAuth, telegramUserIdForPrivyDid } from "../../_lib/privy";
+import { requirePrivyAuth, resolveEoaAddressForPrivyDid, telegramUserIdForPrivyDid } from "../../_lib/privy";
 import { gymAgentLabelFromBaseName, gymAgentNameFromBaseName, safeBaseName } from "../_lib/gym-agent";
 import { createPublicClient, http } from "viem";
 import { sepolia } from "viem/chains";
@@ -15,6 +15,7 @@ type PrepareBody = {
   phase?: unknown;
   baseName?: unknown;
   agentAddress?: unknown;
+  walletAddress?: unknown;
 };
 
 type CompleteBody = {
@@ -22,6 +23,7 @@ type CompleteBody = {
   baseName?: unknown;
   agentAddress?: unknown;
   txHash?: unknown;
+  walletAddress?: unknown;
 };
 
 function a2aAgentBaseUrl(): string {
@@ -207,7 +209,7 @@ export async function POST(req: Request) {
   const baseName = safeBaseName(body?.baseName);
   if (!baseName) return NextResponse.json({ ok: false, error: "Invalid baseName" }, { status: 400 });
 
-  const eoaAddress = await eoaAddressForPrivyDid(auth.did);
+  const eoaAddress = await resolveEoaAddressForPrivyDid(auth.did, body?.walletAddress);
   if (!eoaAddress) {
     return NextResponse.json({ ok: false, error: "Missing connected Ethereum wallet EOA for Privy user" }, { status: 400 });
   }

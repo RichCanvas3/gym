@@ -38,6 +38,8 @@ flowchart LR
   service -.-> note2
 ```
 
+
+
 The protocol replaces that with a delegation chain:
 
 ```mermaid
@@ -49,6 +51,8 @@ flowchart LR
   token --> domain[Principal Domain MCP]
   domain --> data[Principal Data And Actions]
 ```
+
+
 
 ## Purpose
 
@@ -234,6 +238,8 @@ flowchart LR
   profileMcp --> principalStore[PrincipalDataAndCapabilities]
 ```
 
+
+
 ## Roles
 
 - `WebClient`
@@ -291,6 +297,8 @@ flowchart LR
   langchain --> capabilityMcp
   capabilityMcp --> principalStore
 ```
+
+
 
 ## Protocol Flow
 
@@ -447,6 +455,8 @@ sequenceDiagram
   LangChainRuntime-->>AgentGateway: Final answer
   AgentGateway-->>WebClient: Chat response
 ```
+
+
 
 ## Data Model
 
@@ -758,6 +768,8 @@ flowchart TD
   l1 --> l2 --> l3 --> l4 --> l5 --> l6 --> l7
 ```
 
+
+
 ### Technical Responsibilities By Component
 
 #### Web Client
@@ -842,3 +854,83 @@ Protocol-specific layers in this document:
 - the exact fail-closed authorization behavior inside Principal Domain MCP services
 
 This split is important: the protocol builds on familiar web3 standards, but the full delegated agent-to-MCP trust chain still requires application-layer standardization on top of them.
+
+## Residual Risks And Vulnerabilities
+
+The architecture materially improves the trust model, but it does not eliminate all security risk. The following residual risks should be considered in priority order:
+
+### 1. Agent Gateway Compromise
+
+The highest-value target in this design is the `AgentGateway`.
+
+It generates the session wallet private key, stores the encrypted session package, and mints downstream MCP authorization artifacts. If the gateway or its secret material is compromised, an attacker may be able to mint valid downstream auth or misuse stored delegated runtime state until secrets are rotated and sessions are invalidated.
+
+### 2. Session Package Or Secret-Management Failure
+
+The session package is intentionally the bridge between delegation and runtime execution.
+
+If encryption keys, storage controls, secret rotation, or operational access controls are weak, then delegated session material may be exposed or replayed. This is especially important because the browser never holds the delegated runtime private key; the trust is concentrated in the gateway boundary.
+
+### 3. Incomplete Revocation And Rotation Semantics
+
+This design relies on bounded delegation windows and short-lived MCP artifacts, but revocation behavior is still an application-layer concern.
+
+If a principal wants to revoke delegated authority immediately, or if session state must be invalidated after suspected compromise, the protocol needs clear revocation and rotation behavior to avoid a gap between intent and enforcement.
+
+### 4. Cross-Service Claims Canonicalization Errors
+
+The model depends on exact agreement between:
+
+- token claims serialization
+- delegation interpretation
+- selector semantics
+- issuer-signature verification
+- principal derivation rules
+
+If these rules drift across services, an implementation may incorrectly accept or reject requests. This is a major reason canonical token and claims formats should be standardized.
+
+### 5. Smart-Account And Delegation Verification Assumptions
+
+The design assumes correct smart-account behavior for:
+
+- `ERC-1271` signature validation
+- delegation hashing and interpretation
+- selector and scope enforcement
+
+If a wallet implementation, delegation toolkit, or account contract behaves unexpectedly, the protocol may inherit those weaknesses. This is particularly relevant while delegation standards remain partly draft or ecosystem-dependent.
+
+### 6. Over-Broad Delegation Scope
+
+The architecture is only as strong as the delegation that is actually granted.
+
+If selector scope, caveats, or validity windows are too broad, then the runtime may receive more authority than intended. The protocol supports bounded delegation, but safe defaults and careful scope design are still required.
+
+### 7. Audience Or Service-Mapping Mistakes
+
+Downstream authorization is audience-scoped, which is a strength, but configuration errors can still create risk.
+
+If a service accepts the wrong audience, maps the wrong principal domain, or incorrectly reuses bearer-validation rules across domains, the intended service boundary may weaken.
+
+### 8. Principal-Scoped Tooling Mistakes
+
+Even when auth validation is correct, tool implementations can still introduce security bugs.
+
+If a Principal Domain MCP reads caller-supplied identifiers instead of deriving the validated principal from auth context, it may allow cross-principal reads or writes. This remains one of the most important implementation-review areas.
+
+### 9. Replay Windows For Short-Lived Artifacts
+
+Short-lived MCP artifacts reduce risk, but they do not fully eliminate replay concerns.
+
+If expiry windows are too long, nonces are not handled carefully, or downstream services do not enforce intended replay semantics, a captured artifact may still be usable within its validity window.
+
+### 10. Dependency And Supply-Chain Risk
+
+This architecture composes multiple critical libraries and standards implementations, including:
+
+- smart-account tooling
+- wallet signing libraries
+- RPC infrastructure
+- MCP runtimes
+- token and signature verification code
+
+Any weakness in those dependencies may affect the full trust chain. This design should therefore be paired with dependency review, version pinning, and regular security updates.

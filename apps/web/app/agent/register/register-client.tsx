@@ -95,6 +95,10 @@ export default function AgentRegisterClient() {
   const [baseName, setBaseName] = useState("");
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [availability, setAvailability] = useState<Availability>({ kind: "idle" });
+  const statusWalletAddress =
+    (typeof preferredConnectedWallet(wallets)?.address === "string" ? preferredConnectedWallet(wallets)?.address?.trim() : "") ||
+    embeddedEthereumWalletAddress(user) ||
+    null;
 
   async function ensureDelegationAndEnter(nextFullName?: string) {
     if (!accountAddress) throw new Error("Missing account address.");
@@ -121,14 +125,18 @@ export default function AgentRegisterClient() {
       setStatus({ kind: "loading" });
       try {
         const tok = await getAccessToken();
-        const res = await fetch("/api/agentictrust/status", { headers: { authorization: `Bearer ${tok}` } });
+        const statusUrl = statusWalletAddress
+          ? `/api/agentictrust/status?walletAddress=${encodeURIComponent(statusWalletAddress)}`
+          : "/api/agentictrust/status";
+        const res = await fetch(statusUrl, { headers: { authorization: `Bearer ${tok}` } });
         const json = (await res.json().catch(() => ({}))) as unknown;
         const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+        const registrationRequired = rec.registrationRequired === true;
         const saved = typeof rec.savedBaseName === "string" ? rec.savedBaseName.trim() : "";
         const discovered = rec.discovered && typeof rec.discovered === "object" ? (rec.discovered as Record<string, unknown>) : {};
         const discoveredBaseName = typeof discovered.baseName === "string" ? discovered.baseName.trim() : "";
         const effectiveBaseName = saved || discoveredBaseName;
-        if (effectiveBaseName) {
+        if (!registrationRequired && effectiveBaseName) {
           const fullName = typeof rec.fullAgentName === "string" ? rec.fullAgentName.trim() : "";
           await ensureDelegationAndEnter(fullName || undefined);
           return;
@@ -145,7 +153,7 @@ export default function AgentRegisterClient() {
       }
     }
     void load();
-  }, [ready, authenticated, getAccessToken, router, accountAddress, wallets, signTypedData, signMessage]);
+  }, [ready, authenticated, getAccessToken, router, accountAddress, wallets, signTypedData, signMessage, statusWalletAddress]);
 
   useEffect(() => {
     if (!ready || !authenticated || status.kind !== "saved") return;
@@ -156,7 +164,10 @@ export default function AgentRegisterClient() {
         try {
           polls += 1;
           const tok = await getAccessToken();
-          const res = await fetch("/api/agentictrust/status", { headers: { authorization: `Bearer ${tok}` } });
+          const statusUrl = statusWalletAddress
+            ? `/api/agentictrust/status?walletAddress=${encodeURIComponent(statusWalletAddress)}`
+            : "/api/agentictrust/status";
+          const res = await fetch(statusUrl, { headers: { authorization: `Bearer ${tok}` } });
           const json = (await res.json().catch(() => ({}))) as unknown;
           const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
           const saved = typeof rec.savedBaseName === "string" ? rec.savedBaseName.trim() : "";
@@ -178,7 +189,7 @@ export default function AgentRegisterClient() {
       cancelled = true;
       globalThis.clearInterval(timer);
     };
-  }, [ready, authenticated, status.kind, getAccessToken, router]);
+  }, [ready, authenticated, status.kind, getAccessToken, router, statusWalletAddress]);
 
   useEffect(() => {
     if (!ready || !authenticated) return;
@@ -262,7 +273,7 @@ export default function AgentRegisterClient() {
       const prepareRes = await fetch("/api/agentictrust/register", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-        body: JSON.stringify({ phase: "prepare", baseName, agentAddress }),
+        body: JSON.stringify({ phase: "prepare", baseName, agentAddress, walletAddress: signerAddress }),
       });
       const prepareJson = (await prepareRes.json().catch(() => ({}))) as unknown;
       if (!prepareRes.ok) {
@@ -319,7 +330,7 @@ export default function AgentRegisterClient() {
       const completeRes = await fetch("/api/agentictrust/register", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-        body: JSON.stringify({ phase: "complete", baseName, agentAddress, txHash }),
+        body: JSON.stringify({ phase: "complete", baseName, agentAddress, txHash, walletAddress: signerAddress }),
       });
       const completeJson = (await completeRes.json().catch(() => ({}))) as unknown;
       if (!completeRes.ok) {
@@ -340,7 +351,7 @@ export default function AgentRegisterClient() {
         agentHandle: availability.fullName.replace(/\.8004-agent\.eth$/i, ""),
         a2aHost: availability.a2aHost,
         chatReady: false,
-      });
+      }, signerAddress);
       setStatus({
         kind: "saved",
         ...(completedFullName ? { fullName: completedFullName } : {}),

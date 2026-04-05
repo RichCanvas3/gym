@@ -6,6 +6,7 @@ export const dynamic = "force-dynamic";
 
 type Body = {
   origin?: unknown;
+  walletAddress?: unknown;
 };
 
 function a2aAgentBaseUrl(): string {
@@ -26,10 +27,14 @@ export async function POST(req: Request) {
 
   const body = (await req.json().catch(() => null)) as Body | null;
   const reqOrigin = typeof body?.origin === "string" ? body.origin.trim() : "";
+  const walletAddress = typeof body?.walletAddress === "string" ? body.walletAddress.trim() : "";
   const origin = reqOrigin || new URL(req.url).origin;
   const authz = req.headers.get("authorization") ?? "";
+  const statusUrl = walletAddress
+    ? `${origin}/api/agentictrust/status?walletAddress=${encodeURIComponent(walletAddress)}`
+    : `${origin}/api/agentictrust/status`;
 
-  const stRes = await fetch(`${origin}/api/agentictrust/status`, {
+  const stRes = await fetch(statusUrl, {
     headers: { authorization: authz },
     cache: "no-store",
   });
