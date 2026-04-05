@@ -1019,6 +1019,7 @@ def build_system_prompt() -> str:
             "- For future outdoor planning, prefer a forecast tool when available (not just current conditions).",
             "- For class reservations, reserve seats via the scheduling MCP using canonical account addresses, record a reservation ledger entry in gym-core, then send a confirmation email when possible.",
             "- Identity for private data and actions comes from the authenticated accountAddress/session principal. Do not ask for Telegram user ids and do not use Telegram ids as identity scope.",
+            "- For weight lookups and weigh-ins, use Weight MCP with the authenticated accountAddress as scope. Do not ask the user to choose between Privy/account and Telegram.",
             "- For checkout, provide a concise receipt and send an email receipt when possible.",
             "- If discussing a specific outdoor class that is scheduled in the future, include forecast context for that class time when possible.",
             "- When asked about policies, class descriptions, coach bios, or general FAQs, use the knowledge search tool (RAG).",
@@ -1222,7 +1223,7 @@ def _looks_like_weight_text(text: str) -> bool:
     if not t or t.startswith("/") or t.startswith("__"):
         return False
     # Explicit units are strongest.
-    if " lb" in t or " lbs" in t or "kg" in t or "pounds" in t:
+    if " lb" in t or " lbs" in t or "lb'" in t or "kg" in t or "pound" in t:
         return True
     # "weight 182.4" style
     if "weight" in t:
@@ -1250,7 +1251,7 @@ def _parse_weight_from_text(text: str) -> tuple[Optional[float], Optional[float]
         except Exception:
             return None, None
 
-    m = re.search(r"\b(\d{2,3}(?:\.\d)?)\s*(lb|lbs|pounds?)\b", t)
+    m = re.search(r"\b(\d{2,3}(?:\.\d)?)\s*(lb(?:s|\'s)?|pounds?)\b", t)
     if m:
         try:
             return None, float(m.group(1))
@@ -1267,6 +1268,105 @@ def _parse_weight_from_text(text: str) -> tuple[Optional[float], Optional[float]
                 return None, None
 
     return None, None
+
+
+def _is_weight_lookup_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t or t.startswith("/") or t.startswith("__"):
+        return False
+    if _looks_like_weight_text(t):
+        return False
+    return any(
+        phrase in t
+        for phrase in [
+            "what is my weight",
+            "what's my weight",
+            "current weight",
+            "latest weight",
+            "latest weigh-in",
+            "latest weigh in",
+            "last weigh-in",
+            "last weigh in",
+            "show my weight",
+            "my recorded weight",
+            "do i have any weigh-ins",
+            "do i have any weigh ins",
+        ]
+    )
+
+
+def _is_weight_log_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not _looks_like_weight_text(t):
+        return False
+    if re.fullmatch(r"\d{2,3}(?:\.\d+)?\s*(kg|kgs|kilograms?|lb(?:s|\'s)?|pounds?)", t):
+        return True
+    return any(
+        phrase in t
+        for phrase in [
+            "i weigh",
+            "my weight is",
+            "current weight is",
+            "log my weight",
+            "record my weight",
+            "track my weight",
+            "save my weight",
+            "add my weight",
+            "update my weight",
+            "weigh-in",
+            "weigh in",
+        ]
+    )
+
+
+def _profile_weight_values(profile: dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[int]]:
+    kg = _num(profile.get("weight_kg"))
+    lb = _num(profile.get("weight_lb"))
+    if kg is None and lb is not None:
+        kg = lb * 0.45359237
+    if lb is None and kg is not None:
+        lb = kg / 0.45359237
+    at_ms = _int(profile.get("weight_at_ms"))
+    return kg, lb, at_ms
+
+
+def _format_weight_value(value: Optional[float], unit: str) -> str:
+    if value is None:
+        return ""
+    if abs(value - round(value)) < 0.05:
+        return f"{int(round(value))} {unit}"
+    return f"{value:.1f} {unit}"
+
+
+def _weight_label(weight_kg: Optional[float], weight_lb: Optional[float]) -> str:
+    if weight_lb is not None:
+        return _format_weight_value(weight_lb, "lb")
+    if weight_kg is not None:
+        return _format_weight_value(weight_kg, "kg")
+    return ""
+
+
+def _weight_at_iso_from_text(text: str, tz_name: str) -> str:
+    tz = ZoneInfo(tz_name or "UTC")
+    dt_local = datetime.now(tz=tz)
+    t = (text or "").strip().lower()
+    if "yesterday" in t:
+        dt_local = dt_local - timedelta(days=1)
+    if "morning" in t:
+        dt_local = dt_local.replace(hour=8, minute=0, second=0, microsecond=0)
+    elif "afternoon" in t:
+        dt_local = dt_local.replace(hour=15, minute=0, second=0, microsecond=0)
+    elif "evening" in t or "tonight" in t or "night" in t:
+        dt_local = dt_local.replace(hour=20, minute=0, second=0, microsecond=0)
+    return dt_local.astimezone(timezone.utc).isoformat()
+
+
+def _weight_recorded_at_text(at_ms: Optional[int], tz_name: str) -> str:
+    if not isinstance(at_ms, int) or at_ms <= 0:
+        return ""
+    tz = ZoneInfo(tz_name or "UTC")
+    dt_local = datetime.fromtimestamp(at_ms / 1000.0, tz=timezone.utc).astimezone(tz)
+    return dt_local.strftime("%Y-%m-%d %I:%M %p %Z")
 
 
 def _weight_scope_from_session(session: Optional["Session"]) -> Optional[dict[str, Any]]:
@@ -2040,6 +2140,22 @@ async def _run_impl(input: Input) -> Output:
                     "accountAddress": acct,
                 },
             )
+        weight_kg, weight_lb, _weight_at_ms = _profile_weight_values(profile)
+        weight_log_out = None
+        if weight_kg is not None or weight_lb is not None:
+            weight_args: dict[str, Any] = {
+                "scope": {"accountAddress": acct},
+                "source": "profile_form",
+                "atISO": _weight_at_iso_from_text(
+                    "today",
+                    (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver",
+                ),
+            }
+            if weight_kg is not None:
+                weight_args["weightKg"] = weight_kg
+            if weight_lb is not None:
+                weight_args["weightLb"] = weight_lb
+            weight_log_out = await _weight_call_json("weight_log_weight", weight_args)
         return Output(
             answer="",
             citations=[],
@@ -2047,6 +2163,7 @@ async def _run_impl(input: Input) -> Output:
                 "ok": True,
                 "accountAddress": acct,
                 "updated_at": out.get("updated_at") if isinstance(out, dict) else None,
+                "weightLogged": bool(isinstance(weight_log_out, dict) and weight_log_out.get("ok") is True),
             },
         )
 
@@ -2288,6 +2405,84 @@ async def _run_impl(input: Input) -> Output:
             data={"asOfISO": _now_iso(), "dateISO": date_iso, "fromISO": from_iso, "toISO": to_iso, "classes": items},
         )
 
+    # Deterministic: direct weight lookup and weigh-in logging should use the authenticated account scope.
+    if not msg.startswith("__"):
+        scope = _weight_scope_from_session(input.session)
+        tz_name = (input.session.timezone if input.session and input.session.timezone else None) or "America/Denver"
+        if _is_weight_lookup_request(msg):
+            if not scope:
+                answer = "I need you signed in to look up your weight."
+                if thread_id:
+                    await _memory_append(thread_id, "user", msg)
+                    await _memory_append(thread_id, "assistant", answer)
+                return Output(answer=answer, citations=[], uiActions=[])
+            prof_out = await _weight_call_json("weight_profile_get", {"scope": scope})
+            if prof_out is None:
+                return Output(
+                    answer="Weight Management MCP profile_get failed.",
+                    citations=[],
+                    data={
+                        "ok": False,
+                        "error": "weight_profile_get_failed",
+                        "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_profile_get and Weight MCP server is healthy.",
+                    },
+                )
+            prof = prof_out.get("profile") if isinstance(prof_out, dict) else None
+            prof = prof if isinstance(prof, dict) else {}
+            weight_kg, weight_lb, at_ms = _profile_weight_values(prof)
+            if weight_kg is None and weight_lb is None:
+                answer = "I don't have a weigh-in recorded for you yet."
+            else:
+                label = _weight_label(weight_kg, weight_lb)
+                recorded_at = _weight_recorded_at_text(at_ms, tz_name)
+                answer = f"Your latest recorded weight is {label}."
+                if recorded_at:
+                    answer += f" Recorded at {recorded_at}."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"ok": True, "profile": prof})
+        if _is_weight_log_request(msg):
+            if not scope:
+                answer = "I need you signed in to log your weight."
+                if thread_id:
+                    await _memory_append(thread_id, "user", msg)
+                    await _memory_append(thread_id, "assistant", answer)
+                return Output(answer=answer, citations=[], uiActions=[])
+            weight_kg, weight_lb = _parse_weight_from_text(msg)
+            if weight_kg is None and weight_lb is None:
+                answer = "I couldn't parse a weight from that. Try something like `227 lb` or `103 kg`."
+                if thread_id:
+                    await _memory_append(thread_id, "user", msg)
+                    await _memory_append(thread_id, "assistant", answer)
+                return Output(answer=answer, citations=[], uiActions=[])
+            weight_out = await _weight_call_json(
+                "weight_log_weight",
+                {
+                    "scope": scope,
+                    "weightKg": weight_kg,
+                    "weightLb": weight_lb,
+                    "atISO": _weight_at_iso_from_text(msg, tz_name),
+                    "source": "chat",
+                },
+            )
+            if weight_out is None:
+                return Output(
+                    answer="Weight Management MCP weight_log_weight failed.",
+                    citations=[],
+                    data={
+                        "ok": False,
+                        "error": "weight_log_weight_failed",
+                        "hint": "Ensure MCP_TOOL_ALLOWLIST includes weight_weight_log_weight and Weight MCP server is healthy.",
+                    },
+                )
+            label = _weight_label(weight_kg, weight_lb)
+            answer = f"Logged your weight as {label}."
+            if thread_id:
+                await _memory_append(thread_id, "user", msg)
+                await _memory_append(thread_id, "assistant", answer)
+            return Output(answer=answer, citations=[], data={"ok": True, "weight": weight_out})
+
     fitness_intent = "none"
     if (not msg.startswith("__")) and any(
         k in mlow
@@ -2325,7 +2520,7 @@ async def _run_impl(input: Input) -> Output:
     if fitness_intent == "food_trend":
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals, but I need you signed in with Telegram."
+            answer = "I can summarize meals, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -2439,7 +2634,7 @@ async def _run_impl(input: Input) -> Output:
     if fitness_intent == "food_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals, but I need you signed in with Telegram."
+            answer = "I can summarize meals, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -2615,7 +2810,7 @@ SELECT ?t ?desc ?cal ?p ?c ?f WHERE {{
     if fitness_intent == "calories_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize calories, but I need you signed in with Telegram."
+            answer = "I can summarize calories, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -2799,7 +2994,7 @@ SELECT (SUM(?k) AS ?kcalTotal) WHERE {{
     if fitness_intent == "exercise_burn_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can estimate exercise calories, but I need you signed in with Telegram."
+            answer = "I can estimate exercise calories, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -2907,7 +3102,7 @@ SELECT (SUM(?k) AS ?exerciseKcal) (COUNT(?w) AS ?workouts) WHERE {{
     if fitness_intent == "food_exercise_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals + exercise, but I need you signed in with Telegram."
+            answer = "I can summarize meals + exercise, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
@@ -3110,7 +3305,7 @@ SELECT ?activityType ?started ?activeEnergyKcal ?durationSeconds ?distanceMeters
     if fitness_intent == "exercise_overview_day":
         scope = _weight_scope_from_session(input.session)
         if not scope:
-            answer = "I can summarize meals + exercise, but I need you signed in with Telegram."
+            answer = "I can summarize meals + exercise, but I need you signed in."
             if thread_id:
                 await _memory_append(thread_id, "user", msg)
                 await _memory_append(thread_id, "assistant", answer)
