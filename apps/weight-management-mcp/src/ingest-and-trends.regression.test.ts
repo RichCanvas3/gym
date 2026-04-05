@@ -341,5 +341,169 @@ d("weight-management-mcp ingestion + trends", () => {
     expect(out.totals.exercise_kcal).toBe(250);
     expect(out.totals.net_calories).toBe(350);
   });
+
+  it("day summary tolerates tg-to-acct migration when acct profile already exists", async () => {
+    const { SELF, env } = await import("cloudflare:test");
+
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_profiles (
+        scope_id TEXT PRIMARY KEY,
+        scope_json TEXT,
+        profile_json TEXT,
+        updated_at INTEGER
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_food_entries (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        meal TEXT,
+        text TEXT,
+        calories REAL,
+        protein_g REAL,
+        carbs_g REAL,
+        fat_g REAL,
+        fiber_g REAL,
+        sugar_g REAL,
+        sodium_mg REAL,
+        source TEXT,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        analysis_id TEXT,
+        image_url TEXT,
+        created_at INTEGER
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_photos (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        caption TEXT,
+        tags_json TEXT NOT NULL,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        telegram_file_id TEXT,
+        telegram_file_unique_id TEXT,
+        photo_url TEXT,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_water_log (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        amount_ml REAL NOT NULL,
+        source TEXT,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_meal_analyses (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        model TEXT,
+        summary TEXT,
+        raw_json TEXT NOT NULL,
+        image_ref_json TEXT,
+        telegram_chat_id TEXT,
+        telegram_message_id INTEGER,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_daily_targets (
+        scope_id TEXT PRIMARY KEY,
+        targets_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_exercise_entries (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        workout_id TEXT NOT NULL,
+        activity_type TEXT,
+        duration_seconds INTEGER,
+        distance_meters REAL,
+        active_energy_kcal REAL,
+        raw_json TEXT,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_events (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_food_items (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        food_entry_id TEXT NOT NULL,
+        at_ms INTEGER NOT NULL,
+        meal TEXT,
+        name TEXT NOT NULL,
+        portion_g REAL,
+        calories REAL,
+        protein_g REAL,
+        carbs_g REAL,
+        fat_g REAL,
+        fiber_g REAL,
+        source TEXT,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wm_fast_windows (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL,
+        start_ms INTEGER NOT NULL,
+        end_ms INTEGER,
+        source TEXT,
+        created_at INTEGER NOT NULL
+      )`,
+    ).run();
+
+    const acctScope = { accountAddress: "acct:test_user" };
+    const day = "2026-04-05";
+    const dayStart = Date.parse(`${day}T00:00:00.000Z`);
+
+    const weightOut = await toolCall(SELF.fetch, "weight_log_weight", {
+      scope: acctScope,
+      weightLb: 228,
+      atISO: `${day}T14:00:00Z`,
+      source: "test",
+    });
+    expect(weightOut.ok).toBe(true);
+
+    await env.DB.prepare(
+      `INSERT INTO wm_food_entries (id, scope_id, at_ms, meal, text, calories, source, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8)`,
+    )
+      .bind("legacy-food", "tg:6105195555", dayStart + 1000, "lunch", "legacy sandwich", 450, "test", dayStart + 1000)
+      .run();
+
+    const out = await toolCall(SELF.fetch, "weight_day_summary", { scope: acctScope, dateISO: day, tzName: "UTC" });
+    expect(out.ok).toBe(true);
+    expect(out.totals.calories).toBe(450);
+
+    const prof = await toolCall(SELF.fetch, "weight_profile_get", { scope: acctScope });
+    expect(prof.ok).toBe(true);
+    expect(prof.profile.weight_lb).toBe(228);
+  });
 });
 

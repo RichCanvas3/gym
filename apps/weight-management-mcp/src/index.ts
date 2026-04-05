@@ -164,6 +164,25 @@ async function migrateScopeId(env: Env, fromScopeId: string, toScopeId: string):
   const to = String(toScopeId ?? "").trim();
   if (!from || !to || from === to) return { ok: true, migrated: false, fromScopeId: from, toScopeId: to, tablesUpdated: 0 };
 
+  const mergeJsonObjects = (leftRaw: string | null, rightRaw: string | null): string => {
+    let left: Record<string, unknown> = {};
+    let right: Record<string, unknown> = {};
+    try {
+      const parsed = leftRaw ? JSON.parse(leftRaw) : {};
+      left = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      left = {};
+    }
+    try {
+      const parsed = rightRaw ? JSON.parse(rightRaw) : {};
+      right = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      right = {};
+    }
+    // Preserve newer acct-scoped writes when both rows exist.
+    return JSON.stringify({ ...left, ...right });
+  };
+
   const tables = [
     "wm_events",
     "wm_profiles",
@@ -178,6 +197,51 @@ async function migrateScopeId(env: Env, fromScopeId: string, toScopeId: string):
   ];
   let updated = 0;
   for (const t of tables) {
+    if (t === "wm_profiles") {
+      const fromRow = await env.DB.prepare(`SELECT scope_json, profile_json, updated_at FROM wm_profiles WHERE scope_id=?1 LIMIT 1`)
+        .bind(from)
+        .first<{ scope_json: string | null; profile_json: string | null; updated_at: number | null }>();
+      if (fromRow) {
+        const toRow = await env.DB.prepare(`SELECT scope_json, profile_json, updated_at FROM wm_profiles WHERE scope_id=?1 LIMIT 1`)
+          .bind(to)
+          .first<{ scope_json: string | null; profile_json: string | null; updated_at: number | null }>();
+        if (toRow) {
+          const mergedScope = mergeJsonObjects(fromRow.scope_json, toRow.scope_json);
+          const mergedProfile = mergeJsonObjects(fromRow.profile_json, toRow.profile_json);
+          const mergedUpdatedAt = Math.max(Number(fromRow.updated_at ?? 0), Number(toRow.updated_at ?? 0), nowMs());
+          await env.DB.prepare(`UPDATE wm_profiles SET scope_json=?1, profile_json=?2, updated_at=?3 WHERE scope_id=?4`)
+            .bind(mergedScope, mergedProfile, mergedUpdatedAt, to)
+            .run();
+          await env.DB.prepare(`DELETE FROM wm_profiles WHERE scope_id=?1`).bind(from).run();
+        } else {
+          await env.DB.prepare(`UPDATE wm_profiles SET scope_id=?1 WHERE scope_id=?2`).bind(to, from).run();
+        }
+      }
+      updated += 1;
+      continue;
+    }
+    if (t === "wm_daily_targets") {
+      const fromRow = await env.DB.prepare(`SELECT targets_json, updated_at FROM wm_daily_targets WHERE scope_id=?1 LIMIT 1`)
+        .bind(from)
+        .first<{ targets_json: string | null; updated_at: number | null }>();
+      if (fromRow) {
+        const toRow = await env.DB.prepare(`SELECT targets_json, updated_at FROM wm_daily_targets WHERE scope_id=?1 LIMIT 1`)
+          .bind(to)
+          .first<{ targets_json: string | null; updated_at: number | null }>();
+        if (toRow) {
+          const mergedTargets = mergeJsonObjects(fromRow.targets_json, toRow.targets_json);
+          const mergedUpdatedAt = Math.max(Number(fromRow.updated_at ?? 0), Number(toRow.updated_at ?? 0), nowMs());
+          await env.DB.prepare(`UPDATE wm_daily_targets SET targets_json=?1, updated_at=?2 WHERE scope_id=?3`)
+            .bind(mergedTargets, mergedUpdatedAt, to)
+            .run();
+          await env.DB.prepare(`DELETE FROM wm_daily_targets WHERE scope_id=?1`).bind(from).run();
+        } else {
+          await env.DB.prepare(`UPDATE wm_daily_targets SET scope_id=?1 WHERE scope_id=?2`).bind(to, from).run();
+        }
+      }
+      updated += 1;
+      continue;
+    }
     await env.DB.prepare(`UPDATE ${t} SET scope_id=?1 WHERE scope_id=?2`).bind(to, from).run();
     updated += 1;
   }
