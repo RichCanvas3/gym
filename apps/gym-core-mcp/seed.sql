@@ -2,10 +2,6 @@
 -- Safe to re-run: uses INSERT OR IGNORE / UPSERT patterns.
 PRAGMA foreign_keys = ON;
 
--- Gym
-INSERT OR IGNORE INTO gyms (gym_id, name, timezone, created_at_iso, updated_at_iso)
-VALUES ('gym_erie_community_center', 'Erie Community Center', 'America/Denver', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z');
-
 -- Metadata (hours, location)
 INSERT INTO gym_metadata (gym_id, key, value_json, created_at_iso, updated_at_iso)
 VALUES
@@ -26,14 +22,10 @@ INSERT OR IGNORE INTO accounts (account_id, canonical_address, email, display_na
   ('acc_inst_nina', 'acct_inst_nina', 'nina.coach@example.com', 'Nina Alvarez', '+13035550105', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'),
   ('acc_inst_eli',  'acct_inst_eli',  'eli.coach@example.com',  'Eli Thompson', '+13035550106', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z');
 
--- Example customer accounts
+-- Example user accounts
 INSERT OR IGNORE INTO accounts (account_id, canonical_address, email, display_name, phone_e164, created_at_iso, updated_at_iso) VALUES
   ('acc_cust_casey', 'acct_cust_casey', 'casey@example.com', 'Casey Morgan', '+13035550901', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'),
   ('acc_cust_riley', 'acct_cust_riley', 'riley@example.com', 'Riley Kim', '+13035550902', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z');
-
-INSERT OR IGNORE INTO customers (customer_id, account_id, created_at_iso, updated_at_iso) VALUES
-  ('cust_casey', 'acc_cust_casey', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'),
-  ('cust_riley', 'acc_cust_riley', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z');
 
 -- Instructors (link to account_id)
 INSERT OR IGNORE INTO instructors (instructor_id, account_id, skills_json, bio_source_id, created_at_iso, updated_at_iso) VALUES

@@ -629,18 +629,6 @@ async function ensureAccount(
   return { accountId, canonicalAddress: canonical, created: true };
 }
 
-async function ensureCustomer(db: D1Database, accountId: string) {
-  const existing = await db.prepare(`SELECT customer_id FROM customers WHERE account_id = ? LIMIT 1`).bind(accountId).first();
-  const ts = nowISO();
-  if (existing && (existing as any).customer_id) return { customerId: String((existing as any).customer_id), created: false };
-  const customerId = `cust_${crypto.randomUUID()}`;
-  await db
-    .prepare(`INSERT INTO customers (customer_id, account_id, created_at_iso, updated_at_iso) VALUES (?, ?, ?, ?)`)
-    .bind(customerId, accountId, ts, ts)
-    .run();
-  return { customerId, created: true };
-}
-
 async function ensureInstructor(db: D1Database, accountId: string, skillsJson: string | null, bioSourceId: string | null) {
   const existing = await db.prepare(`SELECT instructor_id FROM instructors WHERE account_id = ? LIMIT 1`).bind(accountId).first();
   const ts = nowISO();
@@ -768,29 +756,6 @@ function createServer(env: Env, auth: RequestAuth) {
           }
         : null;
       return { content: [{ type: "text", text: jsonText({ account }) }] };
-    },
-  );
-
-  server.tool(
-    "core_upsert_customer",
-    "Ensure a customer exists for an account canonicalAddress.",
-    { canonicalAddress: AccountAddress, displayName: z.string().min(1).optional(), email: z.string().min(3).optional() },
-    async (args) => {
-      const parsed = z
-        .object({
-          canonicalAddress: AccountAddress,
-          displayName: z.string().min(1).optional(),
-          email: z.string().min(3).optional(),
-        })
-        .parse(args);
-      requirePrincipalMatch(auth, parsed.canonicalAddress);
-      const acc = await ensureAccount(env.DB, {
-        canonicalAddress: parsed.canonicalAddress,
-        email: parsed.email ?? null,
-        displayName: parsed.displayName ?? null,
-      });
-      const cust = await ensureCustomer(env.DB, acc.accountId);
-      return { content: [{ type: "text", text: jsonText({ account: acc, customer: cust }) }] };
     },
   );
 
@@ -1250,124 +1215,6 @@ function createServer(env: Env, auth: RequestAuth) {
         updatedAtISO: String(r.updated_at_iso ?? ""),
       }));
       return { content: [{ type: "text", text: jsonText({ chunks }) }] };
-    },
-  );
-
-  server.tool(
-    "core_create_order",
-    "Create an order for an account (stores JSON items).",
-    {
-      canonicalAddress: AccountAddress,
-      items: z.array(z.record(z.string(), z.unknown())).min(1),
-      totalCents: z.number().int().nonnegative().optional(),
-      currency: z.string().min(3).optional(),
-    },
-    async (args) => {
-      const parsed = z
-        .object({
-          canonicalAddress: AccountAddress,
-          items: z.array(z.record(z.string(), z.unknown())).min(1),
-          totalCents: z.number().int().nonnegative().optional(),
-          currency: z.string().min(3).optional(),
-        })
-        .parse(args);
-      requirePrincipalMatch(auth, parsed.canonicalAddress);
-      const acc = await ensureAccount(env.DB, { canonicalAddress: parsed.canonicalAddress });
-      const orderId = `ord_${crypto.randomUUID()}`;
-      const ts = nowISO();
-      await env.DB.prepare(
-        `INSERT INTO orders (order_id, account_id, status, currency, total_cents, items_json, created_at_iso, updated_at_iso)
-         VALUES (?, ?, 'created', ?, ?, ?, ?, ?)`,
-      )
-        .bind(orderId, acc.accountId, parsed.currency ?? "USD", parsed.totalCents ?? 0, JSON.stringify(parsed.items), ts, ts)
-        .run();
-      return { content: [{ type: "text", text: jsonText({ orderId }) }] };
-    },
-  );
-
-  server.tool(
-    "core_record_reservation",
-    "Record a scheduler reservation in gym-core (ledger).",
-    {
-      canonicalAddress: AccountAddress,
-      schedulerClassId: z.string().min(1),
-      schedulerReservationId: z.string().min(1),
-      classDefId: z.string().min(1).optional(),
-      status: z.enum(["active", "cancelled"]).optional(),
-    },
-    async (args) => {
-      const parsed = z
-        .object({
-          canonicalAddress: AccountAddress,
-          schedulerClassId: z.string().min(1),
-          schedulerReservationId: z.string().min(1),
-          classDefId: z.string().min(1).optional(),
-          status: z.enum(["active", "cancelled"]).optional(),
-        })
-        .parse(args);
-      requirePrincipalMatch(auth, parsed.canonicalAddress);
-      const acc = await ensureAccount(env.DB, { canonicalAddress: parsed.canonicalAddress });
-      const id = `resrec_${crypto.randomUUID()}`;
-      const ts = nowISO();
-      await env.DB.prepare(
-        `INSERT INTO reservation_records (reservation_record_id, account_id, class_def_id, scheduler_class_id, scheduler_reservation_id, status, created_at_iso, updated_at_iso)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-        .bind(
-          id,
-          acc.accountId,
-          parsed.classDefId ?? null,
-          parsed.schedulerClassId,
-          parsed.schedulerReservationId,
-          parsed.status ?? "active",
-          ts,
-          ts,
-        )
-        .run();
-      return { content: [{ type: "text", text: jsonText({ reservationRecordId: id }) }] };
-    },
-  );
-
-  server.tool(
-    "core_set_gym_metadata",
-    "Set gym metadata key/value JSON for a gymId.",
-    { gymId: z.string().min(1), key: z.string().min(1), value: z.record(z.string(), z.unknown()) },
-    async (args) => {
-      const parsed = z
-        .object({ gymId: z.string().min(1), key: z.string().min(1), value: z.record(z.string(), z.unknown()) })
-        .parse(args);
-      const ts = nowISO();
-      await env.DB.prepare(
-        `INSERT INTO gym_metadata (gym_id, key, value_json, created_at_iso, updated_at_iso)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(gym_id, key) DO UPDATE SET value_json=excluded.value_json, updated_at_iso=excluded.updated_at_iso`,
-      )
-        .bind(parsed.gymId, parsed.key, JSON.stringify(parsed.value), ts, ts)
-        .run();
-      return { content: [{ type: "text", text: "ok" }] };
-    },
-  );
-
-  server.tool(
-    "core_get_gym_metadata",
-    "Get gym metadata key/value JSON for a gymId.",
-    { gymId: z.string().min(1) },
-    async (args) => {
-      const parsed = z.object({ gymId: z.string().min(1) }).parse(args);
-      const res = await env.DB.prepare(`SELECT key, value_json FROM gym_metadata WHERE gym_id = ? ORDER BY key ASC`)
-        .bind(parsed.gymId)
-        .all();
-      const items = (res.results ?? []).map((r: any) => ({
-        key: String(r.key ?? ""),
-        value: (() => {
-          try {
-            return JSON.parse(String(r.value_json ?? "{}"));
-          } catch {
-            return {};
-          }
-        })(),
-      }));
-      return { content: [{ type: "text", text: jsonText({ gymId: parsed.gymId, metadata: items }) }] };
     },
   );
 

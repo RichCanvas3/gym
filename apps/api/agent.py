@@ -890,27 +890,6 @@ async def _handle_reserve_class(session: Optional["Session"], class_id: str) -> 
 
     reservation_id = str(reservation_obj.get("reservationId") or "")
 
-    # Record canonical customer + reservation ledger in gym-core (best effort).
-    class_def_id = str(cls.get("classDefId") or "").strip()
-    await _core_call_json(
-        "core_upsert_customer",
-        {
-            "canonicalAddress": account_address,
-            "displayName": participant_name or None,
-            "email": participant_email or None,
-        },
-    )
-    await _core_call_json(
-        "core_record_reservation",
-        {
-            "canonicalAddress": account_address,
-            "schedulerClassId": class_id,
-            "schedulerReservationId": reservation_id,
-            "classDefId": class_def_id or None,
-            "status": "active",
-        },
-    )
-
     emailed = False
     email_err = ""
     subject = f"Class reservation confirmed: {cls.get('title')}"
@@ -1874,22 +1853,6 @@ def make_tools() -> tuple[list[StructuredTool], Any]:
 
         reservation_id = str(reservation_obj.get("reservationId") or "")
 
-        class_def_id = str(gym_class.get("classDefId") or "").strip()
-        await _core_call_json(
-            "core_upsert_customer",
-            {"canonicalAddress": addr, "displayName": participantName or None, "email": to_email or None},
-        )
-        await _core_call_json(
-            "core_record_reservation",
-            {
-                "canonicalAddress": addr,
-                "schedulerClassId": classId,
-                "schedulerReservationId": reservation_id,
-                "classDefId": class_def_id or None,
-                "status": "active",
-            },
-        )
-
         emailed = False
         email_err = ""
         if to_email:
@@ -2320,18 +2283,6 @@ async def _run_impl(input: Input) -> Output:
             return Output(answer=answer, citations=[])
 
         reservation_id = str(reservation_obj.get("reservationId") or "")
-        await _core_call_json("core_upsert_customer", {"canonicalAddress": acct})  # best-effort
-        await _core_call_json(
-            "core_record_reservation",
-            {
-                "canonicalAddress": acct,
-                "schedulerClassId": class_id,
-                "schedulerReservationId": reservation_id,
-                "classDefId": class_def_id,
-                "status": "active",
-            },
-        )
-
         wants_cart = "cart" in mlow or "add to cart" in mlow
         cart_actions = None
         ui_actions = None
